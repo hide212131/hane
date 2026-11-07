@@ -705,7 +705,7 @@ fn named_entity(name: &str) -> Option<char> {
 // Rendering
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Mark {
     Strong,
     Emphasis,
@@ -772,6 +772,9 @@ struct Renderer<'a> {
     limit: usize,
     used: usize,
     prev_space: bool,
+    /// The mark just closed and the output length right after it, so an
+    /// immediately following run of the same mark can be merged into it.
+    last_mark: Option<(Mark, usize)>,
 }
 
 fn compute_has_block(nodes: &[Node]) -> Vec<bool> {
@@ -803,6 +806,7 @@ fn render(html: &str, limits: &HtmlLimits, plain: bool) -> Result<String, HtmlIm
         limit: limits.output_bytes,
         used: 0,
         prev_space: true,
+        last_mark: None,
     };
     let blocks = renderer.blocks(&tree[0].children, &Fmt::default())?;
     let text = join_blocks(&blocks, if plain { "\n" } else { "\n\n" });
@@ -842,7 +846,9 @@ fn is_edge_space(ch: char) -> bool {
 
 /// Wraps `inner` in a delimiter pair, keeping leading and trailing whitespace
 /// (and hard-break markers) outside so the delimiters stay flanking. An empty
-/// or whitespace-only `inner` gets no delimiters.
+/// or whitespace-only `inner` gets no delimiters. Content without any
+/// alphanumeric character cannot be flanked by `*` / `~~` next to a word, so it
+/// uses the equivalent inline HTML tag instead.
 fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     let core = inner.trim_matches(is_edge_space);
     if core.is_empty() {
@@ -850,7 +856,21 @@ fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     }
     let lead = &inner[..inner.len() - inner.trim_start_matches(is_edge_space).len()];
     let trail = &inner[inner.trim_end_matches(is_edge_space).len()..];
+    if !core.chars().any(char::is_alphanumeric) {
+        if let Some(tag) = html_tag(open) {
+            return format!("{lead}<{tag}>{core}</{tag}>{trail}");
+        }
+    }
     format!("{lead}{open}{core}{close}{trail}")
+}
+
+fn html_tag(delimiter: &str) -> Option<&'static str> {
+    match delimiter {
+        "**" => Some("strong"),
+        "*" => Some("em"),
+        "~~" => Some("del"),
+        _ => None,
+    }
 }
 
 fn wrap_link(inner: &str, destination: &str) -> String {
@@ -1247,6 +1267,7 @@ impl Renderer<'_> {
         index: usize,
         fmt: &Fmt,
         mark: Mark,
+        previous: Option<(Mark, usize)>,
         out: &mut String,
     ) -> Result<(), HtmlImportError> {
         if fmt.has(mark) {
@@ -1255,7 +1276,29 @@ impl Renderer<'_> {
         let inner_fmt = fmt.with(mark);
         let mut inner = String::new();
         self.inline_children(index, &inner_fmt, &mut inner)?;
-        out.push_str(&wrap_delimited(&inner, mark.delimiter(), mark.delimiter()));
+        let delimiter = mark.delimiter();
+        let wrapped = wrap_delimited(&inner, delimiter, delimiter);
+        let tail = wrapped.strip_prefix(delimiter);
+        // Directly adjacent runs of one mark would put two delimiters side by
+        // side, so they are joined into a single run instead.
+        let merged = match tail {
+            Some(tail)
+                if previous == Some((mark, out.len()))
+                    && out.ends_with(delimiter)
+                    && !tail.starts_with(delimiter.chars().next().unwrap_or('*')) =>
+            {
+                out.truncate(out.len() - delimiter.len());
+                out.push_str(tail);
+                true
+            }
+            _ => false,
+        };
+        if !merged {
+            out.push_str(&wrapped);
+        }
+        if wrapped.ends_with(delimiter) {
+            self.last_mark = Some((mark, out.len()));
+        }
         Ok(())
     }
 
@@ -1281,6 +1324,7 @@ impl Renderer<'_> {
 
     fn inline(&mut self, index: usize, fmt: &Fmt, out: &mut String) -> Result<(), HtmlImportError> {
         let tree = self.tree;
+        let previous = self.last_mark.take();
         let element = match &tree[index].kind {
             Kind::Text(text) => {
                 self.emit_text(text, out);
@@ -1315,10 +1359,14 @@ impl Renderer<'_> {
                     self.prev_space = false;
                 }
             }
-            "strong" | "b" if !self.plain => self.inline_marked(index, fmt, Mark::Strong, out)?,
-            "em" | "i" if !self.plain => self.inline_marked(index, fmt, Mark::Emphasis, out)?,
+            "strong" | "b" if !self.plain => {
+                self.inline_marked(index, fmt, Mark::Strong, previous, out)?;
+            }
+            "em" | "i" if !self.plain => {
+                self.inline_marked(index, fmt, Mark::Emphasis, previous, out)?;
+            }
             "s" | "del" | "strike" if !self.plain => {
-                self.inline_marked(index, fmt, Mark::Strike, out)?;
+                self.inline_marked(index, fmt, Mark::Strike, previous, out)?;
             }
             "a" if !self.plain => {
                 let destination = if fmt.link.is_some() {

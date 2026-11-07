@@ -425,6 +425,31 @@ fn character_references_follow_html_rules() {
     assert_eq!(md("<p>&unknown; &</p>"), "\\&unknown; &");
 }
 
+/// Delimiter flanking: adjacent runs of one mark must not leave a literal
+/// delimiter, and punctuation-only runs between words must stay emphasised.
+#[test]
+fn adjacent_and_punctuation_only_marks_keep_their_emphasis() {
+    let adjacent = md("<p><em>a</em><em>b</em></p>");
+    assert_eq!(adjacent, "*ab*");
+    assert_eq!(count_kind(&adjacent, NodeKind::Emphasis), 1);
+
+    let strong = md("<p><strong>a</strong><b>b</b></p>");
+    assert_eq!(strong, "**ab**");
+    assert_eq!(count_kind(&strong, NodeKind::Strong), 1);
+
+    let spaced = md("<p><em>a</em> <em>b</em></p>");
+    assert_eq!(spaced, "*a* *b*");
+    assert_eq!(count_kind(&spaced, NodeKind::Emphasis), 2);
+
+    let punctuation = md("<p>a<em>!</em>b</p>");
+    assert_eq!(punctuation, "a<em>!</em>b");
+    assert_eq!(count_kind(&punctuation, NodeKind::InlineHtml), 2);
+
+    let linked = md(r#"<p><em>a</em><a href="https://example.com/"><em>b</em></a></p>"#);
+    assert_eq!(linked, "*a*[*b*](https://example.com/)");
+    assert_eq!(count_kind(&linked, NodeKind::Link), 1);
+}
+
 #[test]
 fn output_is_valid_for_the_markdown_parser() {
     let markdown = md("<h1>題</h1><p>本文 <a href=\"https://example.com/\">リンク</a></p><ul><li>a</li><li>b</li></ul><blockquote><p>q</p></blockquote><pre><code class=\"language-rs\">x</code></pre>");
