@@ -174,6 +174,14 @@ fn text_is_unicode_safe_and_whitespace_collapses() {
 }
 
 #[test]
+fn emphasis_edges_with_multibyte_characters_do_not_panic() {
+    assert_eq!(md("<p>前<strong>日本語</strong>後</p>"), "前**日本語**後");
+    assert_eq!(md("<p>前<em>日本語</em>後</p>"), "前*日本語*後");
+    assert_eq!(md("<p>前<strong>「日本」</strong>後</p>"), "前<strong>「日本」</strong>後");
+    assert_eq!(md("<p><strong>日本語。</strong></p>"), "<strong>日本語。</strong>");
+}
+
+#[test]
 fn line_starts_that_would_become_blocks_are_escaped() {
     assert_eq!(md("<p>1. not list</p>"), "1\\. not list");
     assert_eq!(md("<p># not heading</p>"), "\\# not heading");

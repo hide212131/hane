@@ -882,7 +882,10 @@ fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     let mut chars = core.chars();
     let first = chars.next();
     let last = chars.next_back().or(first);
-    let last_escaped = core.len() >= 2 && core[..core.len() - 1].ends_with('\\');
+    // Slice by the last character's UTF-8 length, never by a raw byte offset.
+    let last_escaped = last.is_some_and(|ch| {
+        core.len() > ch.len_utf8() && core[..core.len() - ch.len_utf8()].ends_with('\\')
+    });
     let punctuated_edge = first.is_some_and(|ch| unicode_edge(ch) || ascii_edge(ch, false))
         || last.is_some_and(|ch| unicode_edge(ch) || ascii_edge(ch, last_escaped));
     let html = html_tag(open)
