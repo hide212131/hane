@@ -355,10 +355,19 @@ impl<'l> Builder<'l> {
         if is_void(name) {
             return;
         }
-        let position = self
-            .stack
-            .iter()
-            .rposition(|&index| self.tag_at(index) == name);
+        // Stop at a dropped element met before the target so that an end tag
+        // cannot close a hidden subtree from the outside.
+        let mut position = None;
+        for (at, &index) in self.stack.iter().enumerate().rev() {
+            let tag = self.tag_at(index);
+            if tag == name {
+                position = Some(at);
+                break;
+            }
+            if is_dropped(tag) {
+                break;
+            }
+        }
         if let Some(position) = position {
             self.stack.truncate(position);
         }

@@ -47,6 +47,14 @@ fn paragraph_close_does_not_cross_a_dropped_subtree_boundary() {
     assert!(markdown.contains("after"), "{markdown:?}");
 }
 
+/// An end tag outside a dropped element must not close it, or the text that
+/// follows would leak out of the hidden subtree.
+#[test]
+fn end_tag_does_not_cross_a_dropped_subtree_boundary() {
+    let markdown = md("<div><template>x</div>secret</template>");
+    assert!(!markdown.contains("secret"), "{markdown:?}");
+}
+
 #[test]
 fn links_nest_with_and_sit_next_to_emphasis() {
     assert_eq!(
