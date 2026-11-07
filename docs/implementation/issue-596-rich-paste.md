@@ -24,8 +24,14 @@
 
 ## 検証
 
-実装前のplain Copy/Paste（1KiB/100KiB/1MiB）と10MiB文書の短いcopyのbaselineを記録し、実装後に同条件で比較する。未測定値は成功扱いしない。
-純粋変換fixture、OS codec/native clipboard test、本文のfocused GPUI回帰、workspace tests/Clippy、current-head最終reviewとmacOS/Windowsの実clipboard GUIを行う。Windowsは接続先Windowsアプリから直接操作し、Mac経由VM操作は行わない。
+対象head `41a8f2fe20c45dc36ba19fff1f6021e601ad3f48` / base `0589d2f93d5f4f0824d37b3ef906d6425193b25e` の記録（2026-11-07）。
+
+- Claude exact-head verifier run [42355521908](https://github.com/hide212131/hane/actions/runs/42355521908) がworkspace regression testsとlintに成功した。
+- PR CI [42355629125](https://github.com/hide212131/hane/actions/runs/42355629125) がmacOS/Windows workspace testsとClippyに成功した。
+- 隔離Mac checkoutで `cargo clippy --workspace --all-targets --all-features -- -D warnings` と `cargo build -p hane --locked` が成功した。
+- Mac隔離GUIはhead `2ba40967909bca9402fb4e6bc910cb9b0bb2639c` で、system pasteboardのHTML貼り付け、文章中の日本語リンクと括弧/query付きURL、各種書式、保存結果、Undo/Redoを確認した。後続head `41a8f2f` では日本語句読点を含む強調のMarkdown変換と回帰テストを修正したため、このGUIシナリオは最新headでは再実行していない。
+- Windows固有CF_HTML経路のhead `2ba4096` Debug buildは成功したが、コード変更でheadが進んだ時点で候補GUIは起動せず終了した。最終headのWindows Debug buildと必要最小限のGUI確認を後段で行う。
+- Release `TestAppContext`の旧probeはnative OS clipboard・実描画・実入力遅延を測定しておらず、現在headの性能証拠とはしない。ネイティブ性能は未測定。
 
 ## 状態
 
@@ -37,10 +43,12 @@
 
 ### 設計との差分（要確認）
 
-- 設計は`html5ever` / `markup5ever_rcdom`を直接依存にするとしていたが、実装担当はshell・buildを実行できず`TreeSink`のAPIを検証できないため、上限を構築中に強制できるcrate内パーサーで実装した。依存とlockfileは増えていない。html5ever採用へ置き換えるかはCommanderの判断事項。
+- 設計文書が想定した`html5ever` / `markup5ever_rcdom`ではなく、上限を構築中に強制できるcrate内parserを採用した。入力・node・depth・出力の上限をtree生成中に適用し、巨大入力が未制限のDOMとして展開されるのを避ける。依存とlockfileは増えていない。
 - `read_rich_clipboard`は`source_format`引数と`source_metadata`を持たない（Haneの専用metadataは書式付きexportを後続に回したため未使用）。`WriteFailed`も書込みが無いため未定義。
 - 書式付きexport（HTML/metadataの書込み）、RTF-onlyの書式復元、表の完全変換は対象外のまま。
 
-### 未実施（このworkerでは実行していない）
+### 残る確認
 
-`cargo test` / `clippy` / workspace外vendorのnative test、baseline・性能測定、macOS/Windowsの実clipboard GUI、CI・reviewはいずれも未実施で、Commanderが別途確認する。
+- 最終head `41a8f2f` のWindows Debug buildと、ブラウザから文章・URL混在のリッチテキストを貼り付ける隔離GUIスモーク（Markdown保存、リンクlabel/href、書式、Undo/Redo、日本語入力）。接続先Windows上で直接操作する。
+- CodeRabbitのcurrent-head full reviewはincluded review limitで開始できず、Policy §4.2に従いcurrent-head CI成功後のCodex review fallbackを依頼済み。結果を取得し、current headに結び付く未解決所見を確認する。
+- ネイティブclipboardの性能測定。
