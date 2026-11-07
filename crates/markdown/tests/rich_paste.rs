@@ -535,6 +535,39 @@ fn unicode_punctuation_edges_keep_their_emphasis() {
     assert_eq!(count_kind(&symbols, NodeKind::InlineHtml), 2);
 }
 
+/// ASCII punctuation at the edge of a mark next to a word is not flanked by
+/// `**`, so the inline HTML tag keeps the emphasis after a re-parse.
+#[test]
+fn ascii_punctuation_edges_keep_their_emphasis() {
+    let strong = md("<p>foo<strong>!a!</strong>bar</p>");
+    assert_eq!(strong, "foo<strong>!a!</strong>bar");
+    assert_eq!(count_kind(&strong, NodeKind::InlineHtml), 2);
+
+    let emphasis = md("<p>foo<em>(a)</em>bar</p>");
+    assert_eq!(emphasis, "foo<em>(a)</em>bar");
+    assert_eq!(count_kind(&emphasis, NodeKind::InlineHtml), 2);
+
+    let plain = md("<p>foo<strong>a</strong>bar</p>");
+    assert_eq!(plain, "foo**a**bar");
+    assert_eq!(count_kind(&plain, NodeKind::Strong), 1);
+}
+
+/// Adjacent code spans must not fuse their backtick runs into foreign content.
+#[test]
+fn adjacent_code_spans_do_not_gain_backticks() {
+    let adjacent = md("<p><code>a</code><code>b</code></p>");
+    assert_eq!(adjacent, "`ab`");
+    assert_eq!(count_kind(&adjacent, NodeKind::InlineCode), 1);
+
+    let ticks = md("<p><code>a`</code><code>`b</code></p>");
+    assert_eq!(count_kind(&ticks, NodeKind::InlineCode), 1);
+    assert!(ticks.starts_with("``"), "{ticks}");
+
+    let spaced = md("<p><code>a</code> <code>b</code></p>");
+    assert_eq!(spaced, "`a` `b`");
+    assert_eq!(count_kind(&spaced, NodeKind::InlineCode), 2);
+}
+
 #[test]
 fn output_is_valid_for_the_markdown_parser() {
     let markdown = md("<h1>題</h1><p>本文 <a href=\"https://example.com/\">リンク</a></p><ul><li>a</li><li>b</li></ul><blockquote><p>q</p></blockquote><pre><code class=\"language-rs\">x</code></pre>");

@@ -752,6 +752,9 @@ struct Renderer<'a> {
     /// The mark just closed and the output length right after it, so an
     /// immediately following run of the same mark can be merged into it.
     last_mark: Option<(Mark, usize)>,
+    /// The code span just emitted: its start offset in the output and its text,
+    /// so an immediately following code span is merged into one safe span.
+    last_code: Option<(usize, String)>,
 }
 
 fn compute_has_block(nodes: &[Node]) -> Vec<bool> {
@@ -784,6 +787,7 @@ fn render(html: &str, limits: &HtmlLimits, plain: bool) -> Result<String, HtmlIm
         used: 0,
         prev_space: true,
         last_mark: None,
+        last_code: None,
     };
     let blocks = renderer.blocks(&tree[0].children, &Fmt::default())?;
     let text = join_blocks(&blocks, if plain { "\n" } else { "\n\n" });
@@ -868,8 +872,19 @@ fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     let lead = &inner[..inner.len() - inner.trim_start_matches(is_edge_space).len()];
     let trail = &inner[inner.trim_end_matches(is_edge_space).len()..];
     let unicode_edge = |ch: char| !ch.is_ascii() && !ch.is_alphanumeric();
-    let punctuated_edge = core.chars().next().is_some_and(unicode_edge)
-        || core.chars().next_back().is_some_and(unicode_edge);
+    // ASCII punctuation from literal text breaks flanking next to a word too.
+    // Characters that open or close nested Markdown constructs (code spans,
+    // nested marks, links, inline HTML) are not literal text, so they stay.
+    let structural = |ch: char| matches!(ch, '`' | '*' | '~' | '[' | ')' | '>' | '<');
+    let ascii_edge = |ch: char, escaped: bool| {
+        ch.is_ascii_punctuation() && (escaped || !structural(ch))
+    };
+    let mut chars = core.chars();
+    let first = chars.next();
+    let last = chars.next_back().or(first);
+    let last_escaped = core.len() >= 2 && core[..core.len() - 1].ends_with('\\');
+    let punctuated_edge = first.is_some_and(|ch| unicode_edge(ch) || ascii_edge(ch, false))
+        || last.is_some_and(|ch| unicode_edge(ch) || ascii_edge(ch, last_escaped));
     let html = html_tag(open)
         .filter(|_| punctuated_edge || !core.chars().any(char::is_alphanumeric));
     if let Some(tag) = html {
@@ -1342,6 +1357,7 @@ impl Renderer<'_> {
     fn inline(&mut self, index: usize, fmt: &Fmt, out: &mut String) -> Result<(), HtmlImportError> {
         let tree = self.tree;
         let previous = self.last_mark.take();
+        let previous_code = self.last_code.take();
         let element = match &tree[index].kind {
             Kind::Text(text) => {
                 self.emit_text(text, out);
@@ -1372,9 +1388,22 @@ impl Renderer<'_> {
                 self.raw_text(index, " ", &mut raw);
                 let text = collapse_whitespace(&raw);
                 if !text.is_empty() {
+                    // Adjacent code spans would put their backtick runs side
+                    // by side and fuse them, so they become one span.
+                    let (start, text) = match previous_code {
+                        Some((start, before))
+                            if out.len() == start + code_span(&before).len() =>
+                        {
+                            out.truncate(start);
+                            (start, before + &text)
+                        }
+                        _ => (out.len(), text),
+                    };
                     out.push_str(&code_span(&text));
+                    self.last_code = Some((start, text));
                     self.prev_space = false;
                 }
+                return Ok(());
             }
             "strong" | "b" if !self.plain => {
                 self.inline_marked(index, fmt, Mark::Strong, previous, out)?;
@@ -1403,6 +1432,8 @@ impl Renderer<'_> {
             }
             _ => self.inline_children(index, fmt, out)?,
         }
+        // Offsets recorded by nested code spans belong to a different buffer.
+        self.last_code = None;
         Ok(())
     }
 
