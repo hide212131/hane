@@ -221,8 +221,8 @@ fn text_is_unicode_safe_and_whitespace_collapses() {
 fn emphasis_edges_with_multibyte_characters_do_not_panic() {
     assert_eq!(md("<p>前<strong>日本語</strong>後</p>"), "前**日本語**後");
     assert_eq!(md("<p>前<em>日本語</em>後</p>"), "前*日本語*後");
-    assert_eq!(md("<p>前<strong>「日本」</strong>後</p>"), "前<strong>「日本」</strong>後");
-    assert_eq!(md("<p><strong>日本語。</strong></p>"), "<strong>日本語。</strong>");
+    assert_eq!(md("<p>前<strong>「日本」</strong>後</p>"), "前「**日本**」後");
+    assert_eq!(md("<p><strong>日本語。</strong></p>"), "**日本語**。");
 }
 
 #[test]
@@ -558,8 +558,8 @@ fn adjacent_and_punctuation_only_marks_keep_their_emphasis() {
     assert_eq!(count_kind(&spaced, NodeKind::Emphasis), 2);
 
     let punctuation = md("<p>a<em>!</em>b</p>");
-    assert_eq!(punctuation, "a<em>!</em>b");
-    assert_eq!(count_kind(&punctuation, NodeKind::InlineHtml), 2);
+    assert_eq!(punctuation, "a!b");
+    assert_eq!(count_kind(&punctuation, NodeKind::InlineHtml), 0);
 
     let linked = md(r#"<p><em>a</em><a href="https://example.com/"><em>b</em></a></p>"#);
     assert_eq!(linked, "*a*[*b*](https://example.com/)");
@@ -567,48 +567,59 @@ fn adjacent_and_punctuation_only_marks_keep_their_emphasis() {
 }
 
 /// A span whose first or last character is a Unicode punctuation / symbol is
-/// not flanked by `**` next to a word, so it uses the inline HTML tag.
+/// not flanked by `**` next to a word, so the punctuation moves outside the
+/// delimiters and no inline HTML is emitted.
 #[test]
 fn unicode_punctuation_edges_keep_their_emphasis() {
     let both = md("<p>本文<strong>「重要」</strong>です</p>");
-    assert_eq!(both, "本文<strong>「重要」</strong>です");
-    assert_eq!(count_kind(&both, NodeKind::InlineHtml), 2);
+    assert_eq!(both, "本文「**重要**」です");
+    assert_eq!(count_kind(&both, NodeKind::Strong), 1);
+    assert_eq!(count_kind(&both, NodeKind::InlineHtml), 0);
 
     let leading = md("<p>本文<strong>「重要</strong>です</p>");
-    assert_eq!(leading, "本文<strong>「重要</strong>です");
-    assert_eq!(count_kind(&leading, NodeKind::InlineHtml), 2);
+    assert_eq!(leading, "本文「**重要**です");
+    assert_eq!(count_kind(&leading, NodeKind::Strong), 1);
+    assert_eq!(count_kind(&leading, NodeKind::InlineHtml), 0);
 
     let trailing = md("<p>本文<em>重要。</em>です</p>");
-    assert_eq!(trailing, "本文<em>重要。</em>です");
-    assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 2);
+    assert_eq!(trailing, "本文*重要*。です");
+    assert_eq!(count_kind(&trailing, NodeKind::Emphasis), 1);
+    assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 0);
 
     let symbols = md("<p>本文<del>★重要☆</del>です</p>");
-    assert_eq!(symbols, "本文<del>★重要☆</del>です");
-    assert_eq!(count_kind(&symbols, NodeKind::InlineHtml), 2);
+    assert_eq!(symbols, "本文★~~重要~~☆です");
+    assert_eq!(count_kind(&symbols, NodeKind::InlineHtml), 0);
+
+    let sentence = md("<p><strong>日本語。</strong></p>");
+    assert_eq!(count_kind(&sentence, NodeKind::Strong), 1);
+    assert_eq!(count_kind(&sentence, NodeKind::InlineHtml), 0);
 }
 
 /// ASCII punctuation at the edge of a mark next to a word is not flanked by
-/// `**`, so the inline HTML tag keeps the emphasis after a re-parse.
+/// `**`, so it moves outside the delimiters instead of using inline HTML.
 #[test]
 fn ascii_punctuation_edges_keep_their_emphasis() {
     let strong = md("<p>foo<strong>!a!</strong>bar</p>");
-    assert_eq!(strong, "foo<strong>!a!</strong>bar");
-    assert_eq!(count_kind(&strong, NodeKind::InlineHtml), 2);
+    assert_eq!(strong, "foo!**a**!bar");
+    assert_eq!(count_kind(&strong, NodeKind::Strong), 1);
+    assert_eq!(count_kind(&strong, NodeKind::InlineHtml), 0);
 
     let emphasis = md("<p>foo<em>(a)</em>bar</p>");
-    assert_eq!(emphasis, "foo<em>(a)</em>bar");
-    assert_eq!(count_kind(&emphasis, NodeKind::InlineHtml), 2);
+    assert_eq!(emphasis, "foo(*a*)bar");
+    assert_eq!(count_kind(&emphasis, NodeKind::Emphasis), 1);
+    assert_eq!(count_kind(&emphasis, NodeKind::InlineHtml), 0);
 
     let trailing = md("<p>foo<em>a)</em>bar</p>");
-    assert_eq!(trailing, "foo<em>a)</em>bar");
-    assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 2);
+    assert_eq!(trailing, "foo*a*)bar");
+    assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 0);
 
     let mixed = md("<p>foo<strong>a (b)</strong>bar</p>");
-    assert_eq!(mixed, "foo<strong>a (b)</strong>bar");
-    assert_eq!(count_kind(&mixed, NodeKind::InlineHtml), 2);
+    assert_eq!(mixed, "foo**a (b**)bar");
+    assert_eq!(count_kind(&mixed, NodeKind::InlineHtml), 0);
 
     let unicode = md("<p>本文<strong>!重要。</strong>です</p>");
-    assert_eq!(unicode, "本文<strong>!重要。</strong>です");
+    assert_eq!(unicode, "本文!**重要**。です");
+    assert_eq!(count_kind(&unicode, NodeKind::InlineHtml), 0);
 
     let linked = md(r#"<p><strong><a href="https://example.com/">太字</a></strong></p>"#);
     assert_eq!(linked, "**[太字](https://example.com/)**");

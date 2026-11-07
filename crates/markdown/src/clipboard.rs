@@ -861,11 +861,10 @@ fn is_edge_space(ch: char) -> bool {
 
 /// Wraps `inner` in a delimiter pair, keeping leading and trailing whitespace
 /// (and hard-break markers) outside so the delimiters stay flanking. An empty
-/// or whitespace-only `inner` gets no delimiters. Content without any
-/// alphanumeric character cannot be flanked by `*` / `~~` next to a word, so it
-/// uses the equivalent inline HTML tag instead, as does content whose first or
-/// last character is a non-ASCII punctuation or symbol (e.g. `「`), which
-/// CommonMark does not flank next to a word.
+/// or whitespace-only `inner` gets no delimiters. Leading and trailing
+/// punctuation or symbols (e.g. `「`, `。`), which CommonMark does not flank next
+/// to a word, are moved outside the delimiters. Content without any
+/// alphanumeric character is left unmarked rather than emitting inline HTML.
 fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     let core = inner.trim_matches(is_edge_space);
     if core.is_empty() {
@@ -889,30 +888,38 @@ fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     let ascii_edge = |ch: char, escaped: bool| {
         ch.is_ascii_punctuation() && (escaped || !structural(ch))
     };
-    let mut chars = core.chars();
-    let first = chars.next();
-    let last = chars.next_back().or(first);
-    // Slice by the last character's UTF-8 length, never by a raw byte offset.
-    let last_escaped = last.is_some_and(|ch| {
-        core.len() > ch.len_utf8() && core[..core.len() - ch.len_utf8()].ends_with('\\')
-    });
-    let punctuated_edge = first.is_some_and(|ch| unicode_edge(ch) || ascii_edge(ch, false))
-        || last.is_some_and(|ch| unicode_edge(ch) || ascii_edge(ch, last_escaped));
-    let html = html_tag(open)
-        .filter(|_| punctuated_edge || !core.chars().any(char::is_alphanumeric));
-    if let Some(tag) = html {
-        return format!("{lead}<{tag}>{core}</{tag}>{trail}");
+    // Punctuated edges are moved outside the delimiters so the remaining
+    // content starts and ends with a flanking character. Hane never renders
+    // inline HTML as emphasis, so no HTML tag is used as a fallback.
+    let mut start = 0;
+    let mut end = core.len();
+    while let Some(ch) = core[start..end].chars().next() {
+        if ch == '\\' {
+            let escaped_len = core[start + 1..end].chars().next().map_or(0, char::len_utf8);
+            start += 1 + escaped_len;
+        } else if unicode_edge(ch) || ascii_edge(ch, false) {
+            start += ch.len_utf8();
+        } else {
+            break;
+        }
     }
-    format!("{lead}{open}{core}{close}{trail}")
-}
-
-fn html_tag(delimiter: &str) -> Option<&'static str> {
-    match delimiter {
-        "**" => Some("strong"),
-        "*" => Some("em"),
-        "~~" => Some("del"),
-        _ => None,
+    while let Some(ch) = core[start..end].chars().next_back() {
+        // Slice by the last character's UTF-8 length, never by a raw byte offset.
+        let before = end - ch.len_utf8();
+        let escaped = ch.is_ascii_punctuation() && core[start..before].ends_with('\\');
+        if unicode_edge(ch) || ascii_edge(ch, escaped) {
+            end = if escaped { before - 1 } else { before };
+        } else {
+            break;
+        }
     }
+    let rest = &core[start..end];
+    if !rest.chars().any(char::is_alphanumeric) {
+        // Nothing can carry the emphasis; keep the text as it is.
+        return inner.to_owned();
+    }
+    let (head, tail) = (&core[..start], &core[end..]);
+    format!("{lead}{head}{open}{rest}{close}{tail}{trail}")
 }
 
 fn wrap_link(inner: &str, destination: &str) -> String {
