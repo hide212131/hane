@@ -314,7 +314,7 @@ impl<'l> Builder<'l> {
                 found = Some(position);
                 break;
             }
-            if boundaries.contains(&tag) {
+            if boundaries.contains(&tag) || is_dropped(tag) {
                 break;
             }
         }

@@ -37,6 +37,16 @@ fn mixed_text_and_multiple_links_keep_labels_destinations_and_text() {
     assert_eq!(count_kind(&markdown, NodeKind::Strong), 1);
 }
 
+/// An implied paragraph close must not truncate the stack past a dropped
+/// element, or the dropped subtree's text would leak into the output.
+#[test]
+fn paragraph_close_does_not_cross_a_dropped_subtree_boundary() {
+    let markdown = md("<p>before<object><p>secret</p></object>after</p>");
+    assert!(!markdown.contains("secret"), "{markdown:?}");
+    assert!(markdown.contains("before"), "{markdown:?}");
+    assert!(markdown.contains("after"), "{markdown:?}");
+}
+
 #[test]
 fn links_nest_with_and_sit_next_to_emphasis() {
     assert_eq!(
