@@ -91,6 +91,29 @@ fn link_destinations_with_parentheses_and_queries_are_kept() {
 }
 
 #[test]
+fn href_keeps_semicolonless_legacy_references_before_equals_or_alphanumerics() {
+    assert_eq!(
+        md(r#"<a href="https://x.example/?a=1&copy=2">x</a>"#),
+        "[x](https://x.example/?a=1&copy=2)"
+    );
+    assert_eq!(
+        md(r#"<a href="https://x.example/?regionId=5">x</a>"#),
+        "[x](https://x.example/?regionId=5)"
+    );
+    // Unquoted attribute values take the same path.
+    assert_eq!(
+        md(r#"<a href=https://x.example/?a=1&copy=2>x</a>"#),
+        "[x](https://x.example/?a=1&copy=2)"
+    );
+    assert_eq!(
+        md(r#"<a href=https://x.example/?regionId=5>x</a>"#),
+        "[x](https://x.example/?regionId=5)"
+    );
+    // Body text still decodes the semicolon-less legacy reference.
+    assert_eq!(md("<p>a&copy=2</p>"), "a©=2");
+}
+
+#[test]
 fn a_link_around_blocks_keeps_the_link_on_each_block() {
     assert_eq!(
         md(r#"<a href="https://example.com/"><div>カード</div></a>"#),

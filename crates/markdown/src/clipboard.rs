@@ -424,7 +424,7 @@ fn parse(html: &str, limits: &HtmlLimits) -> Result<Vec<Node>, HtmlImportError> 
             continue;
         }
         let end = html[i..].find('<').map_or(bytes.len(), |at| i + at);
-        builder.text(&decode_entities(&html[i..end]))?;
+        builder.text(&decode_entities(&html[i..end], false))?;
         i = end;
     }
     Ok(builder.nodes)
@@ -514,7 +514,7 @@ fn parse_start_tag(html: &str, start: usize) -> (String, Vec<(String, String)>, 
                 while i < len && bytes[i] != quote {
                     i += 1;
                 }
-                value = decode_entities(&html[value_start..i]);
+                value = decode_entities(&html[value_start..i], true);
                 if i < len {
                     i += 1;
                 }
@@ -523,7 +523,7 @@ fn parse_start_tag(html: &str, start: usize) -> (String, Vec<(String, String)>, 
                 while i < len && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' {
                     i += 1;
                 }
-                value = decode_entities(&html[value_start..i]);
+                value = decode_entities(&html[value_start..i], true);
             }
         }
         if WANTED_ATTRIBUTES.contains(&attr_name.as_str())
@@ -535,7 +535,7 @@ fn parse_start_tag(html: &str, start: usize) -> (String, Vec<(String, String)>, 
     (name, attrs, i)
 }
 
-fn decode_entities(text: &str) -> String {
+fn decode_entities(text: &str, in_attribute: bool) -> String {
     if !text.contains('&') {
         return text.to_owned();
     }
@@ -544,7 +544,7 @@ fn decode_entities(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        if let Some((decoded, used)) = decode_entity(rest) {
+        if let Some((decoded, used)) = decode_entity(rest, in_attribute) {
             out.push(decoded);
             rest = &rest[used..];
         } else {
@@ -561,7 +561,7 @@ fn decode_entities(text: &str) -> String {
 /// missing `;`, as do the legacy named references HTML allows without one; the
 /// scan only advances over consumed characters, so a run of bare `&` stays
 /// linear.
-fn decode_entity(text: &str) -> Option<(char, usize)> {
+fn decode_entity(text: &str, in_attribute: bool) -> Option<(char, usize)> {
     let bytes = text.as_bytes();
     if bytes.get(1) == Some(&b'#') {
         let (hex, start) = match bytes.get(2) {
@@ -627,6 +627,15 @@ fn decode_entity(text: &str) -> Option<(char, usize)> {
     LEGACY
         .iter()
         .find(|legacy| name.starts_with(**legacy))
+        .filter(|legacy| {
+            // In attribute values a semicolon-less reference followed by `=`
+            // or an ASCII alphanumeric stays literal (HTML spec).
+            !in_attribute
+                || !matches!(
+                    bytes.get(legacy.len() + 1),
+                    Some(b'=') | Some(b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+                )
+        })
         .and_then(|legacy| named_entity(legacy).map(|ch| (ch, legacy.len() + 1)))
 }
 
