@@ -164,6 +164,44 @@ fn inline_and_fenced_code() {
 }
 
 #[test]
+fn code_keeps_edge_whitespace_and_trailing_blank_lines() {
+    assert_eq!(md("<p>x<code> a </code>y</p>"), "x`  a  `y");
+    assert_eq!(md("<p>x<code> a</code>y</p>"), "x` a`y");
+    assert_eq!(md("<pre>a\n\n</pre>"), "```\na\n\n```");
+    assert_eq!(md("<pre>a\n</pre>"), "```\na\n```");
+    assert_eq!(md("<pre>a</pre>"), "```\na\n```");
+}
+
+#[test]
+fn a_heading_inside_a_link_keeps_the_destination() {
+    assert_eq!(
+        md(r#"<a href="https://example.com/"><h2>題</h2></a>"#),
+        "## [題](https://example.com/)"
+    );
+}
+
+#[test]
+fn ordered_lists_that_markdown_cannot_number_faithfully_are_unsupported() {
+    for html in [
+        "<ol start=\"x\"><li>a</li></ol>",
+        "<ol start=\"-1\"><li>a</li></ol>",
+        "<ol start=\"1000000000\"><li>a</li></ol>",
+        "<ol reversed><li>a</li><li>b</li></ol>",
+        "<ol start=\"999999999\"><li>a</li><li>b</li></ol>",
+    ] {
+        assert_eq!(
+            html_to_markdown(html),
+            Err(HtmlImportError::Unsupported),
+            "{html}"
+        );
+    }
+    assert_eq!(
+        md("<ol start=\"999999999\"><li>a</li></ol>"),
+        "999999999. a"
+    );
+}
+
+#[test]
 fn lists_and_quotes_keep_their_structure() {
     assert_eq!(
         md("<ul><li>一</li><li>二<ul><li>入れ子</li></ul></li></ul>"),

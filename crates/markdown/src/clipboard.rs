@@ -110,7 +110,9 @@ struct Node {
     children: Vec<usize>,
 }
 
-const WANTED_ATTRIBUTES: [&str; 6] = ["href", "start", "class", "alt", "value", "type"];
+const WANTED_ATTRIBUTES: [&str; 7] = [
+    "href", "start", "class", "alt", "value", "type", "reversed",
+];
 
 fn is_void(tag: &str) -> bool {
     matches!(
@@ -251,6 +253,9 @@ fn closes_paragraph(tag: &str) -> bool {
             | "ul"
     )
 }
+
+/// Largest ordered-list number CommonMark reads as a list marker (nine digits).
+const MAX_LIST_NUMBER: u32 = 999_999_999;
 
 const PARAGRAPH_BOUNDARIES: [&str; 6] = ["table", "td", "th", "caption", "template", "html"];
 
@@ -1295,10 +1300,9 @@ impl Renderer<'_> {
             "code" | "kbd" | "samp" | "tt" if !self.plain => {
                 let mut raw = String::new();
                 self.raw_text(index, " ", &mut raw);
-                let collapsed = collapse_whitespace(&raw);
-                let text = collapsed.trim_matches(' ');
+                let text = collapse_whitespace(&raw);
                 if !text.is_empty() {
-                    out.push_str(&code_span(text));
+                    out.push_str(&code_span(&text));
                     self.prev_space = false;
                 }
             }
@@ -1342,7 +1346,7 @@ impl Renderer<'_> {
         match element.tag.as_str() {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level = usize::from(element.tag.as_bytes()[1] - b'0');
-                let inner = self.inline_run(children, &Fmt::default())?;
+                let inner = self.inline_run(children, fmt)?;
                 let line = inner.replace('\0', " ");
                 let line = line.trim();
                 if line.is_empty() {
@@ -1362,10 +1366,7 @@ impl Renderer<'_> {
                 let mut raw = String::new();
                 self.raw_text(index, "\n", &mut raw);
                 let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
-                let body = normalized
-                    .strip_prefix('\n')
-                    .unwrap_or(&normalized)
-                    .trim_end_matches('\n');
+                let body = normalized.strip_prefix('\n').unwrap_or(&normalized);
                 if body.trim().is_empty() {
                     return Ok(());
                 }
@@ -1374,7 +1375,10 @@ impl Renderer<'_> {
                 } else {
                     let language = code_language(tree, index);
                     let fence = "`".repeat((longest_backtick_run(body) + 1).max(3));
-                    format!("{fence}{language}\n{body}\n{fence}")
+                    // A body that already ends with a newline keeps its last
+                    // line break as the one before the closing fence.
+                    let break_before_fence = if body.ends_with('\n') { "" } else { "\n" };
+                    format!("{fence}{language}\n{body}{break_before_fence}{fence}")
                 };
                 self.charge(text.len())?;
                 out.push(Block { text, list: false });
@@ -1467,11 +1471,16 @@ impl Renderer<'_> {
             {
                 return Err(HtmlImportError::Unsupported);
             }
-            if let Some(start) = element.attr("start")
-                && let Ok(value) = start.trim().parse::<u32>()
-                && value <= 999_999_999
-            {
-                number = value;
+            // A reversed list or an unreadable / out-of-range start cannot be
+            // written as a Markdown ordered list without changing its numbers.
+            if element.attr("reversed").is_some() {
+                return Err(HtmlImportError::Unsupported);
+            }
+            if let Some(start) = element.attr("start") {
+                match start.trim().parse::<u32>() {
+                    Ok(value) if value <= MAX_LIST_NUMBER => number = value,
+                    _ => return Err(HtmlImportError::Unsupported),
+                }
             }
         }
         let mut items: Vec<String> = Vec::new();
@@ -1498,6 +1507,10 @@ impl Renderer<'_> {
             let marker = if self.plain {
                 String::new()
             } else if ordered {
+                // CommonMark list markers have at most nine digits.
+                if number > MAX_LIST_NUMBER {
+                    return Err(HtmlImportError::Unsupported);
+                }
                 format!("{number}. ")
             } else {
                 "- ".to_owned()

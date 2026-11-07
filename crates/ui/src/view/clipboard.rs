@@ -90,7 +90,7 @@ impl EditorView {
         match decide(mode, snapshot) {
             PasteDecision::Nothing => {}
             PasteDecision::InsertPlain(text) => {
-                self.dispatch(EditorCommand::Insert(&text), cx);
+                self.replace_selection_with(&text, None, cx);
             }
             PasteDecision::Replace { text, notice } => {
                 self.replace_selection_with(&text, notice, cx);
@@ -344,6 +344,23 @@ mod tests {
         assert_eq!(text_of(&view, cx), "abX**y**Z\n");
 
         for expected in ["abX**y**\n", "abX\n", "ab\n"] {
+            view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
+            assert_eq!(text_of(&view, cx), expected);
+        }
+    }
+
+    /// A plain-text paste is its own Undo step too.
+    #[gpui::test]
+    fn plain_paste_is_independent_of_the_typing_around_it(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "ab\n");
+        select(&view, cx, Selection::caret(SourceOffset(2)));
+        view.update(cx, |view, cx| view.insert_text("X", cx));
+        set_clipboard(cx, "y");
+        paste(&view, cx, PasteMode::PlainText);
+        view.update(cx, |view, cx| view.insert_text("Z", cx));
+        assert_eq!(text_of(&view, cx), "abXyZ\n");
+
+        for expected in ["abXy\n", "abX\n", "ab\n"] {
             view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
             assert_eq!(text_of(&view, cx), expected);
         }
