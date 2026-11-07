@@ -514,6 +514,27 @@ fn adjacent_and_punctuation_only_marks_keep_their_emphasis() {
     assert_eq!(count_kind(&linked, NodeKind::Link), 1);
 }
 
+/// A span whose first or last character is a Unicode punctuation / symbol is
+/// not flanked by `**` next to a word, so it uses the inline HTML tag.
+#[test]
+fn unicode_punctuation_edges_keep_their_emphasis() {
+    let both = md("<p>本文<strong>「重要」</strong>です</p>");
+    assert_eq!(both, "本文<strong>「重要」</strong>です");
+    assert_eq!(count_kind(&both, NodeKind::InlineHtml), 2);
+
+    let leading = md("<p>本文<strong>「重要</strong>です</p>");
+    assert_eq!(leading, "本文<strong>「重要</strong>です");
+    assert_eq!(count_kind(&leading, NodeKind::InlineHtml), 2);
+
+    let trailing = md("<p>本文<em>重要。</em>です</p>");
+    assert_eq!(trailing, "本文<em>重要。</em>です");
+    assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 2);
+
+    let symbols = md("<p>本文<del>★重要☆</del>です</p>");
+    assert_eq!(symbols, "本文<del>★重要☆</del>です");
+    assert_eq!(count_kind(&symbols, NodeKind::InlineHtml), 2);
+}
+
 #[test]
 fn output_is_valid_for_the_markdown_parser() {
     let markdown = md("<h1>題</h1><p>本文 <a href=\"https://example.com/\">リンク</a></p><ul><li>a</li><li>b</li></ul><blockquote><p>q</p></blockquote><pre><code class=\"language-rs\">x</code></pre>");

@@ -857,7 +857,9 @@ fn is_edge_space(ch: char) -> bool {
 /// (and hard-break markers) outside so the delimiters stay flanking. An empty
 /// or whitespace-only `inner` gets no delimiters. Content without any
 /// alphanumeric character cannot be flanked by `*` / `~~` next to a word, so it
-/// uses the equivalent inline HTML tag instead.
+/// uses the equivalent inline HTML tag instead, as does content whose first or
+/// last character is a non-ASCII punctuation or symbol (e.g. `「`), which
+/// CommonMark does not flank next to a word.
 fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     let core = inner.trim_matches(is_edge_space);
     if core.is_empty() {
@@ -865,7 +867,11 @@ fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     }
     let lead = &inner[..inner.len() - inner.trim_start_matches(is_edge_space).len()];
     let trail = &inner[inner.trim_end_matches(is_edge_space).len()..];
-    let html = html_tag(open).filter(|_| !core.chars().any(char::is_alphanumeric));
+    let unicode_edge = |ch: char| !ch.is_ascii() && !ch.is_alphanumeric();
+    let punctuated_edge = core.chars().next().is_some_and(unicode_edge)
+        || core.chars().next_back().is_some_and(unicode_edge);
+    let html = html_tag(open)
+        .filter(|_| punctuated_edge || !core.chars().any(char::is_alphanumeric));
     if let Some(tag) = html {
         return format!("{lead}<{tag}>{core}</{tag}>{trail}");
     }
