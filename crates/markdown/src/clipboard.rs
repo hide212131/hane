@@ -332,7 +332,9 @@ impl<'l> Builder<'l> {
             _ => {}
         }
         let void = is_void(&tag);
-        if !void && self.stack.len() >= self.limits.depth {
+        // A void element is a leaf one level below the open stack, so it must
+        // respect the depth limit as well.
+        if self.stack.len() >= self.limits.depth {
             return Err(HtmlImportError::TooLarge);
         }
         let index = self.push_node(Kind::Element(Element { tag, attrs }))?;
@@ -550,30 +552,96 @@ fn decode_entities(text: &str) -> String {
 }
 
 /// Decodes one entity at the start of `text` (which begins with `&`). Returns
-/// the character and the number of bytes consumed. The terminating `;` is
-/// required; the search is bounded so a run of bare `&` stays linear.
+/// the character and the number of bytes consumed. Numeric references accept a
+/// missing `;`, as do the legacy named references HTML allows without one; the
+/// scan only advances over consumed characters, so a run of bare `&` stays
+/// linear.
 fn decode_entity(text: &str) -> Option<(char, usize)> {
     let bytes = text.as_bytes();
-    let window = &bytes[1..bytes.len().min(34)];
-    let semicolon = window.iter().position(|&byte| byte == b';')? + 1;
-    let body = &text[1..semicolon];
-    let decoded = if let Some(number) = body.strip_prefix('#') {
-        let value = if let Some(hex) = number.strip_prefix(['x', 'X']) {
-            u32::from_str_radix(hex, 16)
-        } else {
-            number.parse::<u32>()
+    if bytes.get(1) == Some(&b'#') {
+        let (hex, start) = match bytes.get(2) {
+            Some(b'x' | b'X') => (true, 3),
+            _ => (false, 2),
         };
-        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        let digits = bytes[start..]
+            .iter()
+            .take_while(|byte| {
+                if hex {
+                    byte.is_ascii_hexdigit()
+                } else {
+                    byte.is_ascii_digit()
+                }
+            })
+            .count();
+        if digits == 0 {
             return None;
         }
-        match value.ok().and_then(char::from_u32) {
-            Some(ch) if ch != '\0' => ch,
-            _ => '\u{fffd}',
+        let end = start + digits;
+        let mut value: u32 = 0;
+        let mut overflow = false;
+        for &byte in &bytes[start..end] {
+            let digit = char::from(byte).to_digit(if hex { 16 } else { 10 })?;
+            match value
+                .checked_mul(if hex { 16 } else { 10 })
+                .and_then(|v| v.checked_add(digit))
+            {
+                Some(next) => value = next,
+                None => {
+                    overflow = true;
+                    break;
+                }
+            }
         }
+        let decoded = if overflow {
+            '\u{fffd}'
+        } else {
+            numeric_reference(value)
+        };
+        let used = if bytes.get(end) == Some(&b';') {
+            end + 1
+        } else {
+            end
+        };
+        return Some((decoded, used));
+    }
+    let name_len = bytes[1..]
+        .iter()
+        .take(32)
+        .take_while(|byte| byte.is_ascii_alphanumeric())
+        .count();
+    if name_len == 0 {
+        return None;
+    }
+    let name = &text[1..=name_len];
+    if bytes.get(name_len + 1) == Some(&b';')
+        && let Some(decoded) = named_entity(name)
+    {
+        return Some((decoded, name_len + 2));
+    }
+    const LEGACY: [&str; 7] = ["amp", "quot", "nbsp", "copy", "reg", "lt", "gt"];
+    LEGACY
+        .iter()
+        .find(|legacy| name.starts_with(**legacy))
+        .and_then(|legacy| named_entity(legacy).map(|ch| (ch, legacy.len() + 1)))
+}
+
+/// Maps a numeric character reference to a character: NUL, surrogates and
+/// out-of-range values become U+FFFD, and the C1 range follows windows-1252.
+fn numeric_reference(value: u32) -> char {
+    const C1: [u32; 32] = [
+        0x20ac, 0x81, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030, 0x0160,
+        0x2039, 0x0152, 0x8d, 0x017d, 0x8f, 0x90, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013,
+        0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x9d, 0x017e, 0x0178,
+    ];
+    let value = if (0x80..=0x9f).contains(&value) {
+        C1[(value - 0x80) as usize]
     } else {
-        named_entity(body)?
+        value
     };
-    Some((decoded, semicolon + 1))
+    match char::from_u32(value) {
+        Some(ch) if ch != '\0' => ch,
+        _ => '\u{fffd}',
+    }
 }
 
 fn named_entity(name: &str) -> Option<char> {

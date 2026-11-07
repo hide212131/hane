@@ -272,6 +272,14 @@ fn parse_cf_html(bytes: &[u8]) -> Result<&str, RichClipboardError> {
         } else if position < bytes.len() {
             position += 1;
         }
+        // The header ends with the fragment offsets; never read fragment
+        // content as header lines.
+        if start_fragment.is_some() && end_fragment.is_some() {
+            break;
+        }
+    }
+    if start_html.is_some_and(|offset| offset < -1) || end_html.is_some_and(|offset| offset < -1) {
+        return Err(RichClipboardError::InvalidFormat);
     }
 
     let (Some(start), Some(end)) = (start_fragment, end_fragment) else {
@@ -609,6 +617,26 @@ mod tests {
             Err(RichClipboardError::InvalidFormat)
         );
         assert_eq!(parse_cf_html(b""), Err(RichClipboardError::InvalidFormat));
+    }
+
+    #[test]
+    fn hane_clipboard_cf_html_rejects_html_offsets_below_minus_one() {
+        let good = String::from_utf8(cf_html("<b>x</b>")).unwrap();
+        let start = good.find("StartHTML:").unwrap() + "StartHTML:".len();
+        let mut broken = good.clone();
+        broken.replace_range(start..start + 10, "-000000002");
+        assert_eq!(
+            parse_cf_html(broken.as_bytes()),
+            Err(RichClipboardError::InvalidFormat)
+        );
+    }
+
+    #[test]
+    fn hane_clipboard_cf_html_header_scan_stops_at_the_fragment_offsets() {
+        // A fragment whose first line looks like a header line is still content.
+        let fragment = "Note:x\r\n<b>y</b>";
+        let block = cf_html(fragment);
+        assert_eq!(parse_cf_html(&block), Ok(fragment));
     }
 }
 

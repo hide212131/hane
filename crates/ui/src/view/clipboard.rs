@@ -40,6 +40,7 @@ impl EditorView {
     /// rename owns the keyboard.
     fn body_paste_ready(&self) -> bool {
         self.body_editable()
+            && self.tab_close_confirm.is_none()
             && !self.settings_open()
             && !self.external_comparison_blocks_body()
             && self.other_input_capture_allows_body()
@@ -167,6 +168,8 @@ impl EditorView {
                     && session.editor().selection() == job.selection
                     && session.editor().ime().is_none()
             })
+            && window.is_window_active()
+            && self.tab_close_confirm.is_none()
             && self.focus_handle.is_focused(window)
             && self.body_paste_ready()
     }
@@ -563,6 +566,26 @@ mod tests {
             assert_eq!(view.status, None);
             assert!(view.clipboard_job.is_none());
         });
+    }
+
+    /// A close confirmation opened while converting stops the result from
+    /// being applied.
+    #[gpui::test]
+    fn a_close_confirmation_drops_a_finished_conversion(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "ab\n");
+        select(&view, cx, forward(0, 2));
+        set_clipboard(cx, "");
+        set_test_snapshot(Some("<b>x</b>"), false, None);
+        paste(&view, cx, PasteMode::Rich);
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let instance = view.document_instance(id).unwrap();
+            view.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), "ab\n");
+        assert_eq!(status_of(&view, cx).as_deref(), Some(PASTE_STALE_MESSAGE));
     }
 
     /// Copy and Cut invalidate a running conversion too.

@@ -327,6 +327,34 @@ fn limits_are_enforced_while_building() {
 }
 
 #[test]
+fn void_elements_respect_the_depth_limit() {
+    let two = HtmlLimits {
+        depth: 2,
+        ..HtmlLimits::default()
+    };
+    assert_eq!(
+        html_to_markdown_with_limits("<div><div><br>x</div></div>", &two),
+        Err(HtmlImportError::TooLarge)
+    );
+    assert_eq!(
+        html_to_markdown_with_limits("<div><img alt=\"x\"></div>", &two),
+        Ok("x".to_owned())
+    );
+}
+
+#[test]
+fn character_references_follow_html_rules() {
+    // Numeric references, with and without the terminating semicolon.
+    assert_eq!(md("<p>&#65;&#x42;&#67 &#x44</p>"), "ABC D");
+    // Legacy named references work without a semicolon.
+    assert_eq!(md("<p>a &amp b &copy c</p>"), "a & b \u{a9} c");
+    // C1 numeric references follow windows-1252; invalid ones become U+FFFD.
+    assert_eq!(md("<p>&#150;&#0;&#xD800;&#99999999999;</p>"), "\u{2013}\u{fffd}\u{fffd}\u{fffd}");
+    // Unknown names stay text.
+    assert_eq!(md("<p>&unknown; &</p>"), "\\&unknown; &");
+}
+
+#[test]
 fn output_is_valid_for_the_markdown_parser() {
     let markdown = md("<h1>題</h1><p>本文 <a href=\"https://example.com/\">リンク</a></p><ul><li>a</li><li>b</li></ul><blockquote><p>q</p></blockquote><pre><code class=\"language-rs\">x</code></pre>");
     assert_eq!(count_kind(&markdown, NodeKind::Heading(1)), 1);
