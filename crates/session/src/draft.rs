@@ -158,6 +158,15 @@ pub trait DraftStore: Send + Sync + 'static {
     /// filename or its session closed clean. Already-missing is not an error.
     fn remove(&self, root: &Path, id: DraftId) -> io::Result<()>;
 
+    /// Like `remove`, for a removal requested when `sequence` was taken from
+    /// `next_draft_snapshot_sequence`. A store that can order snapshots keeps
+    /// a snapshot newer than the request, so text journalled after the
+    /// request survives a removal that only starts running later. The
+    /// default ignores the order.
+    fn remove_ordered(&self, root: &Path, id: DraftId, _sequence: u64) -> io::Result<()> {
+        self.remove(root, id)
+    }
+
     /// Every draft left over from a previous run, in no particular order,
     /// plus a count of entries that could not be read. A work folder with no
     /// recovery directory yet recovers to nothing, not an error; a directory
@@ -354,10 +363,19 @@ impl DraftStore for OsDraftStore {
     }
 
     fn remove(&self, root: &Path, id: DraftId) -> io::Result<()> {
+        self.remove_ordered(root, id, next_draft_snapshot_sequence())
+    }
+
+    fn remove_ordered(&self, root: &Path, id: DraftId, sequence: u64) -> io::Result<()> {
         let lock = draft_lock(root, id);
         let mut newest = lock.lock().unwrap_or_else(PoisonError::into_inner);
+        if sequence < *newest {
+            // A snapshot taken after this removal was requested is already
+            // accepted; it is newer content and must not be deleted.
+            return Ok(());
+        }
         // Snapshots read before this removal must not resurrect the draft.
-        *newest = (*newest).max(next_draft_snapshot_sequence());
+        *newest = sequence;
         let dir = drafts_dir(root);
         let ignore_missing = |result: io::Result<()>| match result {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),

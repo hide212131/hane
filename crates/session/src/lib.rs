@@ -68,7 +68,7 @@ pub use service::{
     SaveFailure, SavedFile, observe_disk, run_create_new_job, run_save_job,
 };
 pub use session::{
-    AutosaveTicket, CloseDecision, DocumentSession, ExternalCheckOutcome, ExternalCheckRequest,
+    AutosaveTicket, CloseDecision, DiscardOutcome, DocumentSession, ExternalCheckOutcome, ExternalCheckRequest,
     ExternalCheckResult, ExternalCheckStart, ExternalCheckTicket, ExternalStatus, FileEvent,
     FileEventOutcome, OpenDecision, OpenPolicy, ReloadOutcome, ReloadVerifyOutcome,
     ReloadVerifyRequest, ReloadVerifyResult, ResolutionApproval, ResolutionKind, SaveDecision,
