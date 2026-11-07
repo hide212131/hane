@@ -24,14 +24,23 @@
 
 ## 検証
 
-対象head `41a8f2fe20c45dc36ba19fff1f6021e601ad3f48` / base `0589d2f93d5f4f0824d37b3ef906d6425193b25e` の記録（2026-11-07）。
+current head `c27ba32f249caa1fac40c425acf5dcd394f60ea1` / base `0589d2f93d5f4f0824d37b3ef906d6425193b25e` の記録（2026-11-07）。
 
-- Claude exact-head verifier run [42355521908](https://github.com/hide212131/hane/actions/runs/42355521908) がworkspace regression testsとlintに成功した。
-- PR CI [42355629125](https://github.com/hide212131/hane/actions/runs/42355629125) がmacOS/Windows workspace testsとClippyに成功した。
-- 隔離Mac checkoutで `cargo clippy --workspace --all-targets --all-features -- -D warnings` と `cargo build -p hane --locked` が成功した。
-- Mac隔離GUIはhead `2ba40967909bca9402fb4e6bc910cb9b0bb2639c` で、system pasteboardのHTML貼り付け、文章中の日本語リンクと括弧/query付きURL、各種書式、保存結果、Undo/Redoを確認した。後続head `41a8f2f` では日本語句読点を含む強調のMarkdown変換と回帰テストを修正したため、このGUIシナリオは最新headでは再実行していない。
-- Windows固有CF_HTML経路のhead `2ba4096` Debug buildは成功したが、コード変更でheadが進んだ時点で候補GUIは起動せず終了した。最終headのWindows Debug buildと必要最小限のGUI確認を後段で行う。
-- Release `TestAppContext`の旧probeはnative OS clipboard・実描画・実入力遅延を測定しておらず、現在headの性能証拠とはしない。ネイティブ性能は未測定。
+current headの証拠（macOS・CI）:
+
+- 最新headのmacOSで `cargo test -p hane-markdown --test rich_paste --locked` が38件成功し、`cargo build -p hane --locked` が成功した。
+- current-head CI run [42376761341](https://github.com/hide212131/hane/actions/runs/42376761341) がmacOS/Windows workspace testsとClippyに成功した。
+- 最新headで隔離Mac GUIからsystem pasteboardのHTMLを通常Pasteし、日本語labelと複数URLリンクがMarkdownになること、太字リンクの保存結果、Undo/Redoを確認した。
+- current-headのCodeRabbit reviewはskipだった。
+
+古いheadの証拠（current-head evidenceとして扱わない）:
+
+- Windows Debug buildと隔離GUIはhead `56c1d27a123a3d23c6d12c602291d261627ac479` の証拠である。後続の変更は共通Markdown parserであり、Windows固有コードは変わっていないため、Windows固有差分の追加GUI確認は残作業にしない。
+- 以前のhead（`41a8f2f`、`2ba4096` など）のCI/GUI記録はcurrent headの証拠ではない。
+
+性能:
+
+- Release `TestAppContext`の旧probeはnative OS clipboard・実描画・実入力遅延を測定しておらず、現在headの性能証拠とはしない。ネイティブclipboard性能は未測定。
 
 ## 状態
 
@@ -49,6 +58,7 @@
 
 ### 残る確認
 
-- 最終head `41a8f2f` のWindows Debug buildと、ブラウザから文章・URL混在のリッチテキストを貼り付ける隔離GUIスモーク（Markdown保存、リンクlabel/href、書式、Undo/Redo、日本語入力）。接続先Windows上で直接操作する。
-- CodeRabbitのcurrent-head full reviewはincluded review limitで開始できず、Policy §4.2に従いcurrent-head CI成功後のCodex review fallbackを依頼済み。結果を取得し、current headに結び付く未解決所見を確認する。
-- ネイティブclipboardの性能測定。
+- current-headのCodeRabbit reviewはskipだったため、CI完了後にCommanderがPolicy §4.2に従い一度限りのCodex reviewを実行し、結果とcurrent headへの結び付きを確認する。
+- レビューthreadの確認。
+- expected-head SHAを指定したmergeとrelease。
+- ネイティブclipboardの性能測定（未測定のまま）。
