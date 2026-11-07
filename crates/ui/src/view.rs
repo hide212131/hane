@@ -1916,6 +1916,10 @@ impl EditorView {
         // between the edit and the next sync. The sync that follows the input
         // (or the next render) restores the real value.
         self.raise_external_open_guard();
+        // Any selection change needs a call here, so a running Paste conversion
+        // is dropped as soon as the next call sees the moved selection, even if
+        // that call moves it back to where the conversion started.
+        self.drop_clipboard_job_if_selection_moved();
         self.sessions.active_mut().editor_mut()
     }
 

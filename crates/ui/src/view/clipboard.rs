@@ -59,6 +59,25 @@ impl EditorView {
         }
     }
 
+    /// Drops the running Paste conversion when the selection of the document it
+    /// started on is no longer the one it started with. Comparing only the
+    /// selection leaves events that do not move it (scroll, focus-neutral
+    /// input, status updates) free to leave the job running.
+    pub(super) fn drop_clipboard_job_if_selection_moved(&mut self) {
+        let Some(job) = self.clipboard_job else {
+            return;
+        };
+        let moved = self
+            .sessions
+            .get(job.id)
+            .is_some_and(|session| session.editor().selection() != job.selection);
+        if moved {
+            self.clipboard_generation = self.clipboard_generation.wrapping_add(1);
+            self.clipboard_job = None;
+            self.status = Some(PASTE_STALE_MESSAGE.to_owned());
+        }
+    }
+
     /// Paste / PastePlainText into the document body.
     ///
     /// A read-only body is refused before the clipboard is read. An unfinished
@@ -565,6 +584,34 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(text_of(&view, cx), "ab cd!\n");
         view.read_with(cx, |view, _| assert!(view.clipboard_job.is_none()));
+    }
+
+    /// Moving the selection away and back before the conversion finishes still
+    /// drops the result.
+    #[gpui::test]
+    fn moving_the_selection_away_and_back_drops_a_running_conversion(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, "ab cd\n");
+        select(&view, cx, forward(0, 2));
+        set_clipboard(cx, "plain");
+        set_test_snapshot(Some("<b>B</b>"), false, None);
+        paste(&view, cx, PasteMode::Rich);
+        view.read_with(cx, |view, _| assert!(view.clipboard_job.is_some()));
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(3)))
+                .unwrap();
+            view.editor_mut().set_selection(forward(0, 2)).unwrap();
+            cx.notify();
+        });
+        view.read_with(cx, |view, _| assert!(view.clipboard_job.is_none()));
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), "ab cd\n");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), forward(0, 2));
+            assert!(view.clipboard_job.is_none());
+        });
     }
 
     /// A newer Paste supersedes the older one: the result is applied once.
