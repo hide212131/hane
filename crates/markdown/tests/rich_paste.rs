@@ -56,6 +56,28 @@ fn body_pipes_are_escaped_and_never_form_a_table() {
     assert_eq!(markdown, "a \\| b\n\n--- \\| ---");
 }
 
+/// Pipe escaping applies to body text only: an inline code span keeps the
+/// literal `a|b` the page showed, without a backslash.
+#[test]
+fn inline_code_pipes_stay_literal() {
+    let markdown = md("<p>x | y <code>a|b</code></p>");
+    assert_eq!(markdown, "x \\| y `a|b`");
+    assert_eq!(count_kind(&markdown, NodeKind::Table), 0);
+    let codes: Vec<&str> = parse_document(
+        Revision(1),
+        SourceRange::new(0, markdown.len()),
+        &markdown,
+    )
+    .tree
+    .iter()
+    .filter(|(_, node)| node.kind == NodeKind::InlineCode)
+    .map(|(_, node)| {
+        markdown[node.source_range.start.0..node.source_range.end.0].trim_matches('`')
+    })
+    .collect();
+    assert_eq!(codes, ["a|b"]);
+}
+
 /// The user's required condition: ordinary text and several links in one
 /// paragraph keep every label, destination and the surrounding sentences.
 #[test]
