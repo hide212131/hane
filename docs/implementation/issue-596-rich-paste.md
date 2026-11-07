@@ -14,6 +14,10 @@
 - 同一世代のsnapshot、CF_HTMLのbyte offset、native所有権、HTML-only、不正HTMLとplain fallback、入力・node/depth・出力上限、安全な破棄を設計に従って扱う。script等を実行・保持せず、ネットワーク取得しない。
 - `vendor/gpui`は旧経路のため変更しない。現行platform patchとhane-markdownの責務を使い、UIへ別parserやnative APIを複製しない。
 
+## URLリンク混在の必須条件
+
+通常テキストと複数のリンクが混在する文章を、前後の文章を保って`文章 [表示テキスト](https://example.com/) 文章`へ変換する。日本語ラベル、強調とリンクの入れ子・隣接、句読点、括弧やクエリを含むリンク先を確認する。ラベルをURLへ置換したり段落全体をリンク化したりしない。既存#629とは別の外部HTML入力の契約である。
+
 ## 並行開発
 
 #591 / PR #679はopen Draftで、clipboard snapshotとPaste dispatchが重なるが、未受入の製品コードはmainへ存在しない。本フェーズはcurrent mainの受入済みinput routingと範囲置換を使い、#679の実装をコピーしない。将来どちらかのmerge後にもう一方を共有snapshot/単一dispatchへ統合し、二重読取・優先順位判定を残さない。画像取り込み・保存・履歴rewriteは本PRの対象外。#297全体は待たない。
