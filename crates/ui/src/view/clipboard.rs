@@ -70,7 +70,7 @@ impl EditorView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.body_editable() {
+        if !self.body_paste_ready() {
             return;
         }
         self.invalidate_clipboard_job();
@@ -603,6 +603,44 @@ mod tests {
         cx.run_until_parked();
         assert_eq!(text_of(&view, cx), "ab\n");
         assert_eq!(status_of(&view, cx).as_deref(), Some(PASTE_STALE_MESSAGE));
+    }
+
+    /// While the close confirmation is open, the synchronous Paste paths (plain
+    /// text, the Replace fallback) and the start of an HTML conversion change
+    /// neither the document, the selection nor the Undo history.
+    #[gpui::test]
+    fn paste_while_a_close_confirmation_is_open_changes_nothing(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "ab\n");
+        select(&view, cx, forward(0, 1));
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let instance = view.document_instance(id).unwrap();
+            view.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let can_undo = view.read_with(cx, |view, _| view.editor().can_undo());
+
+        let table = "<table><tr><td>a</td></tr></table>";
+        let cases = [
+            (PasteMode::PlainText, "plain", None),
+            (PasteMode::Rich, "plain", None),
+            (PasteMode::Rich, "表のplain", Some(table)),
+            (PasteMode::Rich, "plain", Some("<b>x</b>")),
+        ];
+        for (mode, plain, html) in cases {
+            set_clipboard(cx, plain);
+            set_test_snapshot(html, false, None);
+            paste(&view, cx, mode);
+            cx.run_until_parked();
+            assert_eq!(text_of(&view, cx), "ab\n");
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.editor().selection(), forward(0, 1));
+                assert_eq!(view.editor().can_undo(), can_undo);
+                assert!(view.clipboard_job.is_none());
+                assert_eq!(view.status, None);
+            });
+        }
     }
 
     /// Leaving the tab a conversion started on invalidates it, even when the
