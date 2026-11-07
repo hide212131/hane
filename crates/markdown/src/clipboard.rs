@@ -824,6 +824,12 @@ fn ends_ordered_list(block: &Block) -> bool {
     starts_ordered_list(block)
 }
 
+fn starts_at_one(block: &Block) -> bool {
+    let first = block.text.lines().next().unwrap_or("");
+    let digits = first.bytes().take_while(u8::is_ascii_digit).count();
+    first[..digits].parse::<u32>() == Ok(1)
+}
+
 fn is_ordered_marker(line: &str) -> bool {
     let digits = line.bytes().take_while(u8::is_ascii_digit).count();
     let rest = &line[digits..];
@@ -1598,7 +1604,19 @@ impl Renderer<'_> {
         let mut body = String::new();
         for (position, block) in blocks.iter().enumerate() {
             if position > 0 {
-                body.push_str(if self.plain || block.list { "\n" } else { "\n\n" });
+                let previous = &blocks[position - 1];
+                if self.plain {
+                    body.push('\n');
+                } else if starts_ordered_list(block) && ends_ordered_list(previous) {
+                    // Adjacent ordered lists would merge into one and lose the
+                    // later start number.
+                    body.push_str("\n\n<!-- -->\n\n");
+                } else if starts_ordered_list(block) && !previous.list && !starts_at_one(block) {
+                    // Only an ordered list starting at 1 can interrupt a paragraph.
+                    body.push_str("\n\n");
+                } else {
+                    body.push_str(if block.list { "\n" } else { "\n\n" });
+                }
             }
             body.push_str(&block.text);
         }

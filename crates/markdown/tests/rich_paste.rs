@@ -300,6 +300,22 @@ fn adjacent_ordered_lists_keep_their_own_boundary_and_start() {
 }
 
 #[test]
+fn nested_ordered_lists_keep_paragraph_boundaries_and_starts() {
+    let markdown = md("<ul><li>x<ol start=\"3\"><li>y</li></ol></li></ul>");
+    assert_eq!(markdown, "- x\n\n  3. y");
+    assert_eq!(count_kind(&markdown, NodeKind::List { start: Some(3) }), 1);
+
+    let markdown = md("<ul><li>x<ol><li>y</li></ol></li></ul>");
+    assert_eq!(markdown, "- x\n  1. y");
+
+    let markdown =
+        md("<ul><li><ol><li>a</li></ol><ol start=\"4\"><li>b</li></ol></li></ul>");
+    assert_eq!(markdown, "- 1. a\n\n  <!-- -->\n\n  4. b");
+    assert_eq!(count_kind(&markdown, NodeKind::List { start: Some(1) }), 1);
+    assert_eq!(count_kind(&markdown, NodeKind::List { start: Some(4) }), 1);
+}
+
+#[test]
 fn unsupported_constructs_fall_back_instead_of_being_half_converted() {
     assert_eq!(
         html_to_markdown("<table><tr><td>a</td></tr></table>"),
