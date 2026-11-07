@@ -996,6 +996,7 @@ fn markdown_destination(url: &str) -> String {
         match ch {
             '(' if !balanced => out.push_str("%28"),
             ')' if !balanced => out.push_str("%29"),
+            '\\' => out.push_str("\\\\"),
             '&' if looks_like_entity(&url[at + 1..]) => out.push_str("\\&"),
             other => out.push(other),
         }

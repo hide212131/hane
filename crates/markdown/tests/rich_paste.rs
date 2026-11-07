@@ -110,6 +110,39 @@ fn link_destinations_with_parentheses_and_queries_are_kept() {
     );
 }
 
+/// A backslash in the destination is escaped so the re-parsed link target
+/// equals the href instead of losing the backslash to a Markdown escape.
+#[test]
+fn link_destinations_with_backslashes_survive_a_reparse() {
+    for (html, expected) in [
+        (
+            r#"<a href="https://example.com/?p=\\)">x</a>"#,
+            r"https://example.com/?p=\\%29",
+        ),
+        (
+            r#"<a href="https://example.com/?p=\\(y)">x</a>"#,
+            r"https://example.com/?p=\\(y)",
+        ),
+        (
+            r#"<a href="https://example.com/?p=\&amp;amp;">x</a>"#,
+            r"https://example.com/?p=\&amp;",
+        ),
+    ] {
+        let markdown = md(html);
+        let document = parse_document(
+            Revision(1),
+            SourceRange::new(0, markdown.len()),
+            &markdown,
+        );
+        let destinations: Vec<&str> = document
+            .links
+            .iter()
+            .map(|link| &*link.destination)
+            .collect();
+        assert_eq!(destinations, vec![expected], "{markdown:?}");
+    }
+}
+
 #[test]
 fn href_keeps_semicolonless_legacy_references_before_equals_or_alphanumerics() {
     assert_eq!(
