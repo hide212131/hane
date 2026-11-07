@@ -98,6 +98,19 @@ fn links_nest_with_and_sit_next_to_emphasis() {
 }
 
 #[test]
+fn empty_link_labels_do_not_inject_the_destination() {
+    assert_eq!(
+        md(r#"<p>前<a href="https://example.com/"></a>後</p>"#),
+        "前後"
+    );
+    let spaced = md(r#"<p>前<a href="https://example.com/"> </a>後</p>"#);
+    assert_eq!(spaced, "前 後");
+    let image = md(r#"<p>前<a href="https://example.com/"><img src="x.png"></a>後</p>"#);
+    assert!(!image.contains("example.com"), "{image:?}");
+    assert!(image.starts_with('前') && image.ends_with('後'), "{image:?}");
+}
+
+#[test]
 fn unsafe_and_relative_hrefs_keep_only_the_label() {
     assert_eq!(md(r#"<a href="javascript:alert(1)">文字</a>"#), "文字");
     assert_eq!(

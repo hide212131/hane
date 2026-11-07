@@ -905,7 +905,9 @@ fn is_flank_punctuation(ch: char) -> bool {
 fn wrap_link(inner: &str, destination: &str) -> String {
     let core = inner.trim_matches(is_edge_space);
     if core.is_empty() {
-        return format!("<{destination}>");
+        // An empty label has nothing to link; keep the source text as is
+        // rather than inventing the destination as visible text.
+        return inner.to_owned();
     }
     let lead = &inner[..inner.len() - inner.trim_start_matches(is_edge_space).len()];
     let trail = &inner[inner.trim_end_matches(is_edge_space).len()..];
