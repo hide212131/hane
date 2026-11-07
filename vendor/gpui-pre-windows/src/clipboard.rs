@@ -779,7 +779,7 @@ impl Drop for LockedGlobal {
 }
 
 #[cfg(test)]
-mod tests {
+mod image_tests {
     use super::*;
 
     #[test]
