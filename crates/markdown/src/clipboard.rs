@@ -875,7 +875,15 @@ fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     // ASCII punctuation from literal text breaks flanking next to a word too.
     // Characters that open or close nested Markdown constructs (code spans,
     // nested marks, links, inline HTML) are not literal text, so they stay.
-    let structural = |ch: char| matches!(ch, '`' | '*' | '~' | '[' | ')' | '>' | '<');
+    // A `)` only closes a nested link when the text holds an unescaped `](`;
+    // literal text escapes `]`, so a bare trailing `)` is plain punctuation.
+    let has_link = core
+        .match_indices("](")
+        .any(|(at, _)| !core[..at].ends_with('\\'));
+    let structural = |ch: char| match ch {
+        ')' => has_link,
+        _ => matches!(ch, '`' | '*' | '~' | '[' | '>' | '<'),
+    };
     let ascii_edge = |ch: char, escaped: bool| {
         ch.is_ascii_punctuation() && (escaped || !structural(ch))
     };

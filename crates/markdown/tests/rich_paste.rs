@@ -555,6 +555,20 @@ fn ascii_punctuation_edges_keep_their_emphasis() {
     assert_eq!(emphasis, "foo<em>(a)</em>bar");
     assert_eq!(count_kind(&emphasis, NodeKind::InlineHtml), 2);
 
+    let trailing = md("<p>foo<em>a)</em>bar</p>");
+    assert_eq!(trailing, "foo<em>a)</em>bar");
+    assert_eq!(count_kind(&trailing, NodeKind::InlineHtml), 2);
+
+    let mixed = md("<p>foo<strong>a (b)</strong>bar</p>");
+    assert_eq!(mixed, "foo<strong>a (b)</strong>bar");
+    assert_eq!(count_kind(&mixed, NodeKind::InlineHtml), 2);
+
+    let unicode = md("<p>本文<strong>!重要。</strong>です</p>");
+    assert_eq!(unicode, "本文<strong>!重要。</strong>です");
+
+    let linked = md(r#"<p><strong><a href="https://example.com/">太字</a></strong></p>"#);
+    assert_eq!(linked, "**[太字](https://example.com/)**");
+
     let plain = md("<p>foo<strong>a</strong>bar</p>");
     assert_eq!(plain, "foo**a**bar");
     assert_eq!(count_kind(&plain, NodeKind::Strong), 1);
