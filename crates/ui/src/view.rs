@@ -102,6 +102,7 @@ pub use app_update::{
 mod ai_settings;
 mod background_parse;
 mod basic_editing_keys;
+mod clipboard;
 mod content_search;
 mod document_find;
 mod editor_context_menu;
@@ -948,6 +949,12 @@ pub struct EditorView {
     editor_context_menu_generation: u64,
     /// Closes the body menu when the window loses activation.
     editor_context_menu_activation: Option<gpui::Subscription>,
+    /// Source of the generation that ties a background Paste conversion to the
+    /// one Paste that started it (Issue #596). A newer Paste, Copy or Cut bumps it.
+    clipboard_generation: u64,
+    /// The Paste conversion running in the background, with the document
+    /// instance, revision and directional selection it was started against.
+    clipboard_job: Option<clipboard::PasteJob>,
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
@@ -1909,6 +1916,10 @@ impl EditorView {
         // between the edit and the next sync. The sync that follows the input
         // (or the next render) restores the real value.
         self.raise_external_open_guard();
+        // Any selection change needs a call here, so a running Paste conversion
+        // is dropped as soon as the next call sees the moved selection, even if
+        // that call moves it back to where the conversion started.
+        self.drop_clipboard_job_if_selection_moved();
         self.sessions.active_mut().editor_mut()
     }
 
@@ -2490,6 +2501,11 @@ impl EditorView {
 
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        // A running Paste conversion belongs to the document it started on. A
+        // round trip A -> B -> A restores the same session, instance, revision
+        // and selection, so the freshness check cannot tell it apart (Issue
+        // #596 section 6).
+        self.invalidate_clipboard_job();
         // The selection AI popup's captured range/revision/instance belong to
         // the document that was active when it opened; switching tabs, a
         // work-folder reopen, or an in-place reload all replace that document
