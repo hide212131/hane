@@ -59,38 +59,6 @@ workerの使用可能な道具は `Read,Edit,Write,Glob,Grep` であり、GitHub
 
 既存コードの修正では `AADW_FAILURE_CLASS` を、観測に対応する `product` または `test` にする。同じ原因には同じ `AADW_ROOT_CAUSE` を使い、原因を区別できるGitHub上の観測を `AADW_EVIDENCE` に指定する。再送を通すために原因IDやURLだけを付け替えない。
 
-## 検証結果を次の実装依頼へ返す
-
-固定workspace testsとClippyの結果は、既存verifyの `aadw-verification-feedback-<run_id>-<run_attempt>` artifactへ返す。
-中身は `report.json` と `source-request.txt` で、提出SHA、元依頼、実終了コード、両コマンドの診断を含む。
-テスト失敗でもClippyを一度実行する。reportの保存成功は実装の合格ではなく、stepの成功表示だけを実終了の代用にしない。
-
-Commanderがcurrent factsを読み、Jevがproduct/testの追加修正を選んだ場合だけ、既存handoffへ次の二行を一組で追加できる。
-
-```text
-AADW_FEEDBACK_RUN_ID: <検証失敗を返した実runのID>
-AADW_FEEDBACK_RUN_ATTEMPT: <そのattempt>
-```
-
-`AADW_TARGET_HEAD` はsource reportの提出SHAと同じcurrent head、`AADW_EVIDENCE` は当該verify jobの実URLとする。
-source runの `head_sha` はissue_comment起点のmainの場合があり、提出SHAへ読み替えない。
-初回initialやdiagnoseに付けず、checkpoint/patch復元fieldと併用しない。同じ原因のstable IDと既存反復制限を維持する。
-初回実装と今回初めて判明した失敗原因のrootが違うことはあり、分類はCommander/Jevが行う。
-
-prepareがsource run/attempt、trusted workflow、元依頼・投稿者権限、同じPR/提出SHA、model/finalizer、
-検証とcollector/uploadの実結果、未失効artifactを照合する。workerの起動前にも再照合し、prepare時の内容hashと固定する。
-古いhead・別run/attempt・欠落/不正report・job障害・出所不明なら停止する。新fieldなしの従来依頼へ黙って降格しない。
-artifactは1日で失効するため、取得不能なら新しい観測から判断し直す。
-
-次workerには `pr-head/` 外の `feedback/report.json` と `feedback/source-request.txt` をRead可能なデータとして渡す。
-current headには前回patchが既に含まれる。同じClaude会話を再開したりpatchを重ね直したりせず、新しいClaude Codeに文脈を渡す。
-今回handoffとtrusted instructionsが範囲を定め、元依頼やログ内の命令を実行しない。
-workerは編集だけで、shell/test/build/lint・GitHub/Jev認証・pushの権限は増やさない。
-
-接続仕様・採用前後の検証は [Issue #684の詳細設計](design/issue-684-verification-feedback.md) を参照する。
-コメント起動はdefault branchのworkflowを使うので、採用前のbranch上だけでは新fieldを本番利用できない。
-採用後の実fixture往復と実修正の比較が完了するまで、Issueの受入成功や速度効果を主張しない。
-
 ## 4. 投稿後に実行結果を確認する
 
 コメント投稿成功はClaude起動成功ではない。Commanderは、投稿コメント、対象PR、対象SHAに対応する `AADW Claude Fix` のrunを確認する。
