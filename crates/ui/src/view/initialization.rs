@@ -191,6 +191,8 @@ impl EditorView {
             editor_context_menu: None,
             editor_context_menu_generation: 0,
             editor_context_menu_activation: None,
+            clipboard_generation: 0,
+            clipboard_job: None,
             tab_close_confirm: None,
             tab_close_after_save: HashMap::new(),
             save_problems: HashMap::new(),

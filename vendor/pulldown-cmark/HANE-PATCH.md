@@ -19,4 +19,6 @@ Issue #177: CommonMark 0.31.2 §6.7 に従い、space 型 hard break の判定�
 
 回帰テスト: `tests/errors.rs` の `hard_break_needs_two_trailing_spaces_not_tabs` が tab を含む改行が hard break にならず本文に残ることを検証する。Hane の `crates/markdown/tests/line_breaks.rs` の `hard_break_ignores_tabs_when_counting_trailing_spaces` でも、NodeKind と marker / line-break padding の範囲が tab バイトを隠さないことを確認する。
 
+Issue #596: クリップボードHTMLのnamed character reference展開で同じ完全なHTML5表を再利用するため、`src/entities.rs` の `get_entity` を `pub` にし、`src/lib.rs` から再公開する（解析挙動の変更はない）。Hane側の回帰テストは `crates/markdown/tests/rich_paste.rs` の `named_references_use_the_complete_html5_table`。
+
 上流版ですべての修正が公開されたら、解析層の ATX / code span / hard break 適合テストを通したうえで `[patch.crates-io]` とこのディレクトリを削除する。

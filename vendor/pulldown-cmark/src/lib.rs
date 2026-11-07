@@ -96,6 +96,9 @@ mod tree;
 
 use std::fmt::Display;
 
+// Hane patch: exposes the HTML5 named character reference table (names
+// without `&`/`;`) so clipboard HTML decoding does not duplicate it.
+pub use crate::entities::get_entity;
 pub use crate::parse::{
     BrokenLink, BrokenLinkCallback, DefaultBrokenLinkCallback, OffsetIter, Parser, RefDefs,
 };

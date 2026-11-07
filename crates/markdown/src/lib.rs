@@ -30,6 +30,7 @@
 
 mod block_index;
 mod block_store;
+mod clipboard;
 mod fence_height;
 mod link_insertion;
 mod list_editing;
@@ -44,6 +45,10 @@ pub use block_index::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, Confidence, IndexSource, IndexedBlock,
     PublishOutcome, TableProjection, TableProjectionCell, TableProjectionLink,
     TableProjectionRow,
+};
+pub use clipboard::{
+    HtmlImportError, HtmlLimits, MAX_HTML_BYTES, MAX_HTML_DEPTH, MAX_HTML_NODES,
+    MAX_MARKDOWN_BYTES, html_to_markdown, html_to_markdown_with_limits, html_to_plain_text,
 };
 pub use fence_height::FenceHeightProjection;
 pub use link_insertion::{

@@ -1,0 +1,64 @@
+# Issue #596: 外部リッチテキストのMarkdown貼り付け（先行フェーズ）
+
+対象: https://github.com/hide212131/hane/issues/596
+基準 main: `0e7bbd221db2f377aee9d9992b85b8d5e0362ea7`
+採用済み設計: `docs/design/issue-596-rich-clipboard.md`（設計PR #650 merge済み）。
+
+## 今回の契約
+
+利用者の依頼はWindows/macOSで外部アプリからコピーしたリッチテキストをMarkdownとして貼り付け、mainへのmergeとreleaseまで行うこと。ブラウザと文書アプリを代表対象とする。Issue #596の外部入力側を先行フェーズとして実装する。書式付きコピー/exportは後続とし、このPRで親Issueをcloseしない。
+
+- 外部HTMLの段落、H1〜H6、太字、斜体、取り消し線、コード、リスト、引用、HTTP(S)リンク、改行をMarkdownへ変換する。フォント・色・背景・任意CSSは持ち込まない。RTF-onlyの書式復元は既存設計の対象外で、提供されたplainを使う。
+- 通常Pasteと本文のプレーンテキストPaste、右クリックメニューを実装する。plain-onlyは原文のまま。Hane内Copyは今回plainのままなので、原文の往復を維持する。将来用metadataを読む場合も設計どおり一致を確認し、信頼の根拠にはしない。
+- 本文以外の入力先・閲覧モード・IMEを保護し、選択置換とUndo/Redoを一編集として扱う。非同期jobはsession/instance/revision/selection方向/generation/focusを検証し、古い結果を適用しない。
+- 同一世代のsnapshot、CF_HTMLのbyte offset、native所有権、HTML-only、不正HTMLとplain fallback、入力・node/depth・出力上限、安全な破棄を設計に従って扱う。script等を実行・保持せず、ネットワーク取得しない。
+- `vendor/gpui`は旧経路のため変更しない。現行platform patchとhane-markdownの責務を使い、UIへ別parserやnative APIを複製しない。
+
+## URLリンク混在の必須条件
+
+通常テキストと複数のリンクが混在する文章を、前後の文章を保って`文章 [表示テキスト](https://example.com/) 文章`へ変換する。日本語ラベル、強調とリンクの入れ子・隣接、句読点、括弧やクエリを含むリンク先を確認する。ラベルをURLへ置換したり段落全体をリンク化したりしない。既存#629とは別の外部HTML入力の契約である。
+
+## 並行開発
+
+#591 / PR #679はopen Draftで、clipboard snapshotとPaste dispatchが重なるが、未受入の製品コードはmainへ存在しない。本フェーズはcurrent mainの受入済みinput routingと範囲置換を使い、#679の実装をコピーしない。将来どちらかのmerge後にもう一方を共有snapshot/単一dispatchへ統合し、二重読取・優先順位判定を残さない。画像取り込み・保存・履歴rewriteは本PRの対象外。#297全体は待たない。
+
+## 検証
+
+current head `c27ba32f249caa1fac40c425acf5dcd394f60ea1` / base `0589d2f93d5f4f0824d37b3ef906d6425193b25e` の記録（2026-11-07）。
+
+current headの証拠（macOS・CI）:
+
+- 最新headのmacOSで `cargo test -p hane-markdown --test rich_paste --locked` が38件成功し、`cargo build -p hane --locked` が成功した。
+- current-head CI run [42376761341](https://github.com/hide212131/hane/actions/runs/42376761341) がmacOS/Windows workspace testsとClippyに成功した。
+- 最新headで隔離Mac GUIからsystem pasteboardのHTMLを通常Pasteし、日本語labelと複数URLリンクがMarkdownになること、太字リンクの保存結果、Undo/Redoを確認した。
+- current-headのCodeRabbit reviewはskipだった。
+
+古いheadの証拠（current-head evidenceとして扱わない）:
+
+- Windows Debug buildと隔離GUIはhead `56c1d27a123a3d23c6d12c602291d261627ac479` の証拠である。後続の変更は共通Markdown parserであり、Windows固有コードは変わっていないため、Windows固有差分の追加GUI確認は残作業にしない。
+- 以前のhead（`41a8f2f`、`2ba4096` など）のCI/GUI記録はcurrent headの証拠ではない。
+
+性能:
+
+- Release `TestAppContext`の旧probeはnative OS clipboard・実描画・実入力遅延を測定しておらず、現在headの性能証拠とはしない。ネイティブclipboard性能は未測定。
+
+## 状態
+
+先行フェーズの製品コードとテストを実装した。実装した責務は次のとおり。
+
+- `crates/markdown/src/clipboard.rs`: 外部HTML→Markdown/プレーン文字の純粋変換（`html_to_markdown` / `html_to_plain_text`）。入力・node・深さ・出力の上限は構築中に適用し、DOMはflatな`Vec`で破棄時に再帰しない。fixtureは`crates/markdown/tests/rich_paste.rs`。
+- `vendor/gpui-pre-macos` / `vendor/gpui-pre-windows`: 同一世代のplain/HTML/画像/ファイルを読む`read_rich_clipboard`（macOS `changeCount`、Windows `ClipboardGuard`とCF_HTMLのUTF-8 byte offset）。読取り専用で、書式付きexportは含まない。
+- `crates/ui/src/clipboard.rs`: スナップショットと貼り付けの決定表（純粋）。`crates/ui/src/view/clipboard.rs`: 本文Paste/PastePlainTextの共通入口、非同期変換の鮮度検査、範囲置換。`actions.rs` / `view/editor_context_menu.rs`: Paste・Cut・Copy・`PastePlainText`（secondary-shift-v）と本文context menuの接続。
+
+### 設計との差分（要確認）
+
+- 設計文書が想定した`html5ever` / `markup5ever_rcdom`ではなく、上限を構築中に強制できるcrate内parserを採用した。入力・node・depth・出力の上限をtree生成中に適用し、巨大入力が未制限のDOMとして展開されるのを避ける。依存とlockfileは増えていない。
+- `read_rich_clipboard`は`source_format`引数と`source_metadata`を持たない（Haneの専用metadataは書式付きexportを後続に回したため未使用）。`WriteFailed`も書込みが無いため未定義。
+- 書式付きexport（HTML/metadataの書込み）、RTF-onlyの書式復元、表の完全変換は対象外のまま。
+
+### 残る確認
+
+- current-headのCodeRabbit reviewはskipだったため、CI完了後にCommanderがPolicy §4.2に従い一度限りのCodex reviewを実行し、結果とcurrent headへの結び付きを確認する。
+- レビューthreadの確認。
+- expected-head SHAを指定したmergeとrelease。
+- ネイティブclipboardの性能測定（未測定のまま）。
