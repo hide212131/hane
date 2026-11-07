@@ -856,10 +856,9 @@ fn wrap_delimited(inner: &str, open: &str, close: &str) -> String {
     }
     let lead = &inner[..inner.len() - inner.trim_start_matches(is_edge_space).len()];
     let trail = &inner[inner.trim_end_matches(is_edge_space).len()..];
-    if !core.chars().any(char::is_alphanumeric) {
-        if let Some(tag) = html_tag(open) {
-            return format!("{lead}<{tag}>{core}</{tag}>{trail}");
-        }
+    let html = html_tag(open).filter(|_| !core.chars().any(char::is_alphanumeric));
+    if let Some(tag) = html {
+        return format!("{lead}<{tag}>{core}</{tag}>{trail}");
     }
     format!("{lead}{open}{core}{close}{trail}")
 }
