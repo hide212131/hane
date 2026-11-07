@@ -1063,7 +1063,10 @@ fn escape_line_starts(text: &str) -> String {
             Some(first @ (b'-' | b'+'))
                 if bytes.len() == 1
                     || bytes[1] == b' '
-                    || bytes.iter().all(|&byte| byte == first) =>
+                    || bytes.iter().all(|&byte| byte == first)
+                    || (first == b'-'
+                        && bytes.iter().all(|&byte| matches!(byte, b'-' | b' ' | b'\t'))
+                        && bytes.iter().filter(|&&byte| byte == b'-').count() >= 3) =>
             {
                 Some(0)
             }

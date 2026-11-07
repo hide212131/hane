@@ -174,6 +174,17 @@ fn line_starts_that_would_become_blocks_are_escaped() {
     assert_eq!(md("<p>a<br>1. b</p>"), "a\\\n1\\. b");
 }
 
+/// Hyphens separated by spaces still form a CommonMark thematic break, which
+/// would drop the pasted text on a Markdown round trip.
+#[test]
+fn spaced_hyphen_lines_do_not_become_thematic_breaks() {
+    for text in ["-- -", "--- -"] {
+        let markdown = md(&format!("<p>{text}</p>"));
+        assert_eq!(markdown, format!("\\{text}"));
+        assert_eq!(count_kind(&markdown, NodeKind::Rule), 0, "{markdown:?}");
+    }
+}
+
 #[test]
 fn inline_and_fenced_code() {
     assert_eq!(md("<p>使う <code>a`b</code> と</p>"), "使う ``a`b`` と");
