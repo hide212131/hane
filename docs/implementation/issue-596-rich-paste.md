@@ -29,4 +29,18 @@
 
 ## 状態
 
-この文書は実装用Draft PRの準備のみ。製品コード・テストは未実装で、baseline・GUI・CI・reviewも未完了。製品変更はClaudeへ正式依頼する。
+先行フェーズの製品コードとテストを実装した。実装した責務は次のとおり。
+
+- `crates/markdown/src/clipboard.rs`: 外部HTML→Markdown/プレーン文字の純粋変換（`html_to_markdown` / `html_to_plain_text`）。入力・node・深さ・出力の上限は構築中に適用し、DOMはflatな`Vec`で破棄時に再帰しない。fixtureは`crates/markdown/tests/rich_paste.rs`。
+- `vendor/gpui-pre-macos` / `vendor/gpui-pre-windows`: 同一世代のplain/HTML/画像/ファイルを読む`read_rich_clipboard`（macOS `changeCount`、Windows `ClipboardGuard`とCF_HTMLのUTF-8 byte offset）。読取り専用で、書式付きexportは含まない。
+- `crates/ui/src/clipboard.rs`: スナップショットと貼り付けの決定表（純粋）。`crates/ui/src/view/clipboard.rs`: 本文Paste/PastePlainTextの共通入口、非同期変換の鮮度検査、範囲置換。`actions.rs` / `view/editor_context_menu.rs`: Paste・Cut・Copy・`PastePlainText`（secondary-shift-v）と本文context menuの接続。
+
+### 設計との差分（要確認）
+
+- 設計は`html5ever` / `markup5ever_rcdom`を直接依存にするとしていたが、実装担当はshell・buildを実行できず`TreeSink`のAPIを検証できないため、上限を構築中に強制できるcrate内パーサーで実装した。依存とlockfileは増えていない。html5ever採用へ置き換えるかはCommanderの判断事項。
+- `read_rich_clipboard`は`source_format`引数と`source_metadata`を持たない（Haneの専用metadataは書式付きexportを後続に回したため未使用）。`WriteFailed`も書込みが無いため未定義。
+- 書式付きexport（HTML/metadataの書込み）、RTF-onlyの書式復元、表の完全変換は対象外のまま。
+
+### 未実施（このworkerでは実行していない）
+
+`cargo test` / `clippy` / workspace外vendorのnative test、baseline・性能測定、macOS/Windowsの実clipboard GUI、CI・reviewはいずれも未実施で、Commanderが別途確認する。

@@ -102,6 +102,7 @@ pub use app_update::{
 mod ai_settings;
 mod background_parse;
 mod basic_editing_keys;
+mod clipboard;
 mod content_search;
 mod document_find;
 mod editor_context_menu;
@@ -948,6 +949,12 @@ pub struct EditorView {
     editor_context_menu_generation: u64,
     /// Closes the body menu when the window loses activation.
     editor_context_menu_activation: Option<gpui::Subscription>,
+    /// Source of the generation that ties a background Paste conversion to the
+    /// one Paste that started it (Issue #596). A newer Paste, Copy or Cut bumps it.
+    clipboard_generation: u64,
+    /// The Paste conversion running in the background, with the document
+    /// instance, revision and directional selection it was started against.
+    clipboard_job: Option<clipboard::PasteJob>,
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,

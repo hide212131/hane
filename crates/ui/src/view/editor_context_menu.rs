@@ -45,6 +45,7 @@ enum EditorMenuAction {
     Copy,
     Cut,
     Paste,
+    PastePlainText,
     InsertLink,
 }
 
@@ -104,9 +105,12 @@ impl EditorView {
         let session = self.sessions.active();
         let revision = session.revision();
         let selection = session.editor().selection();
-        let clipboard_text = cx.read_from_clipboard().and_then(|item| item.text());
-        let has_clipboard_text = clipboard_text.as_deref().is_some_and(|text| !text.is_empty());
-        let link_url = clipboard_text.as_deref().and_then(clipboard_http_url);
+        // One snapshot read: the HTML-only clipboards of external apps are
+        // pasteable too (Issue #596). A busy clipboard simply offers no paste.
+        let snapshot = crate::clipboard::read_snapshot(cx).unwrap_or_default();
+        let has_clipboard_text = snapshot.plain.as_deref().is_some_and(|text| !text.is_empty())
+            || snapshot.html.is_some();
+        let link_url = snapshot.plain.as_deref().and_then(clipboard_http_url);
         let link_available = self.body_editable()
             && self.editor().ime().is_none()
             && link_url
@@ -236,6 +240,21 @@ impl EditorView {
                 view.run_editor_menu_action(&paste_menu, EditorMenuAction::Paste, window, cx);
             },
         );
+        let paste_plain_menu = menu.clone();
+        let paste_plain_item = self.file_tab_context_menu_item(
+            "editor-context-paste-plain",
+            "プレーンテキストとして貼り付け",
+            menu.has_clipboard_text && editable,
+            cx,
+            move |view, _, window, cx| {
+                view.run_editor_menu_action(
+                    &paste_plain_menu,
+                    EditorMenuAction::PastePlainText,
+                    window,
+                    cx,
+                );
+            },
+        );
 
         let menu_element = div()
             .id("editor-context-menu")
@@ -255,7 +274,8 @@ impl EditorView {
             .on_mouse_down_out(cx.listener(Self::close_editor_context_menu))
             .child(copy_item)
             .child(cut_item)
-            .child(paste_item);
+            .child(paste_item)
+            .child(paste_plain_item);
         if !show_link {
             return menu_element;
         }
@@ -320,6 +340,9 @@ impl EditorView {
             EditorMenuAction::Paste => {
                 window.dispatch_action(Box::new(crate::actions::Paste), cx);
             }
+            EditorMenuAction::PastePlainText => {
+                window.dispatch_action(Box::new(crate::actions::PastePlainText), cx);
+            }
             EditorMenuAction::InsertLink => self.insert_link_from_menu(menu, cx),
         }
         cx.notify();
@@ -381,6 +404,7 @@ mod tests {
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
         assert!(cx.update(|window, _| window.is_window_active()));
+        crate::clipboard::set_test_snapshot(None, false, None);
         (view, cx)
     }
 
@@ -760,6 +784,52 @@ mod tests {
         assert!(menu_is_open(&view, cx));
         assert!(cx.debug_bounds("editor-context-insert-link").is_none());
         assert_eq!(text_of(&view, cx), text);
+    }
+
+    /// Issue #596: the menu pastes the plain text as provided, even when the
+    /// clipboard also carries HTML.
+    #[gpui::test]
+    fn the_menu_pastes_plain_text_without_conversion(cx: &mut gpui::TestAppContext) {
+        let text = "label text\n";
+        let (view, cx) = open_view(cx, text);
+        select(
+            &view,
+            cx,
+            Selection {
+                anchor: SourceOffset(0),
+                active: SourceOffset(5),
+            },
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string("*原文*".to_owned()));
+        crate::clipboard::set_test_snapshot(Some("<b>bold</b>"), false, None);
+        right_click_row(cx);
+        assert!(cx.debug_bounds("editor-context-paste-plain").is_some());
+        click_item(cx, "editor-context-paste-plain");
+        assert_eq!(text_of(&view, cx), "*原文* text\n");
+        assert!(!menu_is_open(&view, cx));
+        crate::clipboard::set_test_snapshot(None, false, None);
+    }
+
+    /// Issue #596: an HTML-only clipboard is pasteable from the menu and the
+    /// normal Paste item converts it.
+    #[gpui::test]
+    fn the_menu_paste_converts_an_html_only_clipboard(cx: &mut gpui::TestAppContext) {
+        let text = "label text\n";
+        let (view, cx) = open_view(cx, text);
+        select(
+            &view,
+            cx,
+            Selection {
+                anchor: SourceOffset(0),
+                active: SourceOffset(5),
+            },
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(String::new()));
+        crate::clipboard::set_test_snapshot(Some("<b>bold</b>"), false, None);
+        right_click_row(cx);
+        click_item(cx, "editor-context-paste");
+        assert_eq!(text_of(&view, cx), "**bold** text\n");
+        crate::clipboard::set_test_snapshot(None, false, None);
     }
 
     /// A9: Escape-equivalent dismissal and an outside press both close the menu
