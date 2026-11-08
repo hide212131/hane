@@ -1785,6 +1785,73 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_earlier_write_to_the_same_destination_does_not_resume_a_paste_before_its_own_save_as(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("same-destination-save-while-paste-waits");
+        let destination = root.join("note.md");
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| window.focus(&view.focus_handle, cx));
+        });
+        cx.write_to_clipboard(image_item(None, png(2, 2, [9, 9, 9, 255])));
+        // The standalone untitled document asks where to save; the paste waits
+        // for its own Save As answer.
+        paste_without_waiting(&view, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.image_paste.pending_save.is_some());
+        });
+        // An earlier Save As to the destination starts writing, and the paste's
+        // own prompt then picks the same destination while that write is still
+        // in flight, so its request queues behind the earlier one.
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let instance = view.document_instance(id);
+            view.save_as_to(id, destination.clone(), false, cx);
+            assert!(view.sessions.active().save_in_flight());
+            view.handle_save_as_response(
+                id,
+                instance,
+                crate::view::SaveAsResponse::Chosen(destination.clone()),
+                cx,
+            );
+            assert!(view.image_paste.pending_save.is_some());
+        });
+        // Step the scheduler one task at a time. The paste may only resume once
+        // the write of its own request has landed, i.e. with no save in flight;
+        // the earlier write's completion must not resume it while the queued
+        // write is running, and nothing is created before that.
+        let mut steps = 0;
+        loop {
+            let resumed = view.read_with(cx, |view, _| view.image_paste.pending_save.is_none());
+            if resumed {
+                break;
+            }
+            assert_eq!(text_of(&view, cx), "");
+            assert!(steps < 10_000, "the paste never resumed");
+            assert!(pasted_files(&root).is_empty(), "no image exists before the resume");
+            cx.executor().tick();
+            steps += 1;
+        }
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.sessions.active().save_in_flight(),
+                "the paste resumed while its own save request was still running"
+            );
+        });
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), "");
+        cx.run_until_parked();
+        let text = text_of(&view, cx);
+        let name = reference_in(&text);
+        assert!(root.join("images").join(&name).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn save_as_to_another_directory_copies_the_generated_images_first(
         cx: &mut gpui::TestAppContext,
     ) {
