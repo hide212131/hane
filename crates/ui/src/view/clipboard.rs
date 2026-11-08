@@ -15,9 +15,10 @@
 
 use super::*;
 use crate::clipboard::{
-    COMPOSING_MESSAGE, CONVERTING_MESSAGE, ConvertJob, PasteDecision, PasteMode, PasteOutcome,
-    convert, decide, read_snapshot,
+    CLIPBOARD_BUSY_MESSAGE, COMPOSING_MESSAGE, CONVERTING_MESSAGE, ConvertJob, PasteDecision,
+    PasteMode, PasteOutcome, convert, decide, text_snapshot,
 };
+use crate::view::ClipboardSnapshot;
 use crate::view::input_routing::InputTarget;
 
 /// Shown when a finished conversion is not applied because the document, the
@@ -98,15 +99,23 @@ impl EditorView {
             cx.notify();
             return;
         }
-        let snapshot = match read_snapshot(cx) {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                self.status = Some(error.message().to_owned());
-                cx.notify();
-                return;
-            }
-        };
-        match decide(mode, snapshot) {
+        let snapshot = ClipboardSnapshot::read(cx);
+        if let Some(error) = snapshot.read_error {
+            self.status = Some(match error {
+                super::image_paste::ClipboardReadError::Busy
+                | super::image_paste::ClipboardReadError::ChangedDuringRead => {
+                    CLIPBOARD_BUSY_MESSAGE.to_owned()
+                }
+                _ => format!("貼り付けられませんでした: {}", error.reason()),
+            });
+            cx.notify();
+            return;
+        }
+        if mode == PasteMode::Rich && self.paste_image_from_snapshot(&snapshot, cx) {
+            return;
+        }
+        let text = text_snapshot(snapshot.text, snapshot.html, snapshot.html_problem);
+        match decide(mode, text) {
             PasteDecision::Nothing => {}
             PasteDecision::InsertPlain(text) => {
                 self.replace_selection_with(&text, None, cx);
@@ -403,6 +412,26 @@ mod tests {
         set_test_snapshot(Some("<p><b>太</b> *x*</p>"), false, None);
         dispatch(cx, Box::new(crate::actions::PastePlainText));
         assert_eq!(text_of(&view, cx), "太 *x*\n");
+    }
+
+    #[gpui::test]
+    fn plain_text_paste_ignores_a_raster_image_in_the_same_snapshot(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, "x\n");
+        select(&view, cx, forward(0, 1));
+        let mut item = ClipboardItem::new_string("原文 *そのまま*".to_owned());
+        item.entries.push(gpui::ClipboardEntry::Image(gpui::Image {
+            format: gpui::ImageFormat::Png,
+            bytes: b"not decoded for plain paste".to_vec(),
+            id: 1,
+        }));
+        cx.write_to_clipboard(item);
+        set_test_snapshot(Some("<b>書式</b>"), false, None);
+
+        dispatch(cx, Box::new(crate::actions::PastePlainText));
+        assert_eq!(text_of(&view, cx), "原文 *そのまま*\n");
+        assert_eq!(text_of(&view, cx), "原文 *そのまま*\n");
     }
 
     /// Resets a view to `text` so one test can run several snapshots.

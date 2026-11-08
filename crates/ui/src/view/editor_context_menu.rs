@@ -105,12 +105,10 @@ impl EditorView {
         let session = self.sessions.active();
         let revision = session.revision();
         let selection = session.editor().selection();
-        // One snapshot read: the HTML-only clipboards of external apps are
-        // pasteable too (Issue #596). A busy clipboard simply offers no paste.
-        let snapshot = crate::clipboard::read_snapshot(cx).unwrap_or_default();
-        let has_clipboard_text = snapshot.plain.as_deref().is_some_and(|text| !text.is_empty())
-            || snapshot.html.is_some();
-        let link_url = snapshot.plain.as_deref().and_then(clipboard_http_url);
+        // One snapshot read: image-only and HTML-only clipboards are pasteable.
+        let snapshot = ClipboardSnapshot::read(cx);
+        let has_clipboard_text = snapshot.has_paste_content();
+        let link_url = snapshot.text().and_then(clipboard_http_url);
         let link_available = self.body_editable()
             && self.editor().ime().is_none()
             && link_url

@@ -121,6 +121,9 @@ mod folder_watch;
 mod footer;
 use footer::{DocumentSaveProblem, ScopedSaveProblem};
 mod height_sync;
+mod image_paste;
+pub(crate) use image_paste::ClipboardSnapshot;
+use image_paste::ImagePasteState;
 mod initialization;
 mod inline_rename;
 pub(crate) mod input_routing;
@@ -1083,6 +1086,9 @@ pub struct EditorView {
     /// H1 sync timers that fired while a filesystem rename was already pending.
     /// They are retried after the user-controlled rename releases the path.
     title_sync_deferred: HashSet<SessionId>,
+    /// Clipboard image paste (Issue #591): the newest job number and a paste
+    /// waiting for an untitled document's first save.
+    image_paste: ImagePasteState,
     /// Paths with a background read in flight, so a second click on a note
     /// that has not finished loading yet does not start a second read.
     loading_paths: HashSet<PathBuf>,
@@ -2224,13 +2230,13 @@ impl EditorView {
         }
         match response {
             SaveAsForCloseResponse::Chosen(path) => {
-                // Armed now, against the instance as of this specific
-                // write, so only this user-chosen write's own landing
-                // (checked by `resolve_pending_tab_close`) can close the
-                // tab: nothing landed for this session before the user
+                // The close request is armed against the instance as of the
+                // specific write (inside `save_as_to`, after any generated
+                // images were copied), so only this user-chosen write's own
+                // landing (checked by `resolve_pending_tab_close`) can close
+                // the tab: nothing landed for this session before the user
                 // chose a target is eligible to satisfy this request.
-                self.tab_close_after_save.insert(id, instance);
-                self.save_session(id, SaveIntent::To(path), cx);
+                self.save_as_to(id, path, true, cx);
             }
             SaveAsForCloseResponse::Failed(error) => {
                 if self.tab_close_after_save.get(&id) == Some(&instance) {
@@ -3206,6 +3212,7 @@ impl EditorView {
         self.title_sync_in_flight.clear();
         self.title_sync_scheduled.clear();
         self.title_sync_deferred.clear();
+        self.forget_all_pending_image_pastes();
         self.loading_paths.clear();
         self.latest_open_target = None;
         self.pending_restore.clear();

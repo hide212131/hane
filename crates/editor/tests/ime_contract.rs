@@ -92,6 +92,75 @@ fn ime_commit_on_ordered_list_row_inserts_once_at_expected_offset() {
     );
 }
 
+fn shorten_markers(text: &str) -> Vec<hane_editor::TextEdit> {
+    text.match_indices("LONGNAME")
+        .map(|(at, found)| (at..at + found.len(), "x".to_owned()))
+        .collect()
+}
+
+#[test]
+fn rewrite_keeps_ime_composition_and_follows_continue_commit_and_undo() {
+    let mut editor = Editor::new("LONGNAME\nend");
+    let caret = "LONGNAME\nend".len();
+    editor
+        .set_selection(Selection::caret(SourceOffset(caret)))
+        .unwrap();
+    editor.replace_and_mark_text(None, "ni", None).unwrap();
+
+    editor.apply_rewrite(&shorten_markers).unwrap();
+    assert!(editor.ime().is_some(), "the composition must stay open");
+    assert_eq!(editor.document().full_text(), "x\nendni");
+    let ime = editor.ime().unwrap();
+    assert_eq!(ime.current_range, SourceRange::new(5, 7));
+
+    editor.replace_and_mark_text(None, "にほ", None).unwrap();
+    assert_eq!(editor.document().full_text(), "x\nendにほ");
+    editor.commit_text(None, "日本").unwrap();
+    assert_eq!(editor.document().full_text(), "x\nend日本");
+    assert_eq!(
+        editor.selection(),
+        Selection::caret(SourceOffset("x\nend日本".len()))
+    );
+
+    editor.dispatch(EditorCommand::Undo).unwrap();
+    assert_eq!(editor.document().full_text(), "x\nend");
+    editor.dispatch(EditorCommand::Redo).unwrap();
+    assert_eq!(editor.document().full_text(), "x\nend日本");
+}
+
+#[test]
+fn rewrite_keeps_ime_composition_and_cancel_restores_original_text() {
+    let mut editor = Editor::new("LONGNAME end");
+    editor
+        .set_selection(Selection::caret(SourceOffset("LONGNAME end".len())))
+        .unwrap();
+    editor.replace_and_mark_text(None, "ni", None).unwrap();
+    editor.apply_rewrite(&shorten_markers).unwrap();
+    assert_eq!(editor.document().full_text(), "x endni");
+
+    editor.cancel_composition().unwrap();
+    assert_eq!(editor.document().full_text(), "x end");
+    assert!(editor.ime().is_none());
+}
+
+#[test]
+fn rewrite_touching_the_composed_region_changes_nothing() {
+    let mut editor = Editor::new("abLONGNAME");
+    editor
+        .set_selection(Selection {
+            anchor: SourceOffset(0),
+            active: SourceOffset(2),
+        })
+        .unwrap();
+    editor.replace_and_mark_text(None, "ni", None).unwrap();
+    // Replaces text that overlaps the region the composition started from.
+    let plan = |_: &str| vec![(0..4, "y".to_owned())];
+
+    assert!(editor.apply_rewrite(&plan).is_err());
+    assert_eq!(editor.document().full_text(), "niLONGNAME");
+    assert!(editor.ime().is_some());
+}
+
 #[test]
 fn ime_composition_does_not_inject_structural_prefixes() {
     let mut editor = Editor::new("- item\n");

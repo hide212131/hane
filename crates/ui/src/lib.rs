@@ -10,6 +10,7 @@
 mod actions;
 mod capture;
 mod clipboard;
+mod clipboard_image;
 pub mod context_menu;
 mod icons;
 mod input;

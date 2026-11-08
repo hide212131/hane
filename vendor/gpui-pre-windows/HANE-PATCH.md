@@ -4,7 +4,58 @@ This directory vendors the crates.io package `gpui-pre-windows 0.3.6`, a
 snapshot of Zed `bcf6582ce3500df93a8a39366640173e6786cea6`. The downloaded crate
 SHA-256 is `27662e65bfcf4445d2cccfad91f1570ec07f4b1b5de98400a9f207fd19c464cf`.
 The Apache-2.0 license is retained in `LICENSE-APACHE`. Hane changes only
-`src/events.rs`, `src/vsync.rs`, and `src/dispatcher.rs`.
+`src/events.rs`, `src/vsync.rs`, `src/dispatcher.rs`, `src/clipboard.rs`, and the
+re-export line in `src/gpui_windows.rs`.
+
+## Prefer PNG and retry a busy clipboard (Issue #591)
+
+`read_from_clipboard` already reads text and image formats inside one
+`ClipboardGuard`. It used to keep whichever image format was enumerated first, so
+a CF_DIB (no alpha) could win over a `PNG` representation that keeps
+transparency. It now keeps one image by priority: `PNG`, then `JFIF`/`GIF`, then
+`CF_DIB`, then the rest. `ClipboardGuard::open` retries `OpenClipboard` up to
+five times, 10 ms apart, because another process may hold the clipboard briefly.
+GPUI's `read_from_clipboard` still reports the final failure as no content (its
+`Option` return type cannot express "busy"), so Hane's body Paste uses the
+narrow public API below.
+
+### Narrow public API `read_rich_clipboard` (Issue #591 / #596)
+
+The crate root exports `read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>,
+RichClipboardError>`, `RichClipboardSnapshot { item, html, images }` and
+`RichClipboardError` (`Busy`, `ChangedDuringRead`, `InvalidFormat`, `TooLarge`),
+with the same shape as the macOS crate. `Platform` and `ClipboardItem` are
+unchanged. A clipboard that holds only unsupported formats is
+`Ok(Some(snapshot))` with empty content and `snapshot.unsupported_formats == true`,
+so it is told apart from a really empty clipboard (`Ok(None)`). The read happens inside one `ClipboardGuard`; the retry is kept, but
+its final failure is `Err(Busy)`, never an empty clipboard. `Ok(None)` means the
+clipboard really holds nothing supported. `ChangedDuringRead` is never produced
+here because the open guard prevents any change during the read.
+
+- `item` holds the text and file paths; `images` holds at most one entry. **OS
+  limit:** the Windows clipboard is one data object, so independent images cannot
+  be told apart; the formats of that object collapse to the preferred one
+  (`PNG`, then `JFIF`/`GIF`, then `CF_DIB`, then the rest).
+- A declared image format whose data cannot be locked, is empty or is an invalid
+  DIB is `InvalidFormat`; more than 64 MiB is `TooLarge` (checked before the
+  copy). Another format that reads fine wins; the error is reported only when no
+  representation of the image could be read.
+- `html` is reserved for #596 and is `None` for now. No HTML decoding or write
+  API was added.
+- GPUI's `read_from_clipboard`/`write_to_clipboard` keep their behavior.
+- `convert_dib_to_bmp` adds the 12-byte external RGB masks to `bfOffBits` only
+  for a 40-byte `BITMAPINFOHEADER` with `BI_BITFIELDS`; the masks of
+  `BITMAPV4HEADER`/`BITMAPV5HEADER` are inside the header. A header size below
+  40 or a pixel offset beyond the input is rejected as an invalid DIB.
+
+```powershell
+cargo test --manifest-path vendor/gpui-pre-windows/Cargo.toml --features test-support --lib hane_clipboard
+```
+
+`Busy` cannot be forced deterministically and is not unit-tested.
+
+A real Windows 11 screenshot paste (Snipping Tool, Print Screen) and an image
+copied from an image app need a Hane GUI check on the final PR head.
 
 ## Refresh the caret's input-mode badge
 

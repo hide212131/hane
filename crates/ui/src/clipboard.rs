@@ -53,14 +53,6 @@ pub(crate) enum SnapshotError {
     ChangedDuringRead,
 }
 
-impl SnapshotError {
-    pub(crate) const fn message(self) -> &'static str {
-        match self {
-            Self::Busy | Self::ChangedDuringRead => CLIPBOARD_BUSY_MESSAGE,
-        }
-    }
-}
-
 #[cfg(test)]
 thread_local! {
     static TEST_HTML: std::cell::RefCell<(Option<String>, bool)> =
@@ -73,67 +65,34 @@ thread_local! {
 /// an error to report instead. The plain text still comes from the GPUI test
 /// clipboard.
 #[cfg(test)]
-pub(crate) fn set_test_snapshot(html: Option<&str>, html_problem: bool, error: Option<SnapshotError>) {
+pub(crate) fn set_test_snapshot(
+    html: Option<&str>,
+    html_problem: bool,
+    error: Option<SnapshotError>,
+) {
     TEST_HTML.with(|cell| *cell.borrow_mut() = (html.map(str::to_owned), html_problem));
     TEST_ERROR.with(|cell| cell.set(error));
 }
 
-#[cfg(all(target_os = "macos", not(test)))]
-pub(crate) fn read_snapshot(_cx: &gpui::App) -> Result<ClipboardSnapshot, SnapshotError> {
-    use gpui_macos::{RichClipboardError, read_rich_clipboard};
-
-    match read_rich_clipboard() {
-        Ok(Some(native)) => Ok(ClipboardSnapshot {
-            plain: native.item.text(),
-            html: native.html,
-            html_problem: native.html_problem.is_some(),
-        }),
-        Ok(None) => Ok(ClipboardSnapshot::default()),
-        Err(RichClipboardError::ChangedDuringRead) => Err(SnapshotError::ChangedDuringRead),
-        Err(
-            RichClipboardError::Busy | RichClipboardError::InvalidFormat | RichClipboardError::TooLarge,
-        ) => Err(SnapshotError::Busy),
+#[cfg(test)]
+pub(crate) fn test_html_snapshot() -> Result<(Option<String>, bool), SnapshotError> {
+    if let Some(error) = TEST_ERROR.with(std::cell::Cell::get) {
+        return Err(error);
     }
+    Ok(TEST_HTML.with(|cell| cell.borrow().clone()))
 }
 
-#[cfg(all(target_os = "windows", not(test)))]
-pub(crate) fn read_snapshot(_cx: &gpui::App) -> Result<ClipboardSnapshot, SnapshotError> {
-    use gpui_windows::{RichClipboardError, read_rich_clipboard};
-
-    match read_rich_clipboard() {
-        Ok(Some(native)) => Ok(ClipboardSnapshot {
-            plain: native.item.text(),
-            html: native.html,
-            html_problem: native.html_problem.is_some(),
-        }),
-        Ok(None) => Ok(ClipboardSnapshot::default()),
-        Err(RichClipboardError::ChangedDuringRead) => Err(SnapshotError::ChangedDuringRead),
-        Err(
-            RichClipboardError::Busy | RichClipboardError::InvalidFormat | RichClipboardError::TooLarge,
-        ) => Err(SnapshotError::Busy),
-    }
-}
-
-/// Other platforms keep the GPUI plain-text clipboard. Unit tests do too, so
-/// they never read or disturb the real OS clipboard.
-#[cfg(any(test, not(any(target_os = "macos", target_os = "windows"))))]
-pub(crate) fn read_snapshot(cx: &gpui::App) -> Result<ClipboardSnapshot, SnapshotError> {
-    #[cfg(test)]
-    {
-        if let Some(error) = TEST_ERROR.with(std::cell::Cell::get) {
-            return Err(error);
-        }
-    }
-    let plain = cx.read_from_clipboard().and_then(|item| item.text());
-    #[cfg(test)]
-    let (html, html_problem) = TEST_HTML.with(|cell| cell.borrow().clone());
-    #[cfg(not(test))]
-    let (html, html_problem) = (None, false);
-    Ok(ClipboardSnapshot {
+/// The plain-text and HTML decision input derived from the shared native read.
+pub(crate) fn text_snapshot(
+    plain: Option<String>,
+    html: Option<String>,
+    html_problem: bool,
+) -> ClipboardSnapshot {
+    ClipboardSnapshot {
         plain,
         html,
         html_problem,
-    })
+    }
 }
 
 /// HTML that must be converted off the UI thread.

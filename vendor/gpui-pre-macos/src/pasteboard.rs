@@ -12,43 +12,145 @@ use cocoa::{
 };
 use objc::{msg_send, rc::StrongPtr, runtime::Object, sel, sel_impl};
 use smallvec::SmallVec;
-use strum::IntoEnumIterator as _;
 
 use crate::ns_string;
 use gpui::{
     ClipboardEntry, ClipboardItem, ClipboardString, ExternalPaths, Image, ImageFormat, hash,
 };
 
+/// Raster formats first (PNG carries alpha), SVG last: it is not a raster image.
+const HANE_IMAGE_FORMAT_PRIORITY: [ImageFormat; 9] = [
+    ImageFormat::Png,
+    ImageFormat::Tiff,
+    ImageFormat::Jpeg,
+    ImageFormat::Gif,
+    ImageFormat::Bmp,
+    ImageFormat::Webp,
+    ImageFormat::Ico,
+    ImageFormat::Pnm,
+    ImageFormat::Svg,
+];
+
+/// Hane: the largest single image representation taken from the pasteboard
+/// (64 MiB, the same bound the editor applies to an input image).
+const HANE_MAX_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 /// Largest HTML representation read from the pasteboard (UTF-8 bytes).
 pub const MAX_RICH_HTML_BYTES: usize = 8 * 1024 * 1024;
 
-/// Why a rich pasteboard read produced no usable result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Hane: why a rich clipboard read could not produce its content. Kept
+/// identical in shape to the Windows crate's type so the editor handles both
+/// the same way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RichClipboardError {
-    /// The pasteboard could not be read now.
+    /// The clipboard could not be opened (never produced on macOS).
     Busy,
-    /// The pasteboard changed while it was being read; nothing is returned.
+    /// The pasteboard generation kept changing during the bounded retries.
     ChangedDuringRead,
-    /// The HTML representation is not valid UTF-8.
+    /// A representation is present but its data is missing or empty.
     InvalidFormat,
-    /// The HTML representation exceeds `MAX_RICH_HTML_BYTES`.
+    /// A representation exceeds the size bound.
     TooLarge,
 }
 
-/// Representations read from one pasteboard generation. HTML is the UTF-8
-/// fragment text; when it is unusable it is `None` and `html_problem` says why
-/// while `item` still holds the plain text, images and files of the same
-/// generation.
-#[derive(Clone, Debug)]
+impl std::fmt::Display for RichClipboardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Busy => "the clipboard is busy",
+            Self::ChangedDuringRead => "the clipboard changed while it was read",
+            Self::InvalidFormat => "the clipboard data is not valid",
+            Self::TooLarge => "the clipboard data is too large",
+        })
+    }
+}
+
+impl std::error::Error for RichClipboardError {}
+
+/// Hane: everything of one pasteboard generation, in one value.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RichClipboardSnapshot {
+    /// The plain text and the file paths of the generation.
     pub item: ClipboardItem,
+    /// The UTF-8 HTML fragment from the same pasteboard generation.
     pub html: Option<String>,
+    /// Why the HTML was unusable, while other representations remain available.
     pub html_problem: Option<RichClipboardError>,
+    /// One entry per independent pasteboard item that carries an image. The
+    /// formats of the same item collapse to the preferred one; separate items
+    /// stay separate. An unreadable image is an `Err`, never silently dropped.
+    pub images: Vec<Result<Image, RichClipboardError>>,
+    /// The pasteboard holds representations, but none of them is text, file
+    /// paths, an image or HTML. Such a snapshot has no content and is told
+    /// apart from a really empty pasteboard, which is `Ok(None)`.
+    pub unsupported_formats: bool,
 }
 
 /// Reads the general pasteboard (Hane Issue #596). Call on the main thread.
 pub fn read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipboardError> {
     Pasteboard::general().read_rich()
+}
+
+/// Hane: an image data length the editor can accept.
+fn check_image_length(length: usize) -> Result<(), RichClipboardError> {
+    if length == 0 {
+        Err(RichClipboardError::InvalidFormat)
+    } else if length > HANE_MAX_IMAGE_BYTES {
+        Err(RichClipboardError::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
+/// Hane: the bytes of an `NSData`, bounded before they are copied.
+unsafe fn hane_image_bytes(data: id) -> Result<Vec<u8>, RichClipboardError> {
+    unsafe {
+        if data == nil {
+            return Err(RichClipboardError::InvalidFormat);
+        }
+        let length = data.length() as usize;
+        check_image_length(length)?;
+        let bytes = data.bytes();
+        if bytes.is_null() {
+            return Err(RichClipboardError::InvalidFormat);
+        }
+        Ok(slice::from_raw_parts(bytes as *const u8, length).to_vec())
+    }
+}
+
+/// Hane: the preferred image of one pasteboard owner (the pasteboard itself or
+/// one `NSPasteboardItem`; both answer `types` and `dataForType:`). `None`
+/// when it has no image type at all.
+unsafe fn hane_best_image(owner: id) -> Option<Result<Image, RichClipboardError>> {
+    unsafe {
+        let types: id = msg_send![owner, types];
+        if types == nil {
+            return None;
+        }
+        let mut failure = None;
+        for format in HANE_IMAGE_FORMAT_PRIORITY {
+            let ut_type: UTType = format.into();
+            let present: bool = msg_send![types, containsObject: ut_type.inner()];
+            if !present {
+                continue;
+            }
+            let data: id = msg_send![owner, dataForType: ut_type.inner_mut()];
+            match hane_image_bytes(data) {
+                Ok(bytes) => {
+                    // A readable SVG never hides a raster failure.
+                    if format == ImageFormat::Svg && failure.is_some() {
+                        break;
+                    }
+                    let id = hash(&bytes);
+                    return Some(Ok(Image { format, bytes, id }));
+                }
+                // An unreadable SVG is not an image failure.
+                Err(error) if format != ImageFormat::Svg => {
+                    failure = failure.or(Some(error));
+                }
+                Err(_) => {}
+            }
+        }
+        failure.map(Err)
+    }
 }
 
 pub struct Pasteboard {
@@ -81,52 +183,125 @@ impl Pasteboard {
         }
     }
 
-    /// Reads plain text, HTML, images and files from one pasteboard
-    /// generation (Hane Issue #596). `changeCount` is compared before and
-    /// after; a different value means another app wrote while this read was
-    /// running, and the mixed result is discarded. HTML-only pasteboards are
-    /// supported. HTML that cannot be used is reported in `html_problem` while
-    /// the other representations are kept.
+    /// Hane: reads one pasteboard generation. The item is only returned when
+    /// `changeCount` is the same before and after the read, so text and image
+    /// representations always come from the same generation. A generation that
+    /// keeps changing is reported as "nothing" after a bounded number of tries.
+    pub fn read(&self) -> Option<ClipboardItem> {
+        const ATTEMPTS: usize = 3;
+        for _ in 0..ATTEMPTS {
+            let before: isize = unsafe { msg_send![*self.inner, changeCount] };
+            let item = self.read_generation();
+            let after: isize = unsafe { msg_send![*self.inner, changeCount] };
+            if before == after {
+                return item;
+            }
+        }
+        None
+    }
+
+    /// Hane: reads text, file paths and every independent image of the
+    /// pasteboard, keeping the failures apart from a really empty pasteboard.
+    /// The result is only returned when `changeCount` is the same before and
+    /// after the read; a generation that keeps changing is
+    /// `ChangedDuringRead` after a bounded number of tries, never "empty".
     pub fn read_rich(&self) -> Result<Option<RichClipboardSnapshot>, RichClipboardError> {
+        const ATTEMPTS: usize = 3;
+        for _ in 0..ATTEMPTS {
+            let before: isize = unsafe { msg_send![*self.inner, changeCount] };
+            let snapshot = self.read_rich_generation();
+            let after: isize = unsafe { msg_send![*self.inner, changeCount] };
+            if before == after {
+                return Ok(snapshot);
+            }
+        }
+        Err(RichClipboardError::ChangedDuringRead)
+    }
+
+    fn read_rich_generation(&self) -> Option<RichClipboardSnapshot> {
         unsafe {
-            let before = self.change_count();
-            let mut entries: Vec<ClipboardEntry> = Vec::new();
-            let paths = self.read_external_paths();
-            let has_paths = paths.is_some();
-            if let Some(paths) = paths {
-                entries.push(ClipboardEntry::ExternalPaths(paths));
+            let mut entries = Vec::new();
+            if let Some(paths) = self.read_paths() {
+                entries.push(paths);
             }
-            if let Some(string_item) = self.read_string_from_pasteboard() {
-                entries.push(string_item);
+            if let Some(string_entry) = self.read_string_from_pasteboard() {
+                entries.push(string_entry);
             }
-            if !has_paths {
-                for format in ImageFormat::iter() {
-                    if let Some(item) = self.read_image(format) {
-                        entries.extend(item.entries);
-                        break;
-                    }
-                }
-            }
+            let images = self.read_independent_images();
             let (html, html_problem) = match self.read_html() {
                 Ok(html) => (html, None),
                 Err(problem) => (None, Some(problem)),
             };
-            if self.change_count() != before {
-                return Err(RichClipboardError::ChangedDuringRead);
-            }
-            if entries.is_empty() && html.is_none() && html_problem.is_none() {
-                return Ok(None);
-            }
-            Ok(Some(RichClipboardSnapshot {
+            let unsupported_formats = if entries.is_empty()
+                && images.is_empty()
+                && html.is_none()
+                && html_problem.is_none()
+            {
+                if !self.has_any_type() {
+                    return None;
+                }
+                true
+            } else {
+                false
+            };
+            Some(RichClipboardSnapshot {
                 item: ClipboardItem { entries },
                 html,
                 html_problem,
-            }))
+                images,
+                unsupported_formats,
+            })
         }
     }
 
-    unsafe fn change_count(&self) -> i64 {
-        unsafe { msg_send![*self.inner, changeCount] }
+    /// Whether the pasteboard carries any representation at all, recognized or
+    /// not (on the pasteboard itself or on any of its items).
+    unsafe fn has_any_type(&self) -> bool {
+        unsafe {
+            let types: id = self.inner.types();
+            if types != nil && NSArray::count(types) > 0 {
+                return true;
+            }
+            let items: id = msg_send![*self.inner, pasteboardItems];
+            if items == nil {
+                return false;
+            }
+            for index in 0..NSArray::count(items) {
+                let item = NSArray::objectAtIndex(items, index);
+                let item_types: id = msg_send![item, types];
+                if item_types != nil && NSArray::count(item_types) > 0 {
+                    return true;
+                }
+            }
+            false
+        }
+    }
+
+    /// One preferred image per `NSPasteboardItem`. A pasteboard that reports no
+    /// items is treated as one item of its own.
+    unsafe fn read_independent_images(&self) -> Vec<Result<Image, RichClipboardError>> {
+        unsafe {
+            let items: id = msg_send![*self.inner, pasteboardItems];
+            let count = if items == nil {
+                0
+            } else {
+                NSArray::count(items)
+            };
+            let mut images = Vec::new();
+            if count == 0 {
+                if let Some(image) = hane_best_image(*self.inner) {
+                    images.push(image);
+                }
+                return images;
+            }
+            for index in 0..count {
+                let item = NSArray::objectAtIndex(items, index);
+                if let Some(image) = hane_best_image(item) {
+                    images.push(image);
+                }
+            }
+            images
+        }
     }
 
     unsafe fn read_html(&self) -> Result<Option<String>, RichClipboardError> {
@@ -148,8 +323,7 @@ impl Pasteboard {
         }
     }
 
-    /// Like `data_for_type`, but the native length is checked before anything
-    /// is copied into Rust memory.
+    /// The native length is checked before the data is copied into Rust memory.
     unsafe fn limited_data_for_type(
         &self,
         kind: id,
@@ -173,7 +347,7 @@ impl Pasteboard {
         }
     }
 
-    unsafe fn read_external_paths(&self) -> Option<ExternalPaths> {
+    unsafe fn read_paths(&self) -> Option<ClipboardEntry> {
         unsafe {
             let filenames = NSPasteboard::propertyListForType(*self.inner, NSFilenamesPboardType);
             if filenames != nil && NSArray::count(filenames) > 0 {
@@ -184,18 +358,17 @@ impl Pasteboard {
                     paths.push(PathBuf::from(path));
                 }
                 if !paths.is_empty() {
-                    return Some(ExternalPaths(paths));
+                    return Some(ClipboardEntry::ExternalPaths(ExternalPaths(paths)));
                 }
             }
             None
         }
     }
-
-    pub fn read(&self) -> Option<ClipboardItem> {
+    fn read_generation(&self) -> Option<ClipboardItem> {
         unsafe {
             // Check for file paths first
-            if let Some(paths) = self.read_external_paths() {
-                let mut entries = vec![ClipboardEntry::ExternalPaths(paths)];
+            if let Some(paths) = self.read_paths() {
+                let mut entries = vec![paths];
 
                 // Also include the string representation so text editors can
                 // paste the path as text.
@@ -206,18 +379,21 @@ impl Pasteboard {
                 return Some(ClipboardItem { entries });
             }
 
-            // Next, check for a plain string.
+            // Next, the plain string and, from the same generation, one image
+            // (Hane: a text + image clipboard keeps both so the editor can
+            // prefer the image without reading the pasteboard a second time).
+            let mut entries = Vec::new();
             if let Some(string_entry) = self.read_string_from_pasteboard() {
-                return Some(ClipboardItem {
-                    entries: vec![string_entry],
-                });
+                entries.push(string_entry);
             }
-
-            // Finally, try the various supported image types.
-            for format in ImageFormat::iter() {
+            for format in HANE_IMAGE_FORMAT_PRIORITY {
                 if let Some(item) = self.read_image(format) {
-                    return Some(item);
+                    entries.extend(item.entries);
+                    break;
                 }
+            }
+            if !entries.is_empty() {
+                return Some(ClipboardItem { entries });
             }
         }
 
@@ -472,7 +648,7 @@ mod tests {
     use std::ffi::c_void;
 
     use gpui::{ClipboardEntry, ClipboardItem, ClipboardString, ImageFormat};
-    use objc::rc::autoreleasepool;
+    use objc::{class, rc::autoreleasepool};
 
     use super::*;
 
@@ -764,5 +940,163 @@ mod tests {
             }
             other => panic!("expected Image, got {:?}", other),
         }
+    }
+
+    // Hane: a clipboard holding both a string and an image returns both from
+    // one generation, so the editor never has to read the pasteboard twice.
+    #[test]
+    fn hane_read_keeps_text_and_image_of_one_generation() {
+        let pasteboard = Pasteboard::unique();
+        let png_bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
+
+        unsafe {
+            let ns_png_type = NSPasteboardTypePNG;
+            let types_array = NSArray::arrayWithObjects(nil, &[NSPasteboardTypeString, ns_png_type]);
+            pasteboard.inner.declareTypes_owner(types_array, nil);
+            let text = NSData::dataWithBytes_length_(nil, b"cell".as_ptr() as *const c_void, 4);
+            pasteboard.inner.setData_forType(text, NSPasteboardTypeString);
+            let data = NSData::dataWithBytes_length_(
+                nil,
+                png_bytes.as_ptr() as *const c_void,
+                png_bytes.len() as u64,
+            );
+            pasteboard.inner.setData_forType(data, ns_png_type);
+        }
+
+        let item = pasteboard.read().expect("should read text and image");
+        assert_eq!(item.entries.len(), 2);
+        match (&item.entries[0], &item.entries[1]) {
+            (ClipboardEntry::String(text), ClipboardEntry::Image(image)) => {
+                assert_eq!(text.text(), "cell");
+                assert_eq!(image.format, ImageFormat::Png);
+                assert_eq!(image.bytes, png_bytes);
+            }
+            other => panic!("expected String then Image, got {:?}", other),
+        }
+    }
+
+    unsafe fn hane_data(bytes: &[u8]) -> id {
+        unsafe {
+            NSData::dataWithBytes_length_(nil, bytes.as_ptr() as *const c_void, bytes.len() as u64)
+        }
+    }
+
+    #[test]
+    fn hane_clipboard_empty_pasteboard_is_ok_none() {
+        let pasteboard = Pasteboard::unique();
+        assert_eq!(pasteboard.read_rich(), Ok(None));
+    }
+
+    #[test]
+    fn hane_clipboard_unsupported_only_is_not_empty() {
+        let pasteboard = Pasteboard::unique();
+        unsafe {
+            let unsupported_type = ns_string("com.example.hane-unsupported");
+            hane_clipboard_publish(&pasteboard, &[(unsupported_type, b"payload".as_slice())]);
+        }
+        let snapshot = pasteboard
+            .read_rich()
+            .unwrap()
+            .expect("unsupported-only pasteboard is not empty");
+        assert!(snapshot.unsupported_formats);
+        assert!(snapshot.item.entries.is_empty());
+        assert!(snapshot.images.is_empty());
+        assert_eq!(snapshot.html, None);
+        assert_eq!(snapshot.html_problem, None);
+    }
+
+    #[test]
+    fn hane_clipboard_image_length_bounds() {
+        assert_eq!(check_image_length(0), Err(RichClipboardError::InvalidFormat));
+        assert_eq!(check_image_length(1), Ok(()));
+        assert_eq!(check_image_length(HANE_MAX_IMAGE_BYTES), Ok(()));
+        assert_eq!(
+            check_image_length(HANE_MAX_IMAGE_BYTES + 1),
+            Err(RichClipboardError::TooLarge)
+        );
+    }
+
+    // paths, plain text and a real image of one generation are all returned;
+    // the image is not dropped because paths exist.
+    #[test]
+    fn hane_clipboard_rich_keeps_paths_plain_and_image() {
+        let pasteboard = Pasteboard::unique();
+        let png_bytes: &[u8] = &[0x89, 0x50, 0x4E, 0x47];
+        unsafe {
+            let ns_paths = NSArray::arrayWithObjects(nil, &[ns_string("/a.png")]);
+            let types = NSArray::arrayWithObjects(
+                nil,
+                &[NSFilenamesPboardType, NSPasteboardTypeString, NSPasteboardTypePNG],
+            );
+            pasteboard.inner.declareTypes_owner(types, nil);
+            pasteboard
+                .inner
+                .setPropertyList_forType(ns_paths, NSFilenamesPboardType);
+            pasteboard
+                .inner
+                .setData_forType(hane_data(b"/a.png"), NSPasteboardTypeString);
+            pasteboard
+                .inner
+                .setData_forType(hane_data(png_bytes), NSPasteboardTypePNG);
+        }
+
+        let snapshot = pasteboard
+            .read_rich()
+            .expect("readable")
+            .expect("not empty");
+        assert!(matches!(
+            snapshot.item.entries[0],
+            ClipboardEntry::ExternalPaths(_)
+        ));
+        assert_eq!(snapshot.item.text().as_deref(), Some("/a.png"));
+        assert_eq!(snapshot.images.len(), 1);
+        let image = snapshot.images[0].as_ref().expect("a readable image");
+        assert_eq!(image.format, ImageFormat::Png);
+        assert_eq!(image.bytes, png_bytes);
+    }
+
+    // Two formats of the same item are one image (PNG wins).
+    #[test]
+    fn hane_clipboard_formats_of_one_item_are_one_image() {
+        let pasteboard = Pasteboard::unique();
+        unsafe {
+            let types = NSArray::arrayWithObjects(nil, &[NSPasteboardTypeTIFF, NSPasteboardTypePNG]);
+            pasteboard.inner.declareTypes_owner(types, nil);
+            pasteboard
+                .inner
+                .setData_forType(hane_data(b"tiff-bytes"), NSPasteboardTypeTIFF);
+            pasteboard
+                .inner
+                .setData_forType(hane_data(b"png-bytes"), NSPasteboardTypePNG);
+        }
+        let snapshot = pasteboard.read_rich().unwrap().unwrap();
+        assert_eq!(snapshot.images.len(), 1);
+        let image = snapshot.images[0].as_ref().unwrap();
+        assert_eq!(image.format, ImageFormat::Png);
+        assert_eq!(image.bytes, b"png-bytes");
+    }
+
+    // Independent pasteboard items stay independent: none is dropped or merged.
+    #[test]
+    fn hane_clipboard_independent_items_are_reported_separately() {
+        let pasteboard = Pasteboard::unique();
+        unsafe {
+            let first: id = msg_send![class!(NSPasteboardItem), new];
+            let second: id = msg_send![class!(NSPasteboardItem), new];
+            let first_data = hane_data(b"first");
+            let second_data = hane_data(b"second");
+            let _: bool = msg_send![first, setData: first_data forType: NSPasteboardTypePNG];
+            let _: bool = msg_send![second, setData: second_data forType: NSPasteboardTypePNG];
+            let items = NSArray::arrayWithObjects(nil, &[first, second]);
+            pasteboard.inner.clearContents();
+            let _: bool = msg_send![*pasteboard.inner, writeObjects: items];
+        }
+        let snapshot = pasteboard.read_rich().unwrap().unwrap();
+        let bytes: Vec<&[u8]> = snapshot
+            .images
+            .iter()
+            .map(|image| image.as_ref().unwrap().bytes.as_slice())
+            .collect();
+        assert_eq!(bytes, vec![b"first".as_slice(), b"second".as_slice()]);
     }
 }

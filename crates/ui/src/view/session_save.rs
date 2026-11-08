@@ -811,6 +811,7 @@ impl EditorView {
                 let files = self.files.clone();
                 let path = job.path.clone();
                 let ticket = job.ticket;
+                self.claim_pending_image_paste_write(id, &path, ticket);
                 // Captured now, not re-read once the write lands: a
                 // work-folder switch installs a fresh `SessionSet` whose ids
                 // (and each fresh session's own generation) restart at the
@@ -924,17 +925,28 @@ impl EditorView {
             // of this function would otherwise clear for it. Dropped
             // silently, the same as any other result that no longer
             // belongs to anything open.
+            self.settle_save_as_copies(id, instance, path, false, cx);
             self.sync_external_open_guard();
             return;
         }
+        let revision_before = self.sessions.get(id).map(DocumentSession::revision);
         let Some(outcome) = self
             .sessions
             .get_mut(id)
             .map(|session| session.finish_save(ticket, result))
         else {
+            self.settle_save_as_copies(id, instance, path, false, cx);
             self.sync_external_open_guard();
             return;
         };
+        let landed = matches!(outcome, SaveOutcome::Saved | SaveOutcome::SavedStale);
+        // Images a Save As copied for this write stay only if it landed.
+        self.settle_save_as_copies(id, instance, path, landed, cx);
+        // A Save As that renamed copied images rewrote the document (and its
+        // history) as part of this result.
+        if landed && self.sessions.get(id).map(DocumentSession::revision) != revision_before {
+            self.refresh_after_save_rewrite(id, cx);
+        }
         // Issue #411: a tab's "save and close" request must only ever close
         // on this specific write landing (`SaveOutcome::Saved`). Any other
         // outcome drops the request below rather than leaving it armed,
@@ -1020,8 +1032,12 @@ impl EditorView {
             self.save_session(id, pending, cx);
         }
         if saved {
+            // An image paste that waited for this first save continues now
+            // that the document has a directory (only if nothing changed).
+            self.resume_image_paste_after_save(id, ticket, cx);
             self.resolve_pending_tab_close(id, cx);
         } else {
+            self.forget_pending_image_paste_for_save(id, ticket);
             self.tab_close_after_save.remove(&id);
         }
         // Recompute from every session after the pending-save chain settled, so
@@ -1105,9 +1121,13 @@ impl EditorView {
         }
         match response {
             SaveAsResponse::Chosen(path) => {
-                self.save_session(id, SaveIntent::To(path), cx);
+                // Generated images the document refers to follow it into a
+                // different directory before the new file is written.
+                self.bind_pending_image_paste_save(id, &path);
+                self.save_as_to(id, path, false, cx);
             }
             SaveAsResponse::Failed(error) => {
+                self.forget_pending_image_paste(id);
                 // Only recorded for the document the dialog was opened for
                 // (the instance gate above); no problem is raised by a
                 // cancel, and an earlier unresolved one is not cleared.
@@ -1121,7 +1141,9 @@ impl EditorView {
                 }
                 cx.notify();
             }
-            SaveAsResponse::Canceled => {}
+            // A cancelled first save creates no image and leaves the text,
+            // the selection and the clipboard untouched.
+            SaveAsResponse::Canceled => self.forget_pending_image_paste(id),
         }
     }
 }
