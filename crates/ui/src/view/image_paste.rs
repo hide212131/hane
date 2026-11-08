@@ -2312,8 +2312,10 @@ mod tests {
         let (view, cx) = open_file_view(cx, &from, body);
         let end = body.len();
         select(&view, cx, end, end);
-        let pasted = format!("![画像](images/{NAME_ONE})\n");
-        edit_view(&view, cx, EditorCommand::Insert(&pasted));
+        // `edit_view` takes a `'static` command, so the test-only text is leaked.
+        let pasted: &'static str =
+            Box::leak(format!("![画像](images/{NAME_ONE})\n").into_boxed_str());
+        edit_view(&view, cx, EditorCommand::Insert(pasted));
         edit_view(&view, cx, EditorCommand::Undo);
         assert_eq!(text_of(&view, cx), body);
         assert!(view.read_with(cx, |view, _| view.editor().can_redo()));
