@@ -707,6 +707,16 @@ impl DocumentSession {
         // A plan that cannot be applied is not carried at all, so the saved
         // text and the live document never disagree about it.
         self.in_flight_rewrite = armed.filter(|_| rewritten.is_some());
+        // A write that carries no plan of its own still saves the references
+        // an open composition holds back a rewrite for, as they will read once
+        // it ends. The composition is left alone and the rewrites stay held.
+        let rewritten = rewritten.or_else(|| {
+            if self.in_flight_rewrite.is_none() {
+                self.editor.deferred_rewritten_document()
+            } else {
+                None
+            }
+        });
         SaveJob {
             path,
             document: rewritten.unwrap_or_else(|| self.editor.document().clone()),

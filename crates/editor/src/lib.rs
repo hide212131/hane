@@ -488,6 +488,29 @@ impl Editor {
         Some(apply_edits(text, &edits))
     }
 
+    /// A copy of the current document with the held-back rewrites applied in
+    /// order, without touching the editor, the composition or the history.
+    /// `None` when nothing is held back. A rewrite that is not valid for the
+    /// text it meets is skipped, as it is when the composition ends.
+    pub fn deferred_rewritten_document(&self) -> Option<RopeBuffer> {
+        if self.deferred_rewrites.is_empty() {
+            return None;
+        }
+        let mut document = self.document.clone();
+        for plan in &self.deferred_rewrites {
+            let text = document.full_text();
+            let Some(edits) = checked_edits(&text, (**plan)(&text)) else {
+                continue;
+            };
+            for (range, replacement) in edits.iter().rev() {
+                document
+                    .edit(SourceRange::new(range.start, range.end), replacement)
+                    .ok()?;
+            }
+        }
+        Some(document)
+    }
+
     /// Applies the rewrites held back during a composition, now that it ended.
     pub(crate) fn run_deferred_rewrites(&mut self) {
         if self.ime.is_some() {
