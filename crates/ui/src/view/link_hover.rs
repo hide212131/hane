@@ -43,7 +43,7 @@ impl EditorView {
     }
 
     /// Whether a window-space point lies in the editor body viewport.
-    fn link_hover_in_body(&self, window_x: f32, window_y: f32) -> bool {
+    pub(super) fn link_hover_in_body(&self, window_x: f32, window_y: f32) -> bool {
         let local_y = window_y - self.theme.header_height - self.document_find_reserved_height();
         window_x >= self.main_column_left && local_y >= 0.0 && local_y < self.viewport_height
     }
