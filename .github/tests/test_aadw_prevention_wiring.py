@@ -56,6 +56,17 @@ class WiringTests(unittest.TestCase):
         self.assertIn("steps.claude.outcome == 'failure' || steps.model_verify.outcome == 'success'", text)
         self.assertIn("steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success'", text)
 
+    def test_claude_fix_installs_npm_bun_before_claude_action(self):
+        text = (ROOT / '.github/workflows/claude-fix.yml').read_text()
+        worker = text.split('\n  worker:', 1)[1].split('\n  finalize:', 1)[0]
+        self.assertIn('npm install --prefix "$bun_prefix" --no-audit --no-fund --no-save bun@1.3.14', worker)
+        self.assertIn('"$bun_path" --version', worker)
+        self.assertIn("!= '1.3.14'", worker)
+        self.assertIn('path_to_bun_executable: ${{ steps.bun.outputs.path }}', worker)
+        self.assertLess(worker.index('id: bun'), worker.index('id: claude'))
+        self.assertLess(worker.index('bun@1.3.14'), worker.index('uses: anthropics/claude-code-base-action@'))
+        self.assertLess(worker.index('path_to_bun_executable:'), worker.index('--model claude-sonnet-5-5'))
+
     def test_all_new_contract_tests_are_in_regular_ci(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         for path in ('.github/tests/test_aadw_action_contract.py',

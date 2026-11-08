@@ -369,6 +369,25 @@ jobs:
         shell: bash
         run: rm -rf pr-head/.git
 
+      - name: Install Bun 1.3.14 from npm for Claude action
+        id: bun
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The action's GitHub release download of Bun can fail with HTTP 5xx.
+          # Install the exact pinned version from npm and pass its path instead.
+          bun_prefix="$RUNNER_TEMP/bun-npm"
+          mkdir -p "$bun_prefix"
+          npm install --prefix "$bun_prefix" --no-audit --no-fund --no-save bun@1.3.14
+          bun_path="$bun_prefix/node_modules/.bin/bun"
+          bun_version="$("$bun_path" --version)"
+          if [[ "$bun_version" != '1.3.14' ]]; then
+            echo "::error::Unexpected Bun version from npm: ${bun_version}."
+            exit 1
+          fi
+          echo "path=$bun_path" >> "$GITHUB_OUTPUT"
+
       - name: Revalidate exact target head before Claude execution
         shell: bash
         env:
@@ -398,6 +417,7 @@ jobs:
         uses: anthropics/claude-code-base-action@0adbfaf05435b2e2b7150cb122ba44727b98bf12
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_bun_executable: ${{ steps.bun.outputs.path }}
           prompt: |
             You are the AADW v3 repository-mutation worker for Hane.
 
