@@ -654,6 +654,16 @@ impl EditorView {
         if self.document_base_directory(ticket.id).as_deref() != Some(ticket.base.as_path()) {
             return Err("保存先が変わりました");
         }
+        // A Save As to another directory that is still writing has already
+        // planned which images to copy; an image added now would be missing
+        // from the destination once that write lands.
+        if self
+            .sessions
+            .get(ticket.id)
+            .is_some_and(|session| session.writes_outside_directory(&ticket.base))
+        {
+            return Err("別の場所への保存が進行中です");
+        }
         let current_draft = self.work_folder_drafts.get(&ticket.id).map(|draft| draft.draft_id);
         if current_draft != ticket.draft {
             // The one accepted change is a draft's first save into the very
@@ -1888,6 +1898,33 @@ mod tests {
         let text = text_of(&view, cx);
         let name = reference_in(&text);
         assert!(root.join("images").join(&name).is_file());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn an_image_paste_finishing_during_a_save_as_to_another_directory_is_aborted(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("paste-during-save-as");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&to).unwrap();
+        let (view, cx) = open_file_view(cx, &from, "body\n");
+        select(&view, cx, 4, 4);
+        cx.write_to_clipboard(image_item(None, png(2, 2, [4, 4, 4, 255])));
+        paste_without_waiting(&view, cx);
+        // The Save As to another directory is writing when the background
+        // save of the pasted image is confirmed.
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.save_as_to(id, to.join("note.md"), false, cx);
+            assert!(view.sessions.active().save_in_flight());
+            assert!(view.sessions.active().writes_outside_directory(&from));
+        });
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(to.join("note.md")).unwrap(), "body\n");
+        assert_eq!(text_of(&view, cx), "body\n");
+        assert!(pasted_files(&from).is_empty(), "the unpublished image is removed");
+        assert!(pasted_files(&to).is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 

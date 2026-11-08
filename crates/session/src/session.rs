@@ -863,6 +863,17 @@ impl DocumentSession {
             .is_some_and(|identity| identity.path().starts_with(folder))
     }
 
+    /// Whether a running or queued write targets a file outside `directory`,
+    /// such as a Save As to another directory that has not landed yet.
+    pub fn writes_outside_directory(&self, directory: &Path) -> bool {
+        let outside = |path: &Path| path.parent() != Some(directory);
+        self.in_flight_target.as_deref().is_some_and(outside)
+            || matches!(
+                self.pending_save.as_ref(),
+                Some(SaveIntent::To(path) | SaveIntent::CreateNew(path)) if outside(path)
+            )
+    }
+
     /// Whether a write that is running right now targets `folder` or somewhere
     /// under it, including a first save or Save As whose destination the
     /// session's current file path does not show yet.
