@@ -1718,6 +1718,7 @@ mod tests {
     #[test]
     fn link_hover_marks_only_segments_inside_the_hovered_range() {
         let runs = [link_style(2..8), link_style(10..14)];
+        let hover_ranges = std::iter::once(2..8).collect::<Vec<_>>();
         let segments = line_segments_with_hover(
             0..16,
             None,
@@ -1729,14 +1730,15 @@ mod tests {
             },
             &runs,
             None,
-            &[2..8],
+            &hover_ranges,
         );
         let hovered = segments
             .iter()
             .filter(|segment| segment.link_hover)
             .map(|segment| segment.visual_range.clone())
             .collect::<Vec<_>>();
-        assert_eq!(hovered, [2..8]);
+        assert_eq!(hovered.len(), 1);
+        assert_eq!(hovered[0], 2..8);
         assert!(
             segments
                 .iter()
@@ -1750,6 +1752,7 @@ mod tests {
     fn link_hover_keeps_selection_and_find_flags_for_the_renderer_priority() {
         let runs = [link_style(0..6)];
         let find_matches = single_find_match(0..3);
+        let hover_ranges = std::iter::once(0..6).collect::<Vec<_>>();
         let segments = line_segments_with_hover(
             0..6,
             None,
@@ -1761,7 +1764,7 @@ mod tests {
             },
             &runs,
             None,
-            &[0..6],
+            &hover_ranges,
         );
         assert!(segments.iter().all(|segment| segment.link_hover));
         assert!(segments.iter().all(|segment| segment.selected));
