@@ -877,8 +877,17 @@ impl EditorView {
         // References only Undo or Redo would bring back need their image in
         // the target directory just as much as the ones in the body now.
         let history = session.editor().history_texts().unwrap_or_default();
+        // An open composition replaced a span of the body; cancelling it (or
+        // Undo after committing) brings that original text back.
+        let composing_original = session
+            .editor()
+            .ime()
+            .map(|ime| ime.original_text.clone());
         let mut names: Vec<String> = Vec::new();
-        for state in std::iter::once(&text).chain(history.iter()) {
+        for state in std::iter::once(&text)
+            .chain(history.iter())
+            .chain(composing_original.iter())
+        {
             for reference in clip::generated_references(state) {
                 if !names.contains(&reference.file_name) {
                     names.push(reference.file_name);
@@ -2220,6 +2229,72 @@ mod tests {
         assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"one");
         assert_eq!(std::fs::read(from.join("images").join(NAME_TWO)).unwrap(), b"two");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Marks the whole image notation of an empty-history document as an IME
+    /// composition, saves it elsewhere while composing, then ends the
+    /// composition by cancelling or by committing and undoing.
+    fn save_as_while_composing_over_an_image(cx: &mut gpui::TestAppContext, commit: bool) {
+        let root = temp_root(if commit {
+            "save-as-ime-commit"
+        } else {
+            "save-as-ime-cancel"
+        });
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"mine").unwrap();
+        // The name is taken in the target, so the reference has to be renamed.
+        std::fs::write(to.join("images").join(NAME_ONE), b"someone else's").unwrap();
+        let notation = format!("![画像](images/{NAME_ONE})");
+        let body = format!("{notation}\n");
+        let (view, cx) = open_file_view(cx, &from, &body);
+        assert!(view.read_with(cx, |view, _| view.editor().history_texts().unwrap_or_default().is_empty()));
+        select(&view, cx, 0, notation.len());
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "に", None)
+                .unwrap();
+            view.after_input(cx);
+        });
+        assert!(view.read_with(cx, |view, _| view.editor().is_composing()));
+
+        save_as(&view, cx, to.join("note.md"));
+
+        assert!(view.read_with(cx, |view, _| view.editor().is_composing()));
+        if commit {
+            view.update(cx, |view, cx| {
+                view.editor_mut().commit_text(None, "に").unwrap();
+                view.after_input(cx);
+            });
+            edit_view(&view, cx, EditorCommand::Undo);
+        } else {
+            view.update(cx, |view, cx| {
+                view.editor_mut().cancel_composition().unwrap();
+                view.after_input(cx);
+            });
+        }
+        let restored = text_of(&view, cx);
+        assert!(!restored.contains(NAME_ONE), "the conflicting name is renamed");
+        let expected: [&[u8]; 1] = [b"mine"];
+        assert_references_resolve(&restored, &to, &expected);
+        assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"mine");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn save_as_during_an_ime_composition_keeps_the_image_after_cancel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        save_as_while_composing_over_an_image(cx, false);
+    }
+
+    #[gpui::test]
+    fn save_as_during_an_ime_composition_keeps_the_image_after_commit_and_undo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        save_as_while_composing_over_an_image(cx, true);
     }
 
     #[gpui::test]
