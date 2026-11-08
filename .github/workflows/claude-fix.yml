@@ -369,6 +369,36 @@ jobs:
         shell: bash
         run: rm -rf pr-head/.git
 
+      - name: Install Bun 1.3.14 from pinned npm tarball for Claude action
+        id: bun
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # The action's GitHub release download of Bun can fail with HTTP 5xx.
+          # Download the exact published tarball directly, verify an independently
+          # pinned SHA-512, and never run npm or package lifecycle scripts.
+          bun_url='https://registry.npmjs.org/@oven/bun-linux-x64/-/bun-linux-x64-1.3.14.tgz'
+          bun_sha512_b64='7OVTAKvwfPmSbIV1HpdOoVVx5VRc427GuPPne93N6vk4eQBPId9nXmZDh9/zGaKPdbVjVtQSZafWQoUjx38Utw=='
+          bun_download_dir="$RUNNER_TEMP/bun-download"
+          bun_bin_dir="$RUNNER_TEMP/bun-bin"
+          mkdir "$bun_download_dir" "$bun_bin_dir"
+          curl --fail --silent --show-error --location --retry 3 --output "$bun_download_dir/bun.tgz" "$bun_url"
+          actual_sha512_b64="$(openssl dgst -sha512 -binary "$bun_download_dir/bun.tgz" | openssl base64 -A)"
+          if [[ "$actual_sha512_b64" != "$bun_sha512_b64" ]]; then
+            echo "::error::Bun tarball SHA-512 mismatch."
+            exit 1
+          fi
+          tar -xzf "$bun_download_dir/bun.tgz" -C "$bun_bin_dir" --strip-components=2 package/bin/bun
+          chmod +x "$bun_bin_dir/bun"
+          bun_path="$bun_bin_dir/bun"
+          bun_version="$("$bun_path" --version)"
+          if [[ "$bun_version" != '1.3.14' ]]; then
+            echo "::error::Unexpected Bun version from tarball: ${bun_version}."
+            exit 1
+          fi
+          echo "path=$bun_path" >> "$GITHUB_OUTPUT"
+
       - name: Revalidate exact target head before Claude execution
         shell: bash
         env:
@@ -398,6 +428,7 @@ jobs:
         uses: anthropics/claude-code-base-action@0adbfaf05435b2e2b7150cb122ba44727b98bf12
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          path_to_bun_executable: ${{ steps.bun.outputs.path }}
           prompt: |
             You are the AADW v3 repository-mutation worker for Hane.
 

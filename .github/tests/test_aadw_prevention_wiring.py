@@ -56,6 +56,35 @@ class WiringTests(unittest.TestCase):
         self.assertIn("steps.claude.outcome == 'failure' || steps.model_verify.outcome == 'success'", text)
         self.assertIn("steps.claude.outcome == 'success' && steps.model_verify.outcome == 'success'", text)
 
+    def test_claude_fix_installs_hash_pinned_bun_before_claude_action(self):
+        text = (ROOT / '.github/workflows/claude-fix.yml').read_text()
+        worker = text.split('\n  worker:', 1)[1].split('\n  finalize:', 1)[0]
+        url = 'https://registry.npmjs.org/@oven/bun-linux-x64/-/bun-linux-x64-1.3.14.tgz'
+        digest = '7OVTAKvwfPmSbIV1HpdOoVVx5VRc427GuPPne93N6vk4eQBPId9nXmZDh9/zGaKPdbVjVtQSZafWQoUjx38Utw=='
+        self.assertIn(f"bun_url='{url}'", worker)
+        self.assertIn(f"bun_sha512_b64='{digest}'", worker)
+        self.assertNotIn('npm install', worker)
+        step = worker.split('id: bun', 1)[1].split('Revalidate exact target head', 1)[0]
+        hash_check = step.index('"$actual_sha512_b64" != "$bun_sha512_b64"')
+        extract = step.index('tar -xzf')
+        execute = step.index('"$bun_path" --version')
+        version_check = step.index("!= '1.3.14'")
+        output = step.index('echo "path=$bun_path" >> "$GITHUB_OUTPUT"')
+        self.assertLess(step.index('openssl dgst -sha512'), hash_check)
+        self.assertLess(hash_check, extract)
+        self.assertIn('exit 1', step[hash_check:extract])
+        self.assertLess(hash_check, execute)
+        self.assertIn('package/bin/bun', step)
+        self.assertLess(extract, step.index('chmod +x'))
+        self.assertLess(step.index('chmod +x'), execute)
+        self.assertLess(execute, version_check)
+        self.assertLess(version_check, output)
+        self.assertIn('exit 1', step[version_check:output])
+        self.assertIn('path_to_bun_executable: ${{ steps.bun.outputs.path }}', worker)
+        self.assertLess(worker.index('id: bun'), worker.index('id: claude'))
+        self.assertLess(worker.index('bun_url='), worker.index('uses: anthropics/claude-code-base-action@'))
+        self.assertLess(worker.index('path_to_bun_executable:'), worker.index('--model claude-sonnet-5-5'))
+
     def test_all_new_contract_tests_are_in_regular_ci(self):
         text = (ROOT / '.github/workflows/ci.yml').read_text()
         for path in ('.github/tests/test_aadw_action_contract.py',
