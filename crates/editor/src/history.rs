@@ -382,7 +382,7 @@ pub(crate) fn checked_edits(text: &str, mut edits: Vec<TextEdit>) -> Option<Vec<
     Some(edits)
 }
 
-fn apply_edits(text: &str, edits: &[TextEdit]) -> String {
+pub(crate) fn apply_edits(text: &str, edits: &[TextEdit]) -> String {
     let mut out = String::with_capacity(text.len());
     let mut last = 0;
     for (range, replacement) in edits {

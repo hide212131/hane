@@ -45,7 +45,7 @@ pub use selection::Selection;
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_metrics::RollingWindow;
 pub use history::{RewritePlan, TextEdit};
-use history::{EditKind, History, RewriteState, checked_edits, map_selection};
+use history::{EditKind, History, RewriteState, apply_edits, checked_edits, map_selection};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -474,6 +474,18 @@ impl Editor {
         } else {
             let _ = self.apply_rewrite(&*plan);
         }
+    }
+
+    /// The rewrites held back until the open composition ends, oldest first.
+    pub fn deferred_rewrites(&self) -> &[Arc<RewritePlan>] {
+        &self.deferred_rewrites
+    }
+
+    /// `text` with `plan` applied. `None` when the plan is not a valid set of
+    /// replacements for it.
+    pub fn rewrite_text(text: &str, plan: &RewritePlan) -> Option<String> {
+        let edits = checked_edits(text, plan(text))?;
+        Some(apply_edits(text, &edits))
     }
 
     /// Applies the rewrites held back during a composition, now that it ended.

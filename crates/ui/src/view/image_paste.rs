@@ -339,6 +339,62 @@ fn rename_plan(renamed: Vec<(String, String)>) -> Arc<hane_editor::RewritePlan> 
     })
 }
 
+/// `text` as it will read once the rewrites an open composition holds back
+/// have been applied.
+fn settled_text(text: &str, deferred: &[Arc<hane_editor::RewritePlan>]) -> String {
+    let mut settled = text.to_owned();
+    for plan in deferred {
+        if let Some(next) = hane_editor::Editor::rewrite_text(&settled, &**plan) {
+            settled = next;
+        }
+    }
+    settled
+}
+
+/// One plan that applies the `deferred` rewrites and then `plan`, as a single
+/// replacement of the span that differs. A Save As that starts while the
+/// composition still holds rewrites back saves, and later rewrites the
+/// document into, the text those rewrites lead to.
+fn after_deferred_plan(
+    deferred: Vec<Arc<hane_editor::RewritePlan>>,
+    plan: Arc<hane_editor::RewritePlan>,
+) -> Arc<hane_editor::RewritePlan> {
+    Arc::new(move |text: &str| {
+        let mut settled = settled_text(text, &deferred);
+        if let Some(next) = hane_editor::Editor::rewrite_text(&settled, &*plan) {
+            settled = next;
+        }
+        if settled == text {
+            return Vec::new();
+        }
+        let mut start = text
+            .bytes()
+            .zip(settled.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !text.is_char_boundary(start) || !settled.is_char_boundary(start) {
+            start -= 1;
+        }
+        let limit = text.len().min(settled.len()) - start;
+        let mut tail = text
+            .bytes()
+            .rev()
+            .zip(settled.bytes().rev())
+            .take(limit)
+            .take_while(|(a, b)| a == b)
+            .count();
+        while !text.is_char_boundary(text.len() - tail)
+            || !settled.is_char_boundary(settled.len() - tail)
+        {
+            tail -= 1;
+        }
+        vec![(
+            start..text.len() - tail,
+            settled[start..settled.len() - tail].to_owned(),
+        )]
+    })
+}
+
 /// The saved file and size of a finished background job.
 struct PastedImage {
     saved: clip::SavedImage,
@@ -883,12 +939,16 @@ impl EditorView {
             .editor()
             .ime()
             .map(|ime| ime.original_text.clone());
+        // A rewrite of an earlier Save As may still wait for that composition
+        // to end; the images are then the ones it will point the references at.
+        let deferred = session.editor().deferred_rewrites();
         let mut names: Vec<String> = Vec::new();
         for state in std::iter::once(&text)
             .chain(history.iter())
             .chain(composing_original.iter())
         {
-            for reference in clip::generated_references(state) {
+            let state = settled_text(state, deferred);
+            for reference in clip::generated_references(&state) {
                 if !names.contains(&reference.file_name) {
                     names.push(reference.file_name);
                 }
@@ -1068,7 +1128,12 @@ impl EditorView {
             );
             return;
         }
-        if copied.renamed.is_empty() {
+        let deferred = self
+            .sessions
+            .get(ticket.id)
+            .map(|session| session.editor().deferred_rewrites().to_vec())
+            .unwrap_or_default();
+        if copied.renamed.is_empty() && deferred.is_empty() {
             self.begin_save_as_write(ticket, copied, None, cx);
             return;
         }
@@ -1077,7 +1142,10 @@ impl EditorView {
         // prepared in the background from a snapshot and only applied here,
         // while the document still is that snapshot. Anything edited in the
         // meantime is caught by the checks `begin_save_as_write` repeats.
-        let plan = rename_plan(copied.renamed.clone());
+        let mut plan = rename_plan(copied.renamed.clone());
+        if !deferred.is_empty() {
+            plan = after_deferred_plan(deferred, plan);
+        }
         let snapshot = self
             .sessions
             .get(ticket.id)
@@ -2346,6 +2414,66 @@ mod tests {
         let expected: [&[u8]; 1] = [b"mine"];
         assert_references_resolve(&restored, &to, &expected);
         assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"mine");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn a_second_save_as_during_the_same_ime_composition_follows_the_deferred_rename(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-ime-twice");
+        let (from, second, third) = (root.join("a"), root.join("b"), root.join("c"));
+        for directory in [&from, &second, &third] {
+            std::fs::create_dir_all(directory.join("images")).unwrap();
+        }
+        std::fs::write(from.join("images").join(NAME_ONE), b"mine").unwrap();
+        // The name is taken in both targets, so each Save As renames it.
+        std::fs::write(second.join("images").join(NAME_ONE), b"second's").unwrap();
+        std::fs::write(third.join("images").join(NAME_ONE), b"third's").unwrap();
+        let notation = format!("![画像](images/{NAME_ONE})");
+        let body = format!("{notation}\n");
+        let (view, cx) = open_file_view(cx, &from, &body);
+        select(&view, cx, 0, notation.len());
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "に", None)
+                .unwrap();
+            view.after_input(cx);
+        });
+        assert!(view.read_with(cx, |view, _| view.editor().is_composing()));
+
+        save_as(&view, cx, second.join("note.md"));
+        // The rewrite of the first Save As waits for the composition.
+        assert!(view.read_with(cx, |view, _| view.editor().is_composing()));
+        assert!(view.read_with(cx, |view, _| !view.editor().deferred_rewrites().is_empty()));
+
+        save_as(&view, cx, third.join("note.md"));
+
+        assert!(view.read_with(cx, |view, _| view.editor().is_composing()));
+        let expected: [&[u8]; 1] = [b"mine"];
+
+        view.update(cx, |view, cx| {
+            view.editor_mut().cancel_composition().unwrap();
+            view.after_input(cx);
+        });
+        let restored = text_of(&view, cx);
+        assert!(!restored.contains(NAME_ONE), "the conflicting name is renamed");
+        assert_references_resolve(&restored, &third, &expected);
+        let end = restored.len();
+        select(&view, cx, end, end);
+        edit_view(&view, cx, EditorCommand::Insert("あ"));
+        let mut states = vec![text_of(&view, cx)];
+        edit_view(&view, cx, EditorCommand::Undo);
+        states.push(text_of(&view, cx));
+        edit_view(&view, cx, EditorCommand::Redo);
+        states.push(text_of(&view, cx));
+        assert_eq!(states[0], states[2]);
+        for state in &states {
+            assert_references_resolve(state, &third, &expected);
+        }
+        assert_eq!(std::fs::read(third.join("images").join(NAME_ONE)).unwrap(), b"third's");
+        assert_eq!(std::fs::read(second.join("images").join(NAME_ONE)).unwrap(), b"second's");
         assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"mine");
         std::fs::remove_dir_all(root).unwrap();
     }
