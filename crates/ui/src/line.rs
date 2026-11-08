@@ -981,6 +981,7 @@ pub(crate) fn row_element(
         },
         &line.style_runs,
         row.body_visual_start,
+        &link_boundary_visuals(line),
         &hover_visuals,
     );
     let body_gap_segment = body_gap_segment(row, &segments);
@@ -1096,6 +1097,7 @@ fn table_row_element(
     link_hover: Option<SourceRange>,
 ) -> Div {
     let hover_visuals = link_hover_visuals(line, link_hover);
+    let all_link_visuals = link_boundary_visuals(line);
     let selection = editor.selection().range();
     let selected_visual = layout.visual_range_on_row(block, row_index, selection);
     let marked_visual = editor
@@ -1201,6 +1203,7 @@ fn table_row_element(
                         && fragment_range.start < run.visual_range.end.0
                 });
                 let fragment_hover = clip_visual_ranges(&hover_visuals, fragment_range.clone());
+                let fragment_links = clip_visual_ranges(&all_link_visuals, fragment_range.clone());
                 if fragment_selected.is_none()
                     && fragment_marked.is_none()
                     && fragment_matches.is_empty()
@@ -1244,6 +1247,7 @@ fn table_row_element(
                         },
                         &line.style_runs,
                         None,
+                        &fragment_links,
                         &fragment_hover,
                     )
                     .into_iter()
@@ -1425,9 +1429,21 @@ fn link_hover_visuals(line: &VisualLine, hovered: Option<SourceRange>) -> Vec<Ra
     let Some(hovered) = hovered else {
         return Vec::new();
     };
+    link_visuals(line, Some(hovered))
+}
+
+/// Visual ranges of every link on `line`, hovered or not. Their edges are
+/// segment boundaries in all states so hovering never changes text splitting.
+fn link_boundary_visuals(line: &VisualLine) -> Vec<Range<usize>> {
+    link_visuals(line, None)
+}
+
+/// Visual ranges of the links on `line`, limited to the one whose source range
+/// is `only` when given.
+fn link_visuals(line: &VisualLine, only: Option<SourceRange>) -> Vec<Range<usize>> {
     line.links
         .iter()
-        .filter(|link| link.link_text_range == hovered)
+        .filter(|link| only.is_none_or(|only| link.link_text_range == only))
         .filter_map(|link| {
             let start = line
                 .source_map
@@ -1515,6 +1531,7 @@ fn line_segments(
         style_runs,
         body_visual_start,
         &[],
+        &[],
     )
 }
 
@@ -1527,10 +1544,13 @@ fn line_segments_with_hover(
     find: FindHighlight<'_>,
     style_runs: &[hane_presentation::StyleRun],
     body_visual_start: Option<usize>,
+    link_ranges: &[Range<usize>],
     link_hover: &[Range<usize>],
 ) -> Vec<LineSegment> {
+    // Every link edge splits the text whether or not a link is hovered, so the
+    // shaped runs (and therefore the geometry) do not change on hover.
     let mut boundaries = Vec::new();
-    for range in link_hover {
+    for range in link_ranges {
         boundaries.push(range.start);
         boundaries.push(range.end);
     }
@@ -1730,6 +1750,7 @@ mod tests {
             },
             &runs,
             None,
+            &[2..8, 10..14],
             &hover_ranges,
         );
         let hovered = segments
@@ -1764,11 +1785,52 @@ mod tests {
             },
             &runs,
             None,
+            &[0..6],
             &hover_ranges,
         );
         assert!(segments.iter().all(|segment| segment.link_hover));
         assert!(segments.iter().all(|segment| segment.selected));
         assert!(segments[0].find_match && segments[0].find_current_match);
+    }
+
+    #[test]
+    fn link_hover_does_not_change_segment_boundaries() {
+        // The link edges (2 and 8) are not style-run edges, as when a label
+        // holds a nested style; they must split the text hovered or not.
+        let runs = [link_style(4..6)];
+        let links = [2..8];
+        let split = |hover: &[Range<usize>]| {
+            line_segments_with_hover(
+                0..10,
+                Some(5),
+                None,
+                None,
+                FindHighlight {
+                    matches: &[],
+                    current: None,
+                },
+                &runs,
+                None,
+                &links,
+                hover,
+            )
+        };
+        let idle = split(&[]);
+        let hovered = split(&[2..8]);
+        let bounds = |segments: &[LineSegment]| {
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bounds(&idle), bounds(&hovered));
+        assert!(bounds(&idle).contains(&(2..4)));
+        assert!(bounds(&idle).iter().any(|range| range.end == 8));
+        assert!(idle.iter().all(|segment| !segment.link_hover));
+        assert!(hovered
+            .iter()
+            .filter(|segment| segment.visual_range.start >= 2 && segment.visual_range.end <= 8)
+            .all(|segment| segment.link_hover));
     }
 
     #[test]
