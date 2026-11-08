@@ -2298,6 +2298,57 @@ mod tests {
     }
 
     #[gpui::test]
+    fn save_as_during_an_ime_composition_keeps_a_redo_only_image_before_which_text_changed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-ime-redo-only");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"mine").unwrap();
+        // The name is taken in the target, so the reference has to be renamed.
+        std::fs::write(to.join("images").join(NAME_ONE), b"someone else's").unwrap();
+        let body = "前\n";
+        let (view, cx) = open_file_view(cx, &from, body);
+        let end = body.len();
+        select(&view, cx, end, end);
+        let pasted = format!("![画像](images/{NAME_ONE})\n");
+        edit_view(&view, cx, EditorCommand::Insert(&pasted));
+        edit_view(&view, cx, EditorCommand::Undo);
+        assert_eq!(text_of(&view, cx), body);
+        assert!(view.read_with(cx, |view, _| view.editor().can_redo()));
+        // Compose over "前", which lies before the image reference, changing
+        // the length of the live text.
+        select(&view, cx, 0, "前".len());
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "にほんごにほんご", None)
+                .unwrap();
+            view.after_input(cx);
+        });
+        assert!(view.read_with(cx, |view, _| view.editor().is_composing()));
+        assert!(view.read_with(cx, |view, _| view.editor().history_texts().is_some()));
+
+        save_as(&view, cx, to.join("note.md"));
+
+        assert!(view.read_with(cx, |view, _| view.editor().is_composing()));
+        view.update(cx, |view, cx| {
+            view.editor_mut().cancel_composition().unwrap();
+            view.after_input(cx);
+        });
+        assert_eq!(text_of(&view, cx), body);
+        edit_view(&view, cx, EditorCommand::Redo);
+        let restored = text_of(&view, cx);
+        assert!(restored.contains("![画像]"));
+        assert!(!restored.contains(NAME_ONE), "the conflicting name is renamed");
+        let expected: [&[u8]; 1] = [b"mine"];
+        assert_references_resolve(&restored, &to, &expected);
+        assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"someone else's");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"mine");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn save_as_leaves_code_examples_untouched_next_to_a_conflicting_real_image(
         cx: &mut gpui::TestAppContext,
     ) {

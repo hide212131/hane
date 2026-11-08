@@ -443,7 +443,20 @@ impl Editor {
     /// The text of every document state Undo and Redo can still reach, other
     /// than the current one. `None` when the history cannot be followed.
     pub fn history_texts(&self) -> Option<Vec<String>> {
-        self.history.reachable_texts(&self.document.full_text())
+        let text = self.document.full_text();
+        // History steps are recorded against the text without the marked
+        // composition, so follow them from the original text.
+        let Some(ime) = &self.ime else {
+            return self.history.reachable_texts(&text);
+        };
+        let range = ime.current_range;
+        let base = format!(
+            "{}{}{}",
+            text.get(..range.start.0)?,
+            ime.original_text,
+            text.get(range.end.0..)?
+        );
+        self.history.reachable_texts(&base)
     }
 
     /// Whether an IME composition is open.
