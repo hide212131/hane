@@ -440,6 +440,12 @@ impl Editor {
         self.adopt_rewrite(&edits, history)
     }
 
+    /// The text of every document state Undo and Redo can still reach, other
+    /// than the current one. `None` when the history cannot be followed.
+    pub fn history_texts(&self) -> Option<Vec<String>> {
+        self.history.reachable_texts(&self.document.full_text())
+    }
+
     /// Whether an IME composition is open.
     pub fn is_composing(&self) -> bool {
         self.ime.is_some()

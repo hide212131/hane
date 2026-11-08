@@ -237,6 +237,23 @@ impl History {
         self.rewritten_from(now, plan)
     }
 
+    /// The document text of every state Undo and Redo can still reach, other
+    /// than `current`. `None` means the history could not be followed.
+    pub(crate) fn reachable_texts(&self, current: &str) -> Option<Vec<String>> {
+        let mut texts = Vec::with_capacity(self.undo.len() + self.redo.len());
+        let mut text = current.to_owned();
+        for entry in self.undo.iter().rev() {
+            text = entry.reverted(&text)?;
+            texts.push(text.clone());
+        }
+        let mut text = current.to_owned();
+        for entry in self.redo.iter().rev() {
+            text = entry.applied(&text)?;
+            texts.push(text.clone());
+        }
+        Some(texts)
+    }
+
     /// The identities of every step in time order: Undo oldest first, then
     /// Redo in the order it would be redone.
     pub(crate) fn timeline_ids(&self) -> Vec<u64> {

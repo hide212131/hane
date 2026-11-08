@@ -864,10 +864,17 @@ impl EditorView {
             return None;
         }
         let text = session.editor().document().full_text();
-        let names: Vec<String> = clip::generated_references(&text)
-            .into_iter()
-            .map(|reference| reference.file_name)
-            .collect();
+        // References only Undo or Redo would bring back need their image in
+        // the target directory just as much as the ones in the body now.
+        let history = session.editor().history_texts().unwrap_or_default();
+        let mut names: Vec<String> = Vec::new();
+        for state in std::iter::once(&text).chain(history.iter()) {
+            for reference in clip::generated_references(state) {
+                if !names.contains(&reference.file_name) {
+                    names.push(reference.file_name);
+                }
+            }
+        }
         if names.is_empty() {
             return None;
         }
@@ -2133,6 +2140,46 @@ mod tests {
         assert_eq!(states[0], states[4]);
         assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"other-1");
         assert_eq!(std::fs::read(to.join("images").join(NAME_TWO)).unwrap(), b"other-2");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"one");
+        assert_eq!(std::fs::read(from.join("images").join(NAME_TWO)).unwrap(), b"two");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn save_as_copies_generated_images_referenced_only_by_undo_redo_history(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("save-as-history-only");
+        let (from, to) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(from.join("images")).unwrap();
+        std::fs::create_dir_all(to.join("images")).unwrap();
+        std::fs::write(from.join("images").join(NAME_ONE), b"one").unwrap();
+        std::fs::write(from.join("images").join(NAME_TWO), b"two").unwrap();
+        // Only the first name is taken in the target directory.
+        std::fs::write(to.join("images").join(NAME_ONE), b"other-1").unwrap();
+        let body = "前\n";
+        let (view, cx) = open_file_view(cx, &from, body);
+        let end = body.len();
+        select(&view, cx, end, end);
+        const PASTED: &str =
+            "![画像](images/hane-paste-1-0123abcd.png)\n![画像](images/hane-paste-2-4567ef01.png)\n";
+        edit_view(&view, cx, EditorCommand::Insert(PASTED));
+        edit_view(&view, cx, EditorCommand::Undo);
+        assert_eq!(text_of(&view, cx), body);
+        assert!(view.read_with(cx, |view, _| view.editor().can_redo()));
+
+        save_as(&view, cx, to.join("note.md"));
+
+        let saved = std::fs::read_to_string(to.join("note.md")).unwrap();
+        assert_eq!(saved, body, "the saved body refers to no image");
+        assert_eq!(text_of(&view, cx), body);
+        edit_view(&view, cx, EditorCommand::Redo);
+        let restored = text_of(&view, cx);
+        let expected: [&[u8]; 2] = [b"one", b"two"];
+        assert_references_resolve(&restored, &to, &expected);
+        assert!(!restored.contains(NAME_ONE), "the conflicting name is renamed");
+        assert!(restored.contains(NAME_TWO), "the free name is kept");
+        assert_eq!(std::fs::read(to.join("images").join(NAME_ONE)).unwrap(), b"other-1");
         assert_eq!(std::fs::read(from.join("images").join(NAME_ONE)).unwrap(), b"one");
         assert_eq!(std::fs::read(from.join("images").join(NAME_TWO)).unwrap(), b"two");
         std::fs::remove_dir_all(root).unwrap();
