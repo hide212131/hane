@@ -1736,7 +1736,7 @@ mod tests {
             .filter(|segment| segment.link_hover)
             .map(|segment| segment.visual_range.clone())
             .collect::<Vec<_>>();
-        assert_eq!(hovered, vec![2..8]);
+        assert_eq!(hovered, [2..8]);
         assert!(
             segments
                 .iter()
