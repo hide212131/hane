@@ -25,7 +25,9 @@ The crate root exports `read_rich_clipboard() -> Result<Option<RichClipboardSnap
 RichClipboardError>`, `RichClipboardSnapshot { item, html, images }` and
 `RichClipboardError` (`Busy`, `ChangedDuringRead`, `InvalidFormat`, `TooLarge`),
 with the same shape as the macOS crate. `Platform` and `ClipboardItem` are
-unchanged. The read happens inside one `ClipboardGuard`; the retry is kept, but
+unchanged. A clipboard that holds only unsupported formats is
+`Ok(Some(snapshot))` with empty content and `snapshot.unsupported_formats == true`,
+so it is told apart from a really empty clipboard (`Ok(None)`). The read happens inside one `ClipboardGuard`; the retry is kept, but
 its final failure is `Err(Busy)`, never an empty clipboard. `Ok(None)` means the
 clipboard really holds nothing supported. `ChangedDuringRead` is never produced
 here because the open guard prevents any change during the read.

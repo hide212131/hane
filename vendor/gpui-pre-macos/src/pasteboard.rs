@@ -78,6 +78,10 @@ pub struct RichClipboardSnapshot {
     /// formats of the same item collapse to the preferred one; separate items
     /// stay separate. An unreadable image is an `Err`, never silently dropped.
     pub images: Vec<Result<Image, RichClipboardError>>,
+    /// The pasteboard holds representations, but none of them is text, file
+    /// paths, an image or HTML. Such a snapshot has no content and is told
+    /// apart from a really empty pasteboard, which is `Ok(None)`.
+    pub unsupported_formats: bool,
 }
 
 /// Reads the general pasteboard (Hane Issue #596). Call on the main thread.
@@ -228,15 +232,48 @@ impl Pasteboard {
                 Ok(html) => (html, None),
                 Err(problem) => (None, Some(problem)),
             };
-            if entries.is_empty() && images.is_empty() && html.is_none() && html_problem.is_none() {
-                return None;
-            }
+            let unsupported_formats = if entries.is_empty()
+                && images.is_empty()
+                && html.is_none()
+                && html_problem.is_none()
+            {
+                if !self.has_any_type() {
+                    return None;
+                }
+                true
+            } else {
+                false
+            };
             Some(RichClipboardSnapshot {
                 item: ClipboardItem { entries },
                 html,
                 html_problem,
                 images,
+                unsupported_formats,
             })
+        }
+    }
+
+    /// Whether the pasteboard carries any representation at all, recognized or
+    /// not (on the pasteboard itself or on any of its items).
+    unsafe fn has_any_type(&self) -> bool {
+        unsafe {
+            let types: id = self.inner.types();
+            if types != nil && NSArray::count(types) > 0 {
+                return true;
+            }
+            let items: id = msg_send![*self.inner, pasteboardItems];
+            if items == nil {
+                return false;
+            }
+            for index in 0..NSArray::count(items) {
+                let item = NSArray::objectAtIndex(items, index);
+                let item_types: id = msg_send![item, types];
+                if item_types != nil && NSArray::count(item_types) > 0 {
+                    return true;
+                }
+            }
+            false
         }
     }
 
@@ -948,6 +985,24 @@ mod tests {
     fn hane_clipboard_empty_pasteboard_is_ok_none() {
         let pasteboard = Pasteboard::unique();
         assert_eq!(pasteboard.read_rich(), Ok(None));
+    }
+
+    #[test]
+    fn hane_clipboard_unsupported_only_is_not_empty() {
+        let pasteboard = Pasteboard::unique();
+        unsafe {
+            let unsupported_type = ns_string("com.example.hane-unsupported");
+            hane_clipboard_publish(&pasteboard, &[(unsupported_type, b"payload".as_slice())]);
+        }
+        let snapshot = pasteboard
+            .read_rich()
+            .unwrap()
+            .expect("unsupported-only pasteboard is not empty");
+        assert!(snapshot.unsupported_formats);
+        assert!(snapshot.item.entries.is_empty());
+        assert!(snapshot.images.is_empty());
+        assert_eq!(snapshot.html, None);
+        assert_eq!(snapshot.html_problem, None);
     }
 
     #[test]

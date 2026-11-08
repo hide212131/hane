@@ -250,6 +250,22 @@ pub struct RichClipboardSnapshot {
     /// At most one entry on Windows: the clipboard is a single data object, so
     /// the OS cannot tell independent images apart.
     pub images: Vec<Result<Image, RichClipboardError>>,
+    /// The clipboard holds formats, but none of them is text, files, an image
+    /// or HTML. Such a snapshot has no content and is told apart from a really
+    /// empty clipboard, which is `Ok(None)`.
+    pub unsupported_formats: bool,
+}
+
+/// Whether a read found nothing recognized, and whether the clipboard still
+/// holds some format. `None` means the clipboard is really empty.
+fn unsupported_formats_of(has_recognized: bool, format_count: i32) -> Option<bool> {
+    if has_recognized {
+        Some(false)
+    } else if format_count > 0 {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 /// Reads plain text, HTML, images and files while holding the clipboard once.
@@ -257,14 +273,17 @@ pub fn read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>, RichClipbo
     let _clip = ClipboardGuard::open()?;
     let read = read_formats(true);
     let has_image = read.image.is_some();
-    if read.entries.is_empty()
-        && !has_image
-        && read.html.is_none()
-        && read.html_problem.is_none()
-    {
+    let has_recognized = !read.entries.is_empty()
+        || has_image
+        || read.html.is_some()
+        || read.html_problem.is_some();
+    let Some(unsupported_formats) =
+        unsupported_formats_of(has_recognized, unsafe { CountClipboardFormats() })
+    else {
         return Ok(None);
-    }
+    };
     Ok(Some(RichClipboardSnapshot {
+        unsupported_formats,
         item: ClipboardItem {
             entries: read.entries,
         },
@@ -781,6 +800,14 @@ impl Drop for LockedGlobal {
 #[cfg(test)]
 mod image_tests {
     use super::*;
+
+    #[test]
+    fn hane_clipboard_unsupported_only_is_not_empty() {
+        assert_eq!(unsupported_formats_of(false, 0), None);
+        assert_eq!(unsupported_formats_of(false, 1), Some(true));
+        assert_eq!(unsupported_formats_of(true, 3), Some(false));
+        assert_eq!(unsupported_formats_of(true, 0), Some(false));
+    }
 
     #[test]
     fn hane_clipboard_image_length_bounds() {

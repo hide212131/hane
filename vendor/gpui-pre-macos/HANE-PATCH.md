@@ -21,6 +21,8 @@ crate root から `read_rich_clipboard() -> Result<Option<RichClipboardSnapshot>
 `InvalidFormat` / `TooLarge`）を公開する。Windows crate と同じ形で、`Platform` trait や
 `ClipboardItem` は変えない。`Pasteboard::read_rich` は `changeCount` が前後で同じ世代だけを返し、
 3 回変化し続けたら `ChangedDuringRead`（空として扱わない）。`Ok(None)` は本当に空のときだけ。
+認識できる形式がなく未対応の type だけが存在する pasteboard は `Ok(Some(snapshot))` で、
+`snapshot.unsupported_formats == true`（内容は空）として真の空と区別する。
 
 - `item` は本文とファイルパス、`images` は `pasteboardItems` の項目ごとに優先形式（PNG → TIFF → … →
   SVG）を 1 つ選んだ結果。同じ項目の別形式は 1 枚にまとめ、独立した項目は別の要素にする。
