@@ -55,6 +55,25 @@ impl ClipboardReadError {
     }
 }
 
+/// An image entry that could not be read, with the format it declared when the
+/// reader knows it. An unsupported (SVG) entry is not a raster image, so its
+/// failure is not an image failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(test, target_os = "macos", windows)), allow(dead_code))]
+pub(crate) struct ImageReadFailure {
+    error: ClipboardReadError,
+    format: Option<gpui::ImageFormat>,
+}
+
+impl From<ClipboardReadError> for ImageReadFailure {
+    fn from(error: ClipboardReadError) -> Self {
+        Self {
+            error,
+            format: None,
+        }
+    }
+}
+
 /// What the clipboard offers as an image. One OS item is one image however
 /// many formats it carries; independent OS items are never merged or cut down
 /// to the first one.
@@ -77,7 +96,7 @@ pub(crate) struct NativeRead {
     item: ClipboardItem,
     html: Option<String>,
     html_problem: bool,
-    images: Vec<Result<gpui::Image, ClipboardReadError>>,
+    images: Vec<Result<gpui::Image, ImageReadFailure>>,
 }
 
 /// Everything one Paste needs from the OS clipboard, read in a single call so
@@ -96,7 +115,7 @@ pub(crate) struct ClipboardSnapshot {
 impl ClipboardSnapshot {
     fn from_images(
         text: Option<String>,
-        images: Vec<Result<gpui::Image, ClipboardReadError>>,
+        images: Vec<Result<gpui::Image, ImageReadFailure>>,
     ) -> Self {
         let mut candidates: Vec<Result<Arc<ClipboardRaster>, ClipboardReadError>> = images
             .into_iter()
@@ -107,7 +126,12 @@ impl ClipboardSnapshot {
                         bytes: source.bytes,
                     }))
                 }),
-                Err(error) => Some(Err(error)),
+                // An unreadable SVG is not an image failure; the text pastes.
+                Err(ImageReadFailure {
+                    format: Some(gpui::ImageFormat::Svg),
+                    ..
+                }) => None,
+                Err(failure) => Some(Err(failure.error)),
             })
             .collect();
         let images = match candidates.len() {
@@ -240,7 +264,7 @@ mod native {
             images: snapshot
                 .images
                 .into_iter()
-                .map(|image| image.map_err(error))
+                .map(|image| image.map_err(|failure| error(failure).into()))
                 .collect(),
         }))
     }
@@ -2095,7 +2119,10 @@ mod tests {
             item: ClipboardItem { entries },
             html: None,
             html_problem: false,
-            images,
+            images: images
+                .into_iter()
+                .map(|image| image.map_err(ImageReadFailure::from))
+                .collect(),
         }
     }
 
@@ -2278,6 +2305,37 @@ mod tests {
         assert!(matches!(
             of(vec![Ok(png_image()), Err(ClipboardReadError::InvalidFormat)]).images,
             ClipboardImages::Several(2)
+        ));
+    }
+
+    #[test]
+    fn an_svg_read_error_is_no_raster_candidate_but_a_raster_error_is() {
+        let svg_failure = |error| ImageReadFailure {
+            error,
+            format: Some(gpui::ImageFormat::Svg),
+        };
+        let png_failure = |error| ImageReadFailure {
+            error,
+            format: Some(gpui::ImageFormat::Png),
+        };
+        let of = |images| {
+            let mut read = native_read(Some("text"), false, Vec::new());
+            read.images = images;
+            ClipboardSnapshot::from_native(Ok(Some(read)))
+        };
+        for error in [ClipboardReadError::InvalidFormat, ClipboardReadError::TooLarge] {
+            let snapshot = of(vec![Err(svg_failure(error))]);
+            assert!(matches!(snapshot.images, ClipboardImages::Empty));
+            assert_eq!(snapshot.text(), Some("text"));
+            assert!(matches!(
+                of(vec![Err(png_failure(error))]).images,
+                ClipboardImages::Unreadable(e) if e == error
+            ));
+        }
+        let png_ok = image_of(png(1, 1, [0; 4]), gpui::ImageFormat::Png);
+        assert!(matches!(
+            of(vec![Ok(png_ok), Err(svg_failure(ClipboardReadError::TooLarge))]).images,
+            ClipboardImages::One(_)
         ));
     }
 }
