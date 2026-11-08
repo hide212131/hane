@@ -57,6 +57,9 @@ pub(crate) enum ImagePasteError {
     ImagesNotDirectory,
     /// Every generated name already existed.
     NameExhausted,
+    /// A generated image the document refers to no longer exists, so it
+    /// cannot be copied.
+    SourceMissing,
     Io {
         action: &'static str,
         source: io::Error,
@@ -88,6 +91,9 @@ impl fmt::Display for ImagePasteError {
                 formatter.write_str("images がフォルダーではないため画像を保存できません")
             }
             Self::NameExhausted => formatter.write_str("画像のファイル名を決められませんでした"),
+            Self::SourceMissing => {
+                formatter.write_str("コピーする元の画像が見つかりません")
+            }
             Self::Io { action, source } => write!(formatter, "{action}: {}", io_reason(source)),
         }
     }
@@ -401,8 +407,9 @@ pub(crate) struct CopiedImages {
 /// `<to_base>/images` for a Save As. The source is never touched. A name that
 /// already exists in the destination is reused when the bytes are identical
 /// and otherwise replaced by a new name (reported in `renamed`). A source file
-/// that no longer exists is skipped: there is nothing to copy. Any other
-/// failure removes what this call created and is returned.
+/// that no longer exists fails the copy, so the destination never ends up
+/// referring to a different image of the same name. Any failure removes what
+/// this call created and is returned.
 pub(crate) fn copy_generated_images(
     from_base: &Path,
     to_base: &Path,
@@ -464,7 +471,9 @@ fn copy_each(
         let source = source_directory.join(name);
         let length = match fs::metadata(&source) {
             Ok(metadata) => metadata.len(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ImagePasteError::SourceMissing);
+            }
             Err(error) => return Err(ImagePasteError::io("元の画像を確認できません", error)),
         };
         if length > limit as u64 {
@@ -474,7 +483,9 @@ fn copy_each(
         // the file may have grown since.
         let bytes = match read_bounded(&source, limit) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(ImagePasteError::SourceMissing);
+            }
             Err(error) => return Err(ImagePasteError::io("元の画像を読み取れません", error)),
         };
         if bytes.len() > limit {
@@ -867,14 +878,13 @@ mod tests {
         let same = "hane-paste-1-00000001.png".to_owned();
         let clash = "hane-paste-2-00000002.png".to_owned();
         let fresh = "hane-paste-3-00000003.png".to_owned();
-        let missing = "hane-paste-4-00000004.png".to_owned();
         for (name, bytes) in [(&same, b"same"), (&clash, b"from"), (&fresh, b"new!")] {
             fs::write(from.join("images").join(name), bytes).unwrap();
         }
         fs::write(to.join("images").join(&same), b"same").unwrap();
         fs::write(to.join("images").join(&clash), b"other").unwrap();
 
-        let names = vec![same.clone(), clash.clone(), fresh.clone(), missing, same.clone()];
+        let names = vec![same.clone(), clash.clone(), fresh.clone(), same.clone()];
         let mut replacement = vec!["hane-paste-5-00000005.png".to_owned()];
         let copied = copy_generated_images(&from, &to, &names, &mut || replacement.remove(0))
             .unwrap();
@@ -916,6 +926,32 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(!to.join("images").join(&first).exists());
+        assert!(from.join("images").join(&first).is_file());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_source_fails_even_when_the_destination_has_the_same_name() {
+        let root = temp_root("copy-missing");
+        let (from, to) = (root.join("a"), root.join("b"));
+        fs::create_dir_all(from.join("images")).unwrap();
+        fs::create_dir_all(to.join("images")).unwrap();
+        let first = "hane-paste-1-00000001.png".to_owned();
+        let missing = "hane-paste-2-00000002.png".to_owned();
+        fs::write(from.join("images").join(&first), b"one").unwrap();
+        // A different image already sits under the missing name.
+        fs::write(to.join("images").join(&missing), b"other").unwrap();
+
+        let result = copy_generated_images(
+            &from,
+            &to,
+            &[first.clone(), missing.clone()],
+            &mut generated_file_name,
+        );
+        assert!(matches!(result, Err(ImagePasteError::SourceMissing)));
+        // Only what this call created is removed; the existing file stays.
+        assert!(!to.join("images").join(&first).exists());
+        assert_eq!(fs::read(to.join("images").join(&missing)).unwrap(), b"other");
         assert!(from.join("images").join(&first).is_file());
         fs::remove_dir_all(root).unwrap();
     }
