@@ -811,6 +811,7 @@ impl EditorView {
                 let files = self.files.clone();
                 let path = job.path.clone();
                 let ticket = job.ticket;
+                self.claim_pending_image_paste_write(id, &path, ticket);
                 // Captured now, not re-read once the write lands: a
                 // work-folder switch installs a fresh `SessionSet` whose ids
                 // (and each fresh session's own generation) restart at the
@@ -1033,10 +1034,10 @@ impl EditorView {
         if saved {
             // An image paste that waited for this first save continues now
             // that the document has a directory (only if nothing changed).
-            self.resume_image_paste_after_save(id, path, cx);
+            self.resume_image_paste_after_save(id, ticket, cx);
             self.resolve_pending_tab_close(id, cx);
         } else {
-            self.forget_pending_image_paste_for_save(id, path);
+            self.forget_pending_image_paste_for_save(id, ticket);
             self.tab_close_after_save.remove(&id);
         }
         // Recompute from every session after the pending-save chain settled, so

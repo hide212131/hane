@@ -295,6 +295,11 @@ struct PendingImagePaste {
     /// the write to that destination may resume (or drop) the paste; it stays
     /// `None` while the prompt is unanswered.
     save_path: Option<PathBuf>,
+    /// The write this paste's own Save As request started. Set when that
+    /// request is accepted as a write (immediately, or once an earlier running
+    /// write finished), so a completion of any earlier write to the same
+    /// destination cannot be mistaken for it.
+    save_ticket: Option<SaveTicket>,
 }
 
 #[derive(Default)]
@@ -449,6 +454,7 @@ impl EditorView {
                 selection,
                 raster,
                 save_path: None,
+                save_ticket: None,
             });
             self.status =
                 Some("画像を保存する場所を決めるため、文書の保存先を選んでください".to_owned());
@@ -732,16 +738,18 @@ impl EditorView {
 
     /// Called when a save of `id` landed: an image paste that waited for the
     /// first save of an untitled document continues, if nothing changed.
-    /// Only the write to the destination the paste's own prompt chose counts.
+    /// Only the write the paste's own prompt started counts.
     pub(super) fn resume_image_paste_after_save(
         &mut self,
         id: SessionId,
-        path: &Path,
+        ticket: SaveTicket,
         cx: &mut Context<Self>,
     ) {
-        let Some(pending) = self.image_paste.pending_save.take_if(|pending| {
-            pending.id == id && pending.save_path.as_deref() == Some(path)
-        }) else {
+        let Some(pending) = self
+            .image_paste
+            .pending_save
+            .take_if(|pending| pending.id == id && pending.save_ticket == Some(ticket))
+        else {
             return;
         };
         let unchanged = self.document_instance(id) == Some(pending.instance)
@@ -765,12 +773,36 @@ impl EditorView {
             .take_if(|pending| pending.id == id);
     }
 
-    /// A write to `path` did not land: drops the waiting paste only when that
-    /// write is the one its own prompt started.
-    pub(super) fn forget_pending_image_paste_for_save(&mut self, id: SessionId, path: &Path) {
-        let _ = self.image_paste.pending_save.take_if(|pending| {
-            pending.id == id && pending.save_path.as_deref() == Some(path)
-        });
+    /// A write did not land: drops the waiting paste only when that write is
+    /// the one its own prompt started.
+    pub(super) fn forget_pending_image_paste_for_save(
+        &mut self,
+        id: SessionId,
+        ticket: SaveTicket,
+    ) {
+        let _ = self
+            .image_paste
+            .pending_save
+            .take_if(|pending| pending.id == id && pending.save_ticket == Some(ticket));
+    }
+
+    /// A write to `path` was just accepted for `id`: when the waiting paste's
+    /// own prompt chose `path` and no write was claimed yet, this is the
+    /// paste's write. An earlier write started before the prompt was answered
+    /// never reaches here after the binding, so it is never claimed.
+    pub(super) fn claim_pending_image_paste_write(
+        &mut self,
+        id: SessionId,
+        path: &Path,
+        ticket: SaveTicket,
+    ) {
+        if let Some(pending) = self.image_paste.pending_save.as_mut()
+            && pending.id == id
+            && pending.save_ticket.is_none()
+            && pending.save_path.as_deref() == Some(path)
+        {
+            pending.save_ticket = Some(ticket);
+        }
     }
 
     /// The prompt opened for the waiting paste of `id` was answered with
@@ -780,6 +812,7 @@ impl EditorView {
             && pending.id == id
         {
             pending.save_path = Some(path.to_path_buf());
+            pending.save_ticket = None;
         }
     }
 
