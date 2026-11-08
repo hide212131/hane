@@ -575,6 +575,7 @@ impl EditorView {
     ) {
         let mut changed = false;
         self.promote_pending_link_on_move(event, cx);
+        self.update_link_hover_on_panel(event, cx);
         if let Some(drag) = self.sidebar_resize_drag {
             let delta = f32::from(event.position.x) - drag.pointer_x;
             let next = sidebar_width_for_drag(

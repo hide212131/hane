@@ -126,6 +126,7 @@ pub(crate) use image_paste::ClipboardSnapshot;
 use image_paste::ImagePasteState;
 mod initialization;
 mod inline_rename;
+mod link_hover;
 pub(crate) mod input_routing;
 mod measurement;
 mod mermaid_diagrams;
@@ -994,6 +995,8 @@ pub struct EditorView {
     /// matching mouse-up; a drag first turns it into a text selection that
     /// starts at the pressed offset and discards the destination.
     pending_reading_link: Option<PendingReadingLink>,
+    /// Transient pointer and hovered-link state for link emphasis (Issue #700).
+    link_hover: link_hover::LinkHover,
     /// Which edge of the editor viewport the current text-selection drag is
     /// held against, if any. `None` means no autoscroll is currently ticking.
     text_autoscroll: Option<AutoscrollDirection>,
@@ -4030,6 +4033,7 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         self.promote_pending_link_on_move(event, cx);
+        self.update_link_hover_on_row(line, fragment.clone(), event, window, cx);
         if !self.text_selection_drag || !event.dragging() {
             return;
         }
@@ -6293,6 +6297,7 @@ mod tests {
     fn link_target_matches_only_offsets_inside_the_link_text() {
         let target = hane_presentation::LinkTarget {
             source_range: SourceRange::new(1, 5),
+            link_text_range: SourceRange::new(1, 5),
             destination: std::sync::Arc::from("https://example.com/"),
             uses_reference: false,
         };
@@ -7507,6 +7512,103 @@ mod tests {
                 format!("{text_before}!")
             );
         });
+    }
+
+    /// Issue #700: real `MouseMoveEvent`s over a laid-out `EditorView` switch
+    /// the hovered link by glyph, notify only when the link identity changes,
+    /// and never touch the document, the caret, the geometry or the URL log.
+    #[gpui::test]
+    fn link_hover_tracks_glyphs_and_leaves_document_and_geometry_untouched(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "see https://example.com/a and https://example.com/a end\n";
+        let first_url = SourceRange::new(4, 25);
+        let second_url = SourceRange::new(30, 51);
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let (plain_point, _) = row_click(&view, cx, "row-0-0", 0, 0, 1);
+        let (inside_first, _) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        let (first_end, _) = row_click(&view, cx, "row-0-0", 0, 0, 25);
+        let (inside_second, _) = row_click(&view, cx, "row-0-0", 0, 0, 32);
+        let nudge = |point: gpui::Point<gpui::Pixels>, dx: f32| {
+            gpui::point(point.x + px(dx), point.y)
+        };
+        let inside_first = nudge(inside_first, 1.0);
+        let inside_second = nudge(inside_second, 1.0);
+        // The right half of the link's last glyph, and the first glyph after it.
+        let last_glyph_right_half = nudge(first_end, -1.0);
+        let after_link = nudge(first_end, 1.0);
+
+        let snapshot = |view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext| {
+            let bounds = cx.debug_bounds("row-0-0");
+            view.read_with(cx, |view, _| {
+                (
+                    view.editor().document().full_text(),
+                    view.editor().document().revision(),
+                    view.editor().selection(),
+                    view.editor().can_undo(),
+                    view.scroll_y,
+                    bounds,
+                )
+            })
+        };
+        let hovered = |view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| view.hovered_link_range())
+        };
+        let before = snapshot(&view, cx);
+        let notifications = {
+            let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
+            let observed = std::rc::Rc::clone(&count);
+            cx.update(|_, app| {
+                app.observe(&view, move |_, _| observed.set(observed.get() + 1))
+                    .detach();
+            });
+            count
+        };
+        let hover_at = |cx: &mut gpui::VisualTestContext, point| {
+            cx.simulate_mouse_move(point, None::<MouseButton>, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        hover_at(cx, plain_point);
+        assert_eq!(hovered(&view, cx), None);
+        assert_eq!(notifications.get(), 0, "a non-link move is not an update");
+
+        hover_at(cx, inside_first);
+        assert_eq!(hovered(&view, cx), Some(first_url));
+        let after_enter = notifications.get();
+        assert!(after_enter >= 1);
+
+        // Movement inside one link, including the right half of its last
+        // glyph, keeps the link and adds no update notification.
+        hover_at(cx, nudge(inside_first, 4.0));
+        hover_at(cx, last_glyph_right_half);
+        assert_eq!(hovered(&view, cx), Some(first_url));
+        assert_eq!(notifications.get(), after_enter);
+
+        // Just past the link is not the link.
+        hover_at(cx, after_link);
+        assert_eq!(hovered(&view, cx), None);
+
+        // A second link to the same destination is a different link.
+        hover_at(cx, inside_first);
+        assert_eq!(hovered(&view, cx), Some(first_url));
+        hover_at(cx, inside_second);
+        assert_eq!(hovered(&view, cx), Some(second_url));
+
+        // A pressed button (drag) suppresses the emphasis.
+        cx.simulate_mouse_move(inside_first, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(hovered(&view, cx), None);
+
+        // Leaving the body clears it.
+        hover_at(cx, inside_first);
+        assert_eq!(hovered(&view, cx), Some(first_url));
+        hover_at(cx, gpui::point(px(400.0), px(2.0)));
+        assert_eq!(hovered(&view, cx), None);
+
+        hover_at(cx, plain_point);
+        assert_eq!(snapshot(&view, cx), before);
+        assert!(cx.opened_url().is_none());
     }
 
     fn relative_luminance(color: u32) -> f32 {
