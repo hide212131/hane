@@ -291,6 +291,10 @@ struct PendingImagePaste {
     revision: Revision,
     selection: Selection,
     raster: Arc<ClipboardRaster>,
+    /// The destination the user chose in this paste's own Save As prompt. Only
+    /// the write to that destination may resume (or drop) the paste; it stays
+    /// `None` while the prompt is unanswered.
+    save_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -444,6 +448,7 @@ impl EditorView {
                 revision,
                 selection,
                 raster,
+                save_path: None,
             });
             self.status =
                 Some("画像を保存する場所を決めるため、文書の保存先を選んでください".to_owned());
@@ -727,9 +732,16 @@ impl EditorView {
 
     /// Called when a save of `id` landed: an image paste that waited for the
     /// first save of an untitled document continues, if nothing changed.
-    pub(super) fn resume_image_paste_after_save(&mut self, id: SessionId, cx: &mut Context<Self>) {
-        let Some(pending) = self.image_paste.pending_save.take_if(|pending| pending.id == id)
-        else {
+    /// Only the write to the destination the paste's own prompt chose counts.
+    pub(super) fn resume_image_paste_after_save(
+        &mut self,
+        id: SessionId,
+        path: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.image_paste.pending_save.take_if(|pending| {
+            pending.id == id && pending.save_path.as_deref() == Some(path)
+        }) else {
             return;
         };
         let unchanged = self.document_instance(id) == Some(pending.instance)
@@ -751,6 +763,24 @@ impl EditorView {
             .image_paste
             .pending_save
             .take_if(|pending| pending.id == id);
+    }
+
+    /// A write to `path` did not land: drops the waiting paste only when that
+    /// write is the one its own prompt started.
+    pub(super) fn forget_pending_image_paste_for_save(&mut self, id: SessionId, path: &Path) {
+        let _ = self.image_paste.pending_save.take_if(|pending| {
+            pending.id == id && pending.save_path.as_deref() == Some(path)
+        });
+    }
+
+    /// The prompt opened for the waiting paste of `id` was answered with
+    /// `path`; the write to it is the one that resumes the paste.
+    pub(super) fn bind_pending_image_paste_save(&mut self, id: SessionId, path: &Path) {
+        if let Some(pending) = self.image_paste.pending_save.as_mut()
+            && pending.id == id
+        {
+            pending.save_path = Some(path.to_path_buf());
+        }
     }
 
     pub(super) fn forget_all_pending_image_pastes(&mut self) {

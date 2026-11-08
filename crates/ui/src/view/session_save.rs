@@ -1033,10 +1033,10 @@ impl EditorView {
         if saved {
             // An image paste that waited for this first save continues now
             // that the document has a directory (only if nothing changed).
-            self.resume_image_paste_after_save(id, cx);
+            self.resume_image_paste_after_save(id, path, cx);
             self.resolve_pending_tab_close(id, cx);
         } else {
-            self.forget_pending_image_paste(id);
+            self.forget_pending_image_paste_for_save(id, path);
             self.tab_close_after_save.remove(&id);
         }
         // Recompute from every session after the pending-save chain settled, so
@@ -1122,6 +1122,7 @@ impl EditorView {
             SaveAsResponse::Chosen(path) => {
                 // Generated images the document refers to follow it into a
                 // different directory before the new file is written.
+                self.bind_pending_image_paste_save(id, &path);
                 self.save_as_to(id, path, false, cx);
             }
             SaveAsResponse::Failed(error) => {
