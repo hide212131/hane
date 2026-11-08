@@ -7611,6 +7611,42 @@ mod tests {
         assert!(cx.opened_url().is_none());
     }
 
+    /// Issue #700: moving from a link to a spot inside the body that no row
+    /// covers (below the last line) clears the emphasis, and the link can be
+    /// entered again afterwards.
+    #[gpui::test]
+    fn link_hover_clears_when_pointer_moves_to_body_space_off_every_row(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "see https://example.com/a end\n";
+        let first_url = SourceRange::new(4, 25);
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let (inside_link, _) = row_click(&view, cx, "row-0-0", 0, 0, 6);
+        let inside_link = gpui::point(inside_link.x + px(1.0), inside_link.y);
+        let bounds = cx.debug_bounds("row-0-0").expect("row bounds");
+        let below_rows = gpui::point(inside_link.x, bounds.bottom() + px(40.0));
+        view.read_with(cx, |view, _| {
+            assert!(view.link_hover_in_body(
+                f32::from(below_rows.x),
+                f32::from(below_rows.y)
+            ));
+        });
+        let hovered = |view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| view.hovered_link_range())
+        };
+        let hover_at = |cx: &mut gpui::VisualTestContext, point| {
+            cx.simulate_mouse_move(point, None::<MouseButton>, gpui::Modifiers::none());
+            cx.run_until_parked();
+        };
+
+        hover_at(cx, inside_link);
+        assert_eq!(hovered(&view, cx), Some(first_url));
+        hover_at(cx, below_rows);
+        assert_eq!(hovered(&view, cx), None);
+        hover_at(cx, inside_link);
+        assert_eq!(hovered(&view, cx), Some(first_url));
+    }
+
     fn relative_luminance(color: u32) -> f32 {
         fn linear_channel(channel: u32) -> f32 {
             let srgb = ((channel & 0xff) as f32) / 255.0;

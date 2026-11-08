@@ -108,9 +108,10 @@ impl EditorView {
         self.set_hovered_link(next, cx);
     }
 
-    /// Mouse move anywhere in the window. Rows resolve their own moves; this
-    /// only clears the hover once the pointer is outside the body or the
-    /// pointer is busy.
+    /// Mouse move anywhere in the window. Rows resolve their own moves and run
+    /// before the panel, so a row that already recorded this position owns the
+    /// result. Otherwise the pointer is outside the body, busy, or inside the
+    /// body but off every row (e.g. below the last line), and the hover clears.
     pub(super) fn update_link_hover_on_panel(
         &mut self,
         event: &MouseMoveEvent,
@@ -119,6 +120,9 @@ impl EditorView {
         let (x, y) = (f32::from(event.position.x), f32::from(event.position.y));
         if self.link_hover_suppressed(event.dragging()) || !self.link_hover_in_body(x, y) {
             self.clear_link_hover(cx);
+        } else if self.link_hover.pointer != Some((x, y)) {
+            self.link_hover.pointer = Some((x, y));
+            self.set_hovered_link(None, cx);
         }
     }
 
