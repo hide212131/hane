@@ -1712,6 +1712,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn an_unrelated_save_success_does_not_resume_a_paste_waiting_for_its_own_save_as(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("unrelated-save-while-paste-waits");
+        let unrelated = root.join("unrelated");
+        std::fs::create_dir_all(&unrelated).unwrap();
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| window.focus(&view.focus_handle, cx));
+        });
+        cx.write_to_clipboard(image_item(None, png(2, 2, [8, 8, 8, 255])));
+        // The standalone untitled document asks where to save; that Save As
+        // prompt stays unanswered for the rest of the test.
+        paste_without_waiting(&view, cx);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.image_paste.pending_save.is_some());
+        });
+        // A different save request of the same document succeeds meanwhile.
+        let unrelated_path = unrelated.join("other.md");
+        save_as(&view, cx, unrelated_path.clone());
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&unrelated_path).unwrap(), "");
+        // Only the paste's own save request may resume it: the body, the
+        // destination and the image files stay as the unrelated save left them.
+        assert_eq!(text_of(&view, cx), "");
+        assert!(pasted_files(&unrelated).is_empty());
+        assert!(pasted_files(&root).is_empty());
+        view.read_with(cx, |view, _| {
+            let id = view.sessions.active_id();
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(unrelated_path.as_path())
+            );
+            assert!(view.image_paste.pending_save.is_some());
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn save_as_to_another_directory_copies_the_generated_images_first(
         cx: &mut gpui::TestAppContext,
     ) {
