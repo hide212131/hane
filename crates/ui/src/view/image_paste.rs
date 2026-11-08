@@ -1467,6 +1467,41 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_saved_image_is_removed_when_the_view_is_released_before_its_delivery(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let root = temp_root("saved-then-released");
+        let (view, cx) = open_file_view(cx, &root, "body\n");
+        let other = root.join("images").join("unrelated.png");
+        std::fs::create_dir_all(root.join("images")).unwrap();
+        std::fs::write(&other, b"keep me").unwrap();
+        select(&view, cx, 4, 4);
+        cx.write_to_clipboard(image_item(None, png(1, 1, [0, 0, 0, 255])));
+        paste_without_waiting(&view, cx);
+        // Step the scheduler one task at a time until the background save has
+        // written this job's PNG. Delivery to the view is a later task, so it
+        // has not run yet when the file first appears.
+        let mut steps = 0;
+        while pasted_files(&root).len() < 2 {
+            assert!(steps < 10_000, "the background save never wrote its file");
+            cx.executor().tick();
+            steps += 1;
+        }
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().document().full_text()),
+            "body\n",
+            "the save finished before the outcome was delivered"
+        );
+        // The save succeeded; now the view goes away, so `view.update` fails.
+        cx.update(|window, _| window.remove_window());
+        drop(view);
+        cx.run_until_parked();
+        assert_eq!(pasted_files(&root), vec![other.clone()]);
+        assert_eq!(std::fs::read(&other).unwrap(), b"keep me");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
     fn a_published_image_survives_the_view_release(cx: &mut gpui::TestAppContext) {
         let root = temp_root("published-release");
         let (view, cx) = open_file_view(cx, &root, "body\n");
