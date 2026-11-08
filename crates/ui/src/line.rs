@@ -1785,7 +1785,7 @@ mod tests {
             },
             &runs,
             None,
-            &[0..6],
+            &hover_ranges,
             &hover_ranges,
         );
         assert!(segments.iter().all(|segment| segment.link_hover));
@@ -1798,7 +1798,8 @@ mod tests {
         // The link edges (2 and 8) are not style-run edges, as when a label
         // holds a nested style; they must split the text hovered or not.
         let runs = [link_style(4..6)];
-        let links = [2..8];
+        let links = single_find_match(2..8);
+        let hover_ranges = single_find_match(2..8);
         let split = |hover: &[Range<usize>]| {
             line_segments_with_hover(
                 0..10,
@@ -1816,7 +1817,7 @@ mod tests {
             )
         };
         let idle = split(&[]);
-        let hovered = split(&[2..8]);
+        let hovered = split(&hover_ranges);
         let bounds = |segments: &[LineSegment]| {
             segments
                 .iter()
