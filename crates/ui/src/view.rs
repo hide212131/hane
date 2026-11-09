@@ -11618,6 +11618,47 @@ mod tests {
         });
     }
 
+    /// Issue #709: after leaving a list with Enter twice, the blank line that
+    /// closes the list block is a plain paragraph row at both of its offsets,
+    /// so the caret sits at the left edge instead of the list marker column.
+    #[gpui::test]
+    fn trailing_blank_line_after_list_exit_has_no_list_indent(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::new("# 2026-11-10_test\n\n- abc", "Untitled", cx)
+        });
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(
+                view.editor().document().full_text(),
+                "# 2026-11-10_test\n\n- abc\n\n"
+            );
+
+            let shaper = FixedAdvanceShaper::new(8.0);
+            for offset in [25, 26] {
+                view.editor_mut()
+                    .set_selection(Selection::caret(SourceOffset(offset)))
+                    .unwrap();
+                let indexed = view.block_at_offset(SourceOffset(19)).unwrap();
+                let span = block_line_span(view.editor().document(), &indexed).unwrap();
+                let (visual, _) = view.cached_block(&indexed, &span).unwrap();
+                let layout = layout_block(&visual, 800.0, &shaper);
+                let row = layout
+                    .row_for_source(SourceOffset(offset))
+                    .expect("row for the caret offset");
+                let line = &visual.lines[layout.lines[row].line];
+                assert!(line.list.is_none(), "offset {offset}");
+                assert!(line.quote.is_none(), "offset {offset}");
+                let point = layout
+                    .point_for_source(&visual, SourceOffset(offset), &shaper)
+                    .expect("caret point");
+                assert_eq!(point.x, 0.0, "offset {offset}");
+            }
+        });
+    }
+
     #[gpui::test]
     fn source_first_list_editing_commits_enter_and_immediate_tab(cx: &mut gpui::TestAppContext) {
         let view = gpui::AppContext::new(cx, |cx| EditorView::new("- A\n- B", "Untitled", cx));

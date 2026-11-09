@@ -272,7 +272,10 @@ pub fn present_block_with_table_projection(
     let local_bare = local_bare_links(block, window);
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for run in disclosure_runs(block.kind, window) {
-        if run_uses_shared_parse(run.len(), window.joined) {
+        // The blank run closing the block is not part of the construct, so it
+        // never joins the shared parse and carries no list / quote ownership.
+        let trailing = window.lines[run.start].line >= content_end;
+        if !trailing && run_uses_shared_parse(run.len(), window.joined) {
             present_joined_run_with_list_projection(
                 &window.lines[run.clone()],
                 revision,
@@ -310,7 +313,7 @@ pub fn present_block_with_table_projection(
             line_height,
             line.disclosure,
             line_context,
-            list_projection,
+            if trailing { None } else { list_projection },
             local_bare,
             fence_role,
             table_header,
@@ -532,9 +535,13 @@ fn disclosure_runs(block_kind: NodeKind, window: &BlockWindow<'_>) -> Vec<Range<
             LineContext::Normal
         };
         let mut run_end = index + 1;
-        if joinable && line_context == LineContext::Normal {
+        // Trailing blank lines stay one run each, apart from the block body.
+        if joinable && line_context == LineContext::Normal && line.line < content_end {
             while run_end < window.lines.len() {
                 let next = window.lines[run_end];
+                if next.line >= content_end {
+                    break;
+                }
                 let next_context = if next.line < content_end {
                     context
                 } else {
@@ -583,9 +590,11 @@ pub fn expected_disclosures(
     window: &BlockWindow<'_>,
 ) -> Vec<(usize, Option<SourceRange>)> {
     let mut out = Vec::new();
+    let content_end = window.span.end.saturating_sub(window.trailing_blank_lines);
     for run in disclosure_runs(block_kind, window) {
         let lines = &window.lines[run];
-        let shared_parse = run_uses_shared_parse(lines.len(), window.joined);
+        let shared_parse = lines[0].line < content_end
+            && run_uses_shared_parse(lines.len(), window.joined);
         let merged = shared_parse
             .then(|| joined_run_disclosure(lines, window.block_disclosure))
             .flatten();
