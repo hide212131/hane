@@ -7950,6 +7950,25 @@ mod tests {
         let long = "alpha ".repeat(60);
         let text = format!("| h |\n| --- |\n| [{long}](https://example.com/t) |\n");
         let (view, cx, _) = open_view_for_mouse_tests(cx, &text, false);
+        // A fresh view starts from a quick index without table metadata, so
+        // publish the Formal index the way a settled document has it.
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            let index = BlockIndex::from_buffer(&document);
+            view.block_index
+                .publish(index.clone(), IndexSource::Formal, &document);
+            view.install_heights(
+                Granularity::Blocks,
+                HeightIndex::new(block_heights_with_disclosure(
+                    &document,
+                    &index,
+                    view.line_height(),
+                    view.active_height_disclosure(),
+                )),
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
         let frame = a11y_frame_of(&view, cx);
         assert_eq!(frame.links.len(), 1);
         let bounds = frame.links[0].bounds;
@@ -7961,19 +7980,23 @@ mod tests {
     /// partial even though its remaining rows are fully visible.
     #[gpui::test]
     fn a11y_link_with_rows_above_the_viewport_is_partial(cx: &mut gpui::TestAppContext) {
-        let long = "alpha ".repeat(400);
+        // Long enough to be scrollable, so the position below is not clamped
+        // back to the top; the last rows are scrolled to and fit the viewport.
+        let long = "alpha ".repeat(2000);
         let text = format!("[{long}](https://example.com/w)\n");
         let (view, cx, _) = open_view_for_mouse_tests(cx, &text, false);
-        assert!(!a11y_frame_of(&view, cx).links[0].partial);
-        view.update(cx, |view, cx| {
+        view.update(cx, |view, _| {
             let block = *view
                 .line_owners
                 .values()
                 .map(|(block_id, _)| block_id)
                 .next()
                 .expect("a block");
-            view.scroll_y = view.content_y_for_row(block, 2).expect("third row");
-            cx.notify();
+            let rows = view.layout_cache.get(&block).expect("layout").layout.lines.len();
+            assert!(rows > 8, "the link wraps onto many rows");
+            view.scroll_y = view
+                .content_y_for_row(block, rows - 3)
+                .expect("a row near the end");
         });
         let frame = a11y_frame_of(&view, cx);
         assert_eq!(frame.links.len(), 1);
