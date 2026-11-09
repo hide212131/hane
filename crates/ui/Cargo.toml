@@ -27,6 +27,9 @@ hane-markdown.workspace = true
 hane-presentation.workspace = true
 hane-session.workspace = true
 gpui.workspace = true
+# Synthetic accessibility nodes for body links (Issue #704). The version is the
+# one GPUI already resolves in the lockfile.
+accesskit = "=0.24.1"
 gpui-component.workspace = true
 gpui-kit-assets.workspace = true
 unicode-segmentation.workspace = true
