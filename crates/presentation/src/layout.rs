@@ -877,21 +877,51 @@ impl BlockLayout {
     /// The extent of a line-local visual range that lies on one row, measured
     /// with the same row geometry that paints and hit-tests it. `x0..x1` is in
     /// the block's text column and `y` is relative to the row's top. A range
-    /// that spans several fragments of a table cell is returned as the
-    /// bounding box of its two ends.
-    pub fn visual_span_on_row(
+    /// that spans several wrapped fragments of one table cell is returned as
+    /// one span per fragment, so each piece keeps its own width and position.
+    pub fn visual_spans_on_row(
         &self,
         block: &VisualBlock,
         row_index: usize,
         visual: Range<usize>,
         shaper: &dyn LineShaper,
-    ) -> Option<RowSpan> {
-        let row = self.lines.get(row_index)?;
-        let line = block.lines.get(row.line)?;
+    ) -> Vec<RowSpan> {
+        let Some(row) = self.lines.get(row_index) else {
+            return Vec::new();
+        };
+        let Some(line) = block.lines.get(row.line) else {
+            return Vec::new();
+        };
         let visual = visual.start.max(row.line_visual_range.start)
             ..visual.end.min(row.line_visual_range.end);
         if visual.start >= visual.end {
-            return None;
+            return Vec::new();
+        }
+        if let Some(cell) = row.table_cell_for_visual(visual.start)
+            && cell.fragments.len() > 1
+            && visual.end <= cell.visual_range.end
+        {
+            return cell
+                .fragments
+                .iter()
+                .filter_map(|fragment| {
+                    let start = visual.start.max(fragment.visual_range.start);
+                    let end = visual.end.min(fragment.visual_range.end);
+                    if start >= end {
+                        return None;
+                    }
+                    let left = fragment.text_x
+                        + shaper.x_for_offset(line, fragment.visual_range.clone(), start);
+                    let right = fragment.text_x
+                        + shaper.x_for_offset(line, fragment.visual_range.clone(), end);
+                    Some(RowSpan {
+                        x0: left.min(right),
+                        x1: left.max(right),
+                        y: fragment.y,
+                        height: fragment.height,
+                    })
+                })
+                .collect();
         }
         let left = row.x_for_visual(line, visual.start, shaper);
         let right = row.x_for_visual(line, visual.end, shaper);
@@ -899,16 +929,16 @@ impl BlockLayout {
         let (end_y, end_height) = row.fragment_y_for_visual(visual.end - 1);
         let top = start_y.min(end_y);
         let bottom = (start_y + start_height).max(end_y + end_height);
-        Some(RowSpan {
+        vec![RowSpan {
             x0: left.min(right),
             x1: left.max(right),
             y: top,
             height: bottom - top,
-        })
+        }]
     }
 }
 
-/// A horizontal stretch of one layout row; see [`BlockLayout::visual_span_on_row`].
+/// A horizontal stretch of one layout row; see [`BlockLayout::visual_spans_on_row`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowSpan {
     pub x0: f32,

@@ -92,14 +92,27 @@ impl A11yDocumentFrame {
     }
 }
 
+/// What one document's content generation was assigned for: the document
+/// instance, the work folder it was open in and its revision.
+#[derive(Debug)]
+struct A11yStamp {
+    document: DocumentKey,
+    workspace: u64,
+    revision: Revision,
+    generation: u64,
+}
+
 /// The content generation, advanced lazily: only frames drawn while
-/// accessibility is active compare the stamp, so nothing tracks edits while it
+/// accessibility is active compare the stamps, so nothing tracks edits while it
 /// is inactive, and a change made meanwhile still yields a new generation on
 /// the next active frame. The counter never repeats within the window's life.
+/// Each document keeps its own generation, so switching tabs away and back
+/// without an edit keeps the ids, while a work-folder switch or an edit
+/// retires them.
 #[derive(Debug, Default)]
 pub(super) struct A11yState {
     content_generation: u64,
-    stamp: Option<(DocumentKey, Revision)>,
+    stamps: Vec<A11yStamp>,
 }
 
 #[cfg(test)]
@@ -192,17 +205,51 @@ impl EditorView {
         }
     }
 
-    fn a11y_content_stamp(&self) -> (DocumentKey, Revision) {
-        (self.document_key(), self.sessions.active().revision())
+    fn a11y_content_generation(&mut self) -> u64 {
+        let document = self.document_key();
+        let workspace = self.work_folder_generation;
+        let revision = self.sessions.active().revision();
+        let sessions = &self.sessions;
+        self.a11y.stamps.retain(|stamp| {
+            stamp.workspace == workspace
+                && sessions
+                    .get(stamp.document.session)
+                    .is_some_and(|session| session.generation() == stamp.document.generation)
+        });
+        if let Some(stamp) = self
+            .a11y
+            .stamps
+            .iter_mut()
+            .find(|stamp| stamp.document == document)
+        {
+            if stamp.revision != revision {
+                self.a11y.content_generation += 1;
+                stamp.revision = revision;
+                stamp.generation = self.a11y.content_generation;
+            }
+            return stamp.generation;
+        }
+        self.a11y.content_generation += 1;
+        self.a11y.stamps.push(A11yStamp {
+            document,
+            workspace,
+            revision,
+            generation: self.a11y.content_generation,
+        });
+        self.a11y.content_generation
     }
 
-    fn a11y_content_generation(&mut self) -> u64 {
-        let stamp = self.a11y_content_stamp();
-        if self.a11y.stamp != Some(stamp) {
-            self.a11y.stamp = Some(stamp);
-            self.a11y.content_generation += 1;
-        }
-        self.a11y.content_generation
+    /// Whether `generation` is the one the active document's current content
+    /// was published under in the current work folder.
+    fn a11y_generation_is_current(&self, generation: u64) -> bool {
+        let document = self.document_key();
+        let revision = self.sessions.active().revision();
+        self.a11y.stamps.iter().any(|stamp| {
+            stamp.document == document
+                && stamp.workspace == self.work_folder_generation
+                && stamp.revision == revision
+                && stamp.generation == generation
+        })
     }
 
     /// Visible links from this frame's layout. Rows that do not reach the
@@ -231,6 +278,7 @@ impl EditorView {
             .map(|(block_id, _)| *block_id)
             .collect::<HashSet<_>>();
         let mut fragments = Vec::new();
+        let mut omitted: Vec<SourceRange> = Vec::new();
         for block_id in blocks {
             let (Some(layout), Some(visual)) = (
                 self.layout_cache.get(&block_id).map(|entry| &entry.layout),
@@ -256,27 +304,42 @@ impl EditorView {
                     continue;
                 };
                 let row_top = body_top + row_content_y - self.scroll_y;
-                if row_top + row.height <= viewport.y0 || row_top >= viewport.y1 {
-                    continue;
-                }
+                let row_offscreen = row_top + row.height <= viewport.y0 || row_top >= viewport.y1;
                 for link in &line.links {
                     let Some(visual_range) =
                         layout.visual_range_on_row(visual, row_index, link.source_range)
                     else {
                         continue;
                     };
-                    let Some(span) =
-                        layout.visual_span_on_row(visual, row_index, visual_range.clone(), shaper)
-                    else {
+                    if row_offscreen {
+                        // Nothing is measured for a row outside the viewport;
+                        // it only marks the link as cut off.
+                        omitted.push(link.link_text_range);
                         continue;
-                    };
-                    let full = LogicalRect {
-                        x0: text_left + span.x0,
-                        y0: row_top + span.y,
-                        x1: text_left + span.x1,
-                        y1: row_top + span.y + span.height,
-                    };
-                    let Some(visible) = full.intersect(viewport) else {
+                    }
+                    let spans =
+                        layout.visual_spans_on_row(visual, row_index, visual_range.clone(), shaper);
+                    let mut visible_rect: Option<LogicalRect> = None;
+                    let mut clipped = false;
+                    for span in &spans {
+                        let full = LogicalRect {
+                            x0: text_left + span.x0,
+                            y0: row_top + span.y,
+                            x1: text_left + span.x1,
+                            y1: row_top + span.y + span.height,
+                        };
+                        match full.intersect(viewport) {
+                            Some(visible) => {
+                                clipped |= visible != full;
+                                visible_rect = Some(
+                                    visible_rect.map_or(visible, |rect| rect.union(visible)),
+                                );
+                            }
+                            None => clipped = true,
+                        }
+                    }
+                    let Some(visible) = visible_rect else {
+                        omitted.push(link.link_text_range);
                         continue;
                     };
                     let Some(text) = line.visual_text.get(visual_range) else {
@@ -285,10 +348,10 @@ impl EditorView {
                     fragments.push(LinkFragment {
                         link_text_range: link.link_text_range,
                         destination: link.destination.clone(),
-                        order: (row_content_y, span.x0),
+                        order: (row_content_y, spans.first().map_or(0.0, |span| span.x0)),
                         text: text.to_owned(),
                         rect: visible,
-                        clipped: visible != full,
+                        clipped,
                     });
                 }
             }
@@ -326,7 +389,8 @@ impl EditorView {
                 link_text_range: first.link_text_range,
                 destination: first.destination.clone(),
                 label,
-                partial: group.iter().any(|fragment| fragment.clipped),
+                partial: group.iter().any(|fragment| fragment.clipped)
+                    || omitted.contains(&first.link_text_range),
                 bounds: accesskit::Rect {
                     x0: f64::from(rect.x0) * scale,
                     y0: f64::from(rect.y0) * scale,
@@ -338,20 +402,48 @@ impl EditorView {
         links
     }
 
-    /// Whether the presentation drawn last still has exactly this link.
+    /// Whether the presentation drawn last still has exactly this link, and
+    /// at least one of its rows is in the viewport now. A click that arrives
+    /// after a scroll moved the link out of view is therefore refused.
     fn a11y_link_is_current(&self, request: &A11yLinkRequest) -> bool {
+        let body_top = self.theme.header_height + self.document_find_reserved_height();
+        let (view_top, view_bottom) = (body_top, body_top + self.viewport_height);
         let blocks = self
             .line_owners
             .values()
             .map(|(block_id, _)| *block_id)
             .collect::<HashSet<_>>();
         blocks.into_iter().any(|block_id| {
-            self.block_cache.get(&block_id).is_some_and(|visual| {
-                visual.lines.iter().any(|line| {
-                    line.links.iter().any(|link| {
-                        link.link_text_range == request.link_text_range
-                            && link.destination == request.destination
-                    })
+            let (Some(layout), Some(visual)) = (
+                self.layout_cache.get(&block_id).map(|entry| &entry.layout),
+                self.block_cache.get(&block_id),
+            ) else {
+                return false;
+            };
+            layout.lines.iter().enumerate().any(|(row_index, row)| {
+                let owned = self
+                    .line_owners
+                    .get(&(row.line_id as usize))
+                    .is_some_and(|(owner, _)| *owner == block_id);
+                if !owned || row.height <= 0.0 {
+                    return false;
+                }
+                let Some(line) = visual.lines.get(row.line) else {
+                    return false;
+                };
+                let Some(row_content_y) = self.content_y_for_row(block_id, row_index) else {
+                    return false;
+                };
+                let row_top = body_top + row_content_y - self.scroll_y;
+                if row_top + row.height <= view_top || row_top >= view_bottom {
+                    return false;
+                }
+                line.links.iter().any(|link| {
+                    link.link_text_range == request.link_text_range
+                        && link.destination == request.destination
+                        && layout
+                            .visual_range_on_row(visual, row_index, link.source_range)
+                            .is_some()
                 })
             })
         })
@@ -366,9 +458,9 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) -> bool {
         let content_is_current = request.document == self.document_key()
-            && self.a11y.content_generation == request.content_generation
-            && self.a11y.stamp == Some(self.a11y_content_stamp());
+            && self.a11y_generation_is_current(request.content_generation);
         if !content_is_current
+            || self.external_comparison_blocks_body()
             || self.settings_open
             || self.tab_close_confirm.is_some()
             || !self.a11y_link_is_current(request)

@@ -7880,6 +7880,106 @@ mod tests {
         assert_eq!(a11y_editor_state(&view, cx), state_before);
     }
 
+    /// Issue #704: switching tabs away and back without an edit keeps the id
+    /// keys and an old request valid.
+    #[gpui::test]
+    fn a11y_keys_survive_a_tab_round_trip_without_an_edit(cx: &mut gpui::TestAppContext) {
+        let text = "see https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let before = a11y_frame_of(&view, cx);
+        let request = a11y_request_for(&before, 0);
+        let first = view.read_with(cx, |view, _| view.sessions.active_id());
+        let second = view.update(cx, |view, _| view.sessions.open_untitled("other\n", "Other"));
+        view.update(cx, |view, cx| assert!(view.activate_session(second, cx)));
+        cx.run_until_parked();
+        let other = a11y_frame_of(&view, cx);
+        assert_ne!(other.content_generation, before.content_generation);
+        view.update(cx, |view, cx| assert!(view.activate_session(first, cx)));
+        cx.run_until_parked();
+        let after = a11y_frame_of(&view, cx);
+        assert_eq!(after.content_generation, before.content_generation);
+        assert_eq!(after.links[0].key, before.links[0].key);
+        assert!(view.update(cx, |view, cx| view.activate_a11y_link(&request, cx)));
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/a"));
+    }
+
+    /// Issue #704: a request made before a work-folder switch is refused even
+    /// when the session id, revision and link range look the same, and the
+    /// next frame publishes new keys.
+    #[gpui::test]
+    fn a11y_request_does_not_survive_a_work_folder_switch(cx: &mut gpui::TestAppContext) {
+        let text = "see https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let before = a11y_frame_of(&view, cx);
+        let request = a11y_request_for(&before, 0);
+        view.update(cx, |view, cx| {
+            view.work_folder_generation = view.work_folder_generation.wrapping_add(1);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(!view.update(cx, |view, cx| view.activate_a11y_link(&request, cx)));
+        assert!(cx.opened_url().is_none());
+        let after = a11y_frame_of(&view, cx);
+        assert_ne!(after.content_generation, before.content_generation);
+        assert_ne!(after.links[0].key, before.links[0].key);
+        assert!(view.update(cx, |view, cx| {
+            view.activate_a11y_link(&a11y_request_for(&after, 0), cx)
+        }));
+    }
+
+    /// Issue #704: a request for a link that has scrolled out of the viewport
+    /// since it was published opens nothing.
+    #[gpui::test]
+    fn a11y_click_on_a_link_scrolled_out_of_view_is_refused(cx: &mut gpui::TestAppContext) {
+        let text = format!(
+            "intro\n\n[first](https://example.com/first)\n\n{}",
+            "filler paragraph\n\n".repeat(150)
+        );
+        let (view, cx, _) = open_view_for_mouse_tests(cx, &text, false);
+        let frame = a11y_frame_of(&view, cx);
+        let request = a11y_request_for(&frame, 0);
+        view.update(cx, |view, _| view.scroll_y = 5000.0);
+        assert!(!view.update(cx, |view, cx| view.activate_a11y_link(&request, cx)));
+        assert!(cx.opened_url().is_none());
+    }
+
+    /// Issue #704: a link wrapped inside a left-aligned table cell keeps a
+    /// non-zero width.
+    #[gpui::test]
+    fn a11y_wrapped_link_in_a_table_cell_has_non_zero_bounds(cx: &mut gpui::TestAppContext) {
+        let long = "alpha ".repeat(60);
+        let text = format!("| h |\n| --- |\n| [{long}](https://example.com/t) |\n");
+        let (view, cx, _) = open_view_for_mouse_tests(cx, &text, false);
+        let frame = a11y_frame_of(&view, cx);
+        assert_eq!(frame.links.len(), 1);
+        let bounds = frame.links[0].bounds;
+        assert!(bounds.x1 > bounds.x0, "a wrapped cell link has width");
+        assert!(bounds.y1 > bounds.y0);
+    }
+
+    /// Issue #704: a link whose first rows are above the viewport is marked
+    /// partial even though its remaining rows are fully visible.
+    #[gpui::test]
+    fn a11y_link_with_rows_above_the_viewport_is_partial(cx: &mut gpui::TestAppContext) {
+        let long = "alpha ".repeat(400);
+        let text = format!("[{long}](https://example.com/w)\n");
+        let (view, cx, _) = open_view_for_mouse_tests(cx, &text, false);
+        assert!(!a11y_frame_of(&view, cx).links[0].partial);
+        view.update(cx, |view, cx| {
+            let block = *view
+                .line_owners
+                .values()
+                .map(|(block_id, _)| block_id)
+                .next()
+                .expect("a block");
+            view.scroll_y = view.content_y_for_row(block, 2).expect("third row");
+            cx.notify();
+        });
+        let frame = a11y_frame_of(&view, cx);
+        assert_eq!(frame.links.len(), 1);
+        assert!(frame.links[0].partial);
+    }
+
     /// Issue #704: while accessibility is inactive a frame runs no collector,
     /// label builder or handler registration.
     #[gpui::test]
