@@ -2391,6 +2391,31 @@ fn trailing_blank_line_after_a_list_is_a_plain_paragraph_at_every_offset() {
         let line = &visual.lines[hit.expect("row for offset")];
         assert!(line.list.is_none() && line.quote.is_none(), "offset {offset}");
     }
+
+    // Reverse direction: points on the blank rows resolve back to the same
+    // offsets, including a point where the old list marker column would sit.
+    for offset in [25, 26] {
+        let row = layout
+            .row_for_source(SourceOffset(offset))
+            .expect("row for offset");
+        for x in [0.0, 16.0] {
+            assert_eq!(
+                layout.source_at_x(&visual, row, x, &shaper),
+                Some(SourceOffset(offset)),
+                "x={x} on the row of offset {offset}"
+            );
+        }
+        let point = layout
+            .point_for_source(&visual, SourceOffset(offset), &shaper)
+            .expect("caret point");
+        assert_eq!(
+            layout.source_for_point(&visual, 0.0, point.y + point.height / 2.0, &shaper),
+            Some(SourceOffset(offset)),
+            "source_for_point at x=0 for offset {offset}"
+        );
+        let line = &visual.lines[layout.lines[row].line];
+        assert!(line.list.is_none(), "offset {offset} resolved into a list");
+    }
 }
 
 #[test]

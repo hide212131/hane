@@ -5,16 +5,16 @@
 ## 根本原因（データの流れに沿って）
 
 1. **末尾空白行の所属と、構文の所属が分離されていない。**  
-   [block_index.rs](/home/hatch/workspace/projects/hane/crates/markdown/src/block_index.rs:839) の `tiled_blocks` は、次のブロックまでの空白行を上のブロックへ含める。`block_line_span` は EOF の空行も表示対象に加える。
+   [block_index.rs](../../crates/markdown/src/block_index.rs#L839) の `tiled_blocks` は、次のブロックまでの空白行を上のブロックへ含める。`block_line_span` は EOF の空行も表示対象に加える。
 
 2. **末尾空白行がリスト本文と同じ共有解析へ渡される。**  
-   [line.rs](/home/hatch/workspace/projects/hane/crates/ui/src/line.rs:175) の `presented_block` → `block_context` が `trailing_blank_lines` を計算し、`BlockWindow` に渡す。しかし [block.rs](/home/hatch/workspace/projects/hane/crates/presentation/src/projection/block.rs:520) の `disclosure_runs` は、本文と末尾空白行を `LineContext::Normal` 同士として結合する。**リスト自体も Normal なので、現在の文脈切替では境界を作れない。**
+   [line.rs](../../crates/ui/src/line.rs#L172) の `presented_block` → `block_context` が `trailing_blank_lines` を計算し、`BlockWindow` に渡す。しかし [block.rs](../../crates/presentation/src/projection/block.rs#L524) の `disclosure_runs` は、本文と末尾空白行を `LineContext::Normal` 同士として結合する。**リスト自体も Normal なので、現在の文脈切替では境界を作れない。**
 
 3. **共有解析から継続行のメタデータが付く。**  
-   `present_joined_run_with_list_projection` → `present_markdown_from_parse` → [mod.rs の `list_row_metadata`](/home/hatch/workspace/projects/hane/crates/presentation/src/projection/mod.rs:2030) は、共有解析の項目範囲、または formal な `ListProjection::item_for_range` から所有者を求める。項目と交差し、開始マーカーを持たない行は `Continuation` となる。末尾空白行を構文外として除外する処理が、この経路にはない。
+   `present_joined_run_with_list_projection` → `present_markdown_from_parse` → [mod.rs の `list_row_metadata`](../../crates/presentation/src/projection/mod.rs#L2032) は、共有解析の項目範囲、または formal な `ListProjection::item_for_range` から所有者を求める。項目と交差し、開始マーカーを持たない行は `Continuation` となる。末尾空白行を構文外として除外する処理が、この経路にはない。
 
 4. **レイアウトはその情報に従ってインデントする。**  
-   [layout.rs の `line_geometry`](/home/hatch/workspace/projects/hane/crates/presentation/src/layout.rs:1533) は `VisualLine.list` がある行にマーカー列の幅を確保する。文字が空でも位置は右へずれ、`BlockLayout::point_for_source` がその座標をカーソル位置として返す。`context = Normal` への変更だけでは解消しない。
+   [layout.rs の `line_geometry`](../../crates/presentation/src/layout.rs#L1603) は `VisualLine.list` がある行にマーカー列の幅を確保する。文字が空でも位置は右へずれ、`BlockLayout::point_for_source` がその座標をカーソル位置として返す。`context = Normal` への変更だけでは解消しない。
 
 ### 編集直後と開き直しの差
 
@@ -50,7 +50,7 @@ Enter×2 後は通常 offset 26 に着く。この違いで「編集直後は左
 
 ## テスト計画
 
-主な回帰テストは [projection/tests.rs](/home/hatch/workspace/projects/hane/crates/presentation/src/projection/tests.rs) に置く。**presentation 単体でカーソル座標まで検証できる。** `FixedAdvanceShaper` と `layout_block` → `point_for_source` を使う。
+主な回帰テストは [projection/tests.rs](../../crates/presentation/src/projection/tests.rs#L2368) に置く。**presentation 単体でカーソル座標まで検証できる。** `FixedAdvanceShaper` と `layout_block` → `point_for_source` を使う。
 
 - 指定文書を実際の `BlockIndex`・`BlockWindow` から表示し、offset **25 と 26 の両方**で `list/quote = None`、カーソル `x = 0` を検証する。SourceMap と逆方向の hit-test も確認する。
 - formal 投影あり／なし、cached joined parse あり／なし、全行表示／末尾だけの表示で結果が一致することを確認する。
