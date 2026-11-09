@@ -310,6 +310,52 @@ fn rebase_after_a_multibyte_edit_in_front_keeps_targets_and_glyphs_aligned() {
 }
 
 #[test]
+fn bare_url_keeps_its_whole_range_and_equal_urls_stay_independent() {
+    let url = "https://example.com/a";
+    let source = format!("{url} and {url}\n");
+    let blocks = present(&source);
+    let links = blocks
+        .iter()
+        .flat_map(|block| &block.lines)
+        .flat_map(|line| &line.links)
+        .collect::<Vec<_>>();
+    assert_eq!(links.len(), 2);
+    let first = SourceRange::new(0, url.len());
+    let second_start = source.rfind(url).expect("second url");
+    let second = SourceRange::new(second_start, second_start + url.len());
+    assert_eq!(links[0].link_text_range, first);
+    assert_eq!(links[0].source_range, first);
+    assert_eq!(links[1].link_text_range, second);
+    assert_eq!(links[1].source_range, second);
+    assert_ne!(
+        links[0].link_text_range, links[1].link_text_range,
+        "the same destination must not merge two links"
+    );
+}
+
+#[test]
+fn multi_line_markdown_link_shares_one_whole_range_across_physical_lines() {
+    let url = "https://example.com/";
+    let source = format!("see [one\ntwo]({url}) end\n");
+    let whole = range_of(&source, "one\ntwo");
+    let blocks = present(&source);
+    let links = blocks
+        .iter()
+        .flat_map(|block| &block.lines)
+        .flat_map(|line| &line.links)
+        .collect::<Vec<_>>();
+    assert!(links.len() >= 2, "each physical line carries its part");
+    for link in &links {
+        assert_eq!(link.link_text_range, whole);
+        assert!(whole.start <= link.source_range.start && link.source_range.end <= whole.end);
+    }
+    assert_ne!(
+        links[0].source_range, links[1].source_range,
+        "the per-line click range stays clipped to its own line"
+    );
+}
+
+#[test]
 fn several_urls_in_one_text_each_hit_only_their_own_glyphs() {
     let source = "see https://a.example/x, then https://b.example/y; https://c.example/z end";
     let urls = [

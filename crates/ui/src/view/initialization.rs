@@ -202,6 +202,7 @@ impl EditorView {
             editor_scrollbar_drag: None,
             text_selection_drag: false,
             pending_reading_link: None,
+            link_hover: link_hover::LinkHover::default(),
             text_autoscroll: None,
             text_autoscroll_activity: 0,
             sidebar_scrollbar_visible: false,

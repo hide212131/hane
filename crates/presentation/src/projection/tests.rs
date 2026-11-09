@@ -595,6 +595,7 @@ fn external_link_target_carries_destination_and_absolute_text_range() {
     let target = &line.links[0];
     assert_eq!(&*target.destination, "https://example.com/");
     assert_eq!(target.source_range, SourceRange::new(14, 18));
+    assert_eq!(target.link_text_range, SourceRange::new(14, 18));
     assert!(target.contains(SourceOffset(14)));
     assert!(!target.contains(SourceOffset(18)));
 }
@@ -670,6 +671,7 @@ fn heading_reference_link_keeps_destination_defined_on_another_line() {
         links[0].source_range,
         SourceRange::new(text_start, text_start + "docs".len())
     );
+    assert_eq!(links[0].link_text_range, links[0].source_range);
 }
 
 #[test]
@@ -725,6 +727,7 @@ fn table_row_reference_link_keeps_destination_defined_on_another_line() {
         links[0].source_range,
         SourceRange::new(text_start, text_start + "docs".len())
     );
+    assert_eq!(links[0].link_text_range, links[0].source_range);
 }
 
 #[test]
@@ -746,6 +749,7 @@ fn rebase_moves_link_targets_with_the_source_map() {
     };
     assert!(line.rebase(&[delta], Revision(2)));
     assert_eq!(line.links[0].source_range, SourceRange::new(19, 23));
+    assert_eq!(line.links[0].link_text_range, SourceRange::new(19, 23));
 
     // A delta that overlaps the link text cannot be transformed, so the
     // cached presentation is rejected instead of keeping a stale target.

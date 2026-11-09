@@ -435,6 +435,9 @@ impl EditorView {
         let top_space = self.heights.prefix_sum(items.start);
         let bottom_space =
             (self.heights.total_height() - self.heights.prefix_sum(items.end)).max(0.0);
+        // Re-resolved against this frame's layout so a still pointer never
+        // keeps a link emphasised after the content moved under it.
+        let link_hover = self.refresh_link_hover(&shaper);
         let root = div()
             .size_full()
             .flex()
@@ -481,10 +484,18 @@ impl EditorView {
         let editor_scrollbar = self.editor_scrollbar(self.scrollable_content_height(), cx);
         let main_column = main_column.child(
             div()
+                .id("editor-body")
                 .relative()
                 .flex_1()
                 .min_h(px(0.0))
                 .overflow_hidden()
+                // Leaving the body (or the window, or being covered by other
+                // UI) drops the link emphasis.
+                .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                    if !*hovered {
+                        view.clear_link_hover(cx);
+                    }
+                }))
                 .on_mouse_down(MouseButton::Left, cx.listener(Self::on_editor_mouse_down))
                 .on_mouse_down(
                     MouseButton::Right,
@@ -528,6 +539,7 @@ impl EditorView {
                                         self.body_caret_visible(),
                                         &find_matches,
                                         find_current_match,
+                                        link_hover,
                                         diagram_paint.as_ref(),
                                     )
                                     // Lets GPUI-event regression tests read a row's real

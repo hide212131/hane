@@ -1282,6 +1282,7 @@ fn present_markdown_from_parse(
                 };
                 (clipped.start < clipped.end).then(|| LinkTarget {
                     source_range: clipped,
+                    link_text_range: link.text_range,
                     destination: link.destination.clone(),
                     uses_reference: link.uses_reference,
                 })
@@ -1307,6 +1308,7 @@ fn present_markdown_from_parse(
                 };
                 (clipped.start < clipped.end).then(|| LinkTarget {
                     source_range: clipped,
+                    link_text_range: link.text_range,
                     destination: link.destination.clone(),
                     uses_reference: link.uses_reference,
                 })

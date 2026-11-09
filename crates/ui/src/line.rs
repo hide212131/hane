@@ -751,6 +751,7 @@ pub(crate) fn row_element(
     show_caret: bool,
     find_matches: &[SourceRange],
     find_current_match: Option<SourceRange>,
+    link_hover: Option<SourceRange>,
     diagram: Option<&DiagramPaint>,
 ) -> Div {
     let row = &layout.lines[row_index];
@@ -891,6 +892,7 @@ pub(crate) fn row_element(
             show_caret,
             find_matches,
             find_current_match,
+            link_hover,
         );
     }
 
@@ -945,6 +947,7 @@ pub(crate) fn row_element(
             show_caret,
             find_matches,
             find_current_match,
+            link_hover,
         );
     }
 
@@ -966,7 +969,8 @@ pub(crate) fn row_element(
         .and_then(|ime| layout.visual_range_on_row(block, row_index, ime.marked_range));
     let (match_visuals, current_match_visual) =
         row_find_match_visuals(block, layout, row_index, find_matches, find_current_match);
-    let segments = line_segments(
+    let hover_visuals = link_hover_visuals(line, link_hover);
+    let segments = line_segments_with_hover(
         row.line_visual_range.clone(),
         visual_cursor.map(|offset| offset.0),
         selected_visual,
@@ -977,6 +981,8 @@ pub(crate) fn row_element(
         },
         &line.style_runs,
         row.body_visual_start,
+        &link_boundary_visuals(line),
+        &hover_visuals,
     );
     let body_gap_segment = body_gap_segment(row, &segments);
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
@@ -1022,7 +1028,7 @@ pub(crate) fn row_element(
                         element.text_bg(rgb(theme.code_background))
                     })
                     .when(segment.display.link_color, |element| {
-                        element.text_color(rgb(theme.link_foreground))
+                        element.text_color(rgb(link_text_color(theme, segment.link_hover)))
                     })
                     .child(line.visual_text[segment.visual_range.clone()].to_owned())
                     .into_any_element(),
@@ -1088,7 +1094,10 @@ fn table_row_element(
     show_caret: bool,
     find_matches: &[SourceRange],
     find_current_match: Option<SourceRange>,
+    link_hover: Option<SourceRange>,
 ) -> Div {
+    let hover_visuals = link_hover_visuals(line, link_hover);
+    let all_link_visuals = link_boundary_visuals(line);
     let selection = editor.selection().range();
     let selected_visual = layout.visual_range_on_row(block, row_index, selection);
     let marked_visual = editor
@@ -1193,6 +1202,8 @@ fn table_row_element(
                         && run.visual_range.start.0 < fragment_range.end
                         && fragment_range.start < run.visual_range.end.0
                 });
+                let fragment_hover = clip_visual_ranges(&hover_visuals, fragment_range.clone());
+                let fragment_links = clip_visual_ranges(&all_link_visuals, fragment_range.clone());
                 if fragment_selected.is_none()
                     && fragment_marked.is_none()
                     && fragment_matches.is_empty()
@@ -1225,7 +1236,7 @@ fn table_row_element(
                         .child(text);
                     vec![text_element]
                 } else {
-                    line_segments(
+                    line_segments_with_hover(
                         fragment_range.clone(),
                         None,
                         fragment_selected,
@@ -1236,6 +1247,8 @@ fn table_row_element(
                         },
                         &line.style_runs,
                         None,
+                        &fragment_links,
+                        &fragment_hover,
                     )
                     .into_iter()
                     .filter(|segment| !segment.visual_range.is_empty())
@@ -1288,7 +1301,7 @@ fn table_row_element(
                                     line.line_id, cell_layout.column, fragment_index
                                 );
                                 element
-                                    .text_color(rgb(theme.link_foreground))
+                                    .text_color(rgb(link_text_color(theme, segment.link_hover)))
                                     .debug_selector(move || selector.clone())
                             })
                             .child(line.visual_text[segment.visual_range].to_owned())
@@ -1397,6 +1410,54 @@ struct LineSegment {
     find_current_match: bool,
     /// Inline render policy for this stretch, supplied by presentation.
     display: InlineDisplay,
+    /// Inside the link the pointer hovers; only the link foreground changes.
+    link_hover: bool,
+}
+
+/// Foreground of link text, brightened while its link is hovered.
+fn link_text_color(theme: Theme, hovered: bool) -> u32 {
+    if hovered {
+        theme.link_hover_foreground
+    } else {
+        theme.link_foreground
+    }
+}
+
+/// Visual ranges on `line` that belong to the hovered link, identified by the
+/// link's whole source range so a same-destination neighbour is not included.
+fn link_hover_visuals(line: &VisualLine, hovered: Option<SourceRange>) -> Vec<Range<usize>> {
+    let Some(hovered) = hovered else {
+        return Vec::new();
+    };
+    link_visuals(line, Some(hovered))
+}
+
+/// Visual ranges of every link on `line`, hovered or not. Their edges are
+/// segment boundaries in all states so hovering never changes text splitting.
+fn link_boundary_visuals(line: &VisualLine) -> Vec<Range<usize>> {
+    link_visuals(line, None)
+}
+
+/// Visual ranges of the links on `line`, limited to the one whose source range
+/// is `only` when given.
+fn link_visuals(line: &VisualLine, only: Option<SourceRange>) -> Vec<Range<usize>> {
+    line.links
+        .iter()
+        .filter(|link| only.is_none_or(|only| link.link_text_range == only))
+        .filter_map(|link| {
+            let start = line
+                .source_map
+                .source_to_visual(link.source_range.start, Bias::After)?
+                .visual_offset
+                .0;
+            let end = line
+                .source_map
+                .source_to_visual(link.source_range.end, Bias::Before)?
+                .visual_offset
+                .0;
+            (start < end).then_some(start..end)
+        })
+        .collect()
 }
 
 /// Whether a segment's div should carry the code span's `text_bg`.
@@ -1451,6 +1512,7 @@ struct FindHighlight<'a> {
     current: Option<Range<usize>>,
 }
 
+#[cfg(test)]
 fn line_segments(
     bounds: Range<usize>,
     cursor: Option<usize>,
@@ -1460,7 +1522,38 @@ fn line_segments(
     style_runs: &[hane_presentation::StyleRun],
     body_visual_start: Option<usize>,
 ) -> Vec<LineSegment> {
+    line_segments_with_hover(
+        bounds,
+        cursor,
+        selected,
+        marked,
+        find,
+        style_runs,
+        body_visual_start,
+        &[],
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn line_segments_with_hover(
+    bounds: Range<usize>,
+    cursor: Option<usize>,
+    selected: Option<Range<usize>>,
+    marked: Option<Range<usize>>,
+    find: FindHighlight<'_>,
+    style_runs: &[hane_presentation::StyleRun],
+    body_visual_start: Option<usize>,
+    link_ranges: &[Range<usize>],
+    link_hover: &[Range<usize>],
+) -> Vec<LineSegment> {
+    // Every link edge splits the text whether or not a link is hovered, so the
+    // shaped runs (and therefore the geometry) do not change on hover.
     let mut boundaries = Vec::new();
+    for range in link_ranges {
+        boundaries.push(range.start);
+        boundaries.push(range.end);
+    }
     boundaries.extend(cursor);
     boundaries.extend(body_visual_start);
     for range in [selected.as_ref(), marked.as_ref()].into_iter().flatten() {
@@ -1494,6 +1587,9 @@ fn line_segments(
                 .as_ref()
                 .is_some_and(|m| range.start >= m.start && range.end <= m.end),
             display: inline_display_for(&range, style_runs),
+            link_hover: link_hover
+                .iter()
+                .any(|hover| range.start >= hover.start && range.end <= hover.end),
             visual_range: range.clone(),
         })
         .collect()
@@ -1628,7 +1724,125 @@ mod tests {
                 code_background: true,
                 ..InlineDisplay::default()
             },
+            link_hover: false,
         }
+    }
+
+    fn link_style(range: Range<usize>) -> hane_presentation::StyleRun {
+        hane_presentation::StyleRun {
+            visual_range: hane_presentation::VisualRange::new(range.start, range.end),
+            kind: hane_presentation::StyleKind::Link,
+        }
+    }
+
+    #[test]
+    fn link_hover_marks_only_segments_inside_the_hovered_range() {
+        let runs = [link_style(2..8), link_style(10..14)];
+        let hover_ranges = std::iter::once(2..8).collect::<Vec<_>>();
+        let segments = line_segments_with_hover(
+            0..16,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &runs,
+            None,
+            &[2..8, 10..14],
+            &hover_ranges,
+        );
+        let hovered = segments
+            .iter()
+            .filter(|segment| segment.link_hover)
+            .map(|segment| segment.visual_range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(hovered.len(), 1);
+        assert_eq!(hovered[0], 2..8);
+        assert!(
+            segments
+                .iter()
+                .filter(|segment| segment.display.link_color)
+                .any(|segment| !segment.link_hover),
+            "a second link with the same style is not hovered"
+        );
+    }
+
+    #[test]
+    fn link_hover_keeps_selection_and_find_flags_for_the_renderer_priority() {
+        let runs = [link_style(0..6)];
+        let find_matches = single_find_match(0..3);
+        let hover_ranges = std::iter::once(0..6).collect::<Vec<_>>();
+        let segments = line_segments_with_hover(
+            0..6,
+            None,
+            Some(0..6),
+            None,
+            FindHighlight {
+                matches: &find_matches,
+                current: Some(0..3),
+            },
+            &runs,
+            None,
+            &hover_ranges,
+            &hover_ranges,
+        );
+        assert!(segments.iter().all(|segment| segment.link_hover));
+        assert!(segments.iter().all(|segment| segment.selected));
+        assert!(segments[0].find_match && segments[0].find_current_match);
+    }
+
+    #[test]
+    fn link_hover_does_not_change_segment_boundaries() {
+        // The link edges (2 and 8) are not style-run edges, as when a label
+        // holds a nested style; they must split the text hovered or not.
+        let runs = [link_style(4..6)];
+        let links = single_find_match(2..8);
+        let hover_ranges = single_find_match(2..8);
+        let split = |hover: &[Range<usize>]| {
+            line_segments_with_hover(
+                0..10,
+                Some(5),
+                None,
+                None,
+                FindHighlight {
+                    matches: &[],
+                    current: None,
+                },
+                &runs,
+                None,
+                &links,
+                hover,
+            )
+        };
+        let idle = split(&[]);
+        let hovered = split(&hover_ranges);
+        let bounds = |segments: &[LineSegment]| {
+            segments
+                .iter()
+                .map(|segment| segment.visual_range.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bounds(&idle), bounds(&hovered));
+        assert!(bounds(&idle).contains(&(2..4)));
+        assert!(bounds(&idle).iter().any(|range| range.end == 8));
+        assert!(idle.iter().all(|segment| !segment.link_hover));
+        assert!(hovered
+            .iter()
+            .filter(|segment| segment.visual_range.start >= 2 && segment.visual_range.end <= 8)
+            .all(|segment| segment.link_hover));
+    }
+
+    #[test]
+    fn link_text_color_switches_only_when_hovered() {
+        assert_eq!(
+            link_text_color(crate::theme::DEFAULT_THEME, false),
+            0x2867a9
+        );
+        assert_eq!(link_text_color(crate::theme::DEFAULT_THEME, true), 0x0066ff);
+        assert_eq!(link_text_color(crate::theme::DARK_THEME, false), 0x79b8ff);
+        assert_eq!(link_text_color(crate::theme::DARK_THEME, true), 0x40c8ff);
     }
 
     #[test]
@@ -2161,6 +2375,7 @@ mod tests {
                     find_match: false,
                     find_current_match: false,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
                 LineSegment {
                     visual_range: 3..6,
@@ -2170,6 +2385,7 @@ mod tests {
                     find_match: false,
                     find_current_match: false,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
                 LineSegment {
                     visual_range: 6..9,
@@ -2179,6 +2395,7 @@ mod tests {
                     find_match: false,
                     find_current_match: false,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
                 LineSegment {
                     visual_range: 9..12,
@@ -2188,6 +2405,7 @@ mod tests {
                     find_match: false,
                     find_current_match: false,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
             ]
         );
@@ -2219,6 +2437,7 @@ mod tests {
                     find_match: false,
                     find_current_match: false,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
                 LineSegment {
                     visual_range: 3..6,
@@ -2228,6 +2447,7 @@ mod tests {
                     find_match: true,
                     find_current_match: false,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
                 LineSegment {
                     visual_range: 6..9,
@@ -2237,6 +2457,7 @@ mod tests {
                     find_match: true,
                     find_current_match: true,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
                 LineSegment {
                     visual_range: 9..12,
@@ -2246,6 +2467,7 @@ mod tests {
                     find_match: false,
                     find_current_match: false,
                     display: InlineDisplay::default(),
+                    link_hover: false,
                 },
             ]
         );

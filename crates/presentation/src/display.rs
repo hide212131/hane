@@ -455,6 +455,10 @@ pub struct ImagePresentation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LinkTarget {
     pub source_range: SourceRange,
+    /// The whole link text before it was clipped to this physical line. Hover
+    /// uses it as the link's identity, so a link that wraps over several lines
+    /// or appears twice with the same destination stays distinguishable.
+    pub link_text_range: SourceRange,
     pub destination: Arc<str>,
     /// Whether the destination comes from a reference definition, which an edit
     /// outside this link's block can change.
@@ -568,6 +572,12 @@ impl VisualLine {
                     return false;
                 };
                 link.source_range = rebased;
+            }
+            for delta in deltas {
+                let Some(rebased) = delta.transform_range(link.link_text_range) else {
+                    return false;
+                };
+                link.link_text_range = rebased;
             }
         }
         if let Some(list) = &mut self.list
