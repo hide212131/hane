@@ -62,8 +62,8 @@ pub use display::{
 pub use height_index::{HeightIndex, ScrollAnchor, anchored_scroll_y};
 pub use layout::{
     BlockLayout, LIST_DEPTH_INDENT, LayoutLine, LayoutPoint, LineShaper, LineWrap, QUOTE_BAR_GAP,
-    QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, TableCellFragment, TableCellLayout, VerticalMove,
-    layout_block, line_visual_start,
+    QUOTE_BAR_WIDTH, QUOTE_DEPTH_INDENT, RowSpan, TableCellFragment, TableCellLayout,
+    VerticalMove, layout_block, line_visual_start,
 };
 pub use projection::{
     BlockLine, BlockWindow, JoinedParse, block_height_with_disclosure, block_heights,

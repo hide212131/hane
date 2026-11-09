@@ -873,6 +873,48 @@ impl BlockLayout {
             .clamp(row.line_visual_range.start, row.line_visual_range.end);
         (start < end).then_some(start..end)
     }
+
+    /// The extent of a line-local visual range that lies on one row, measured
+    /// with the same row geometry that paints and hit-tests it. `x0..x1` is in
+    /// the block's text column and `y` is relative to the row's top. A range
+    /// that spans several fragments of a table cell is returned as the
+    /// bounding box of its two ends.
+    pub fn visual_span_on_row(
+        &self,
+        block: &VisualBlock,
+        row_index: usize,
+        visual: Range<usize>,
+        shaper: &dyn LineShaper,
+    ) -> Option<RowSpan> {
+        let row = self.lines.get(row_index)?;
+        let line = block.lines.get(row.line)?;
+        let visual = visual.start.max(row.line_visual_range.start)
+            ..visual.end.min(row.line_visual_range.end);
+        if visual.start >= visual.end {
+            return None;
+        }
+        let left = row.x_for_visual(line, visual.start, shaper);
+        let right = row.x_for_visual(line, visual.end, shaper);
+        let (start_y, start_height) = row.fragment_y_for_visual(visual.start);
+        let (end_y, end_height) = row.fragment_y_for_visual(visual.end - 1);
+        let top = start_y.min(end_y);
+        let bottom = (start_y + start_height).max(end_y + end_height);
+        Some(RowSpan {
+            x0: left.min(right),
+            x1: left.max(right),
+            y: top,
+            height: bottom - top,
+        })
+    }
+}
+
+/// A horizontal stretch of one layout row; see [`BlockLayout::visual_span_on_row`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RowSpan {
+    pub x0: f32,
+    pub x1: f32,
+    pub y: f32,
+    pub height: f32,
 }
 
 /// Block-local visual offset the presented line at `index` starts at.

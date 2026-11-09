@@ -1,3 +1,4 @@
+use super::a11y_links::A11yDocumentExt;
 use super::*;
 
 impl Render for EditorView {
@@ -438,6 +439,9 @@ impl EditorView {
         // Re-resolved against this frame's layout so a still pointer never
         // keeps a link emphasised after the content moved under it.
         let link_hover = self.refresh_link_hover(&shaper);
+        // `None` unless accessibility is active; the link nodes are collected
+        // from this frame's layout only then.
+        let a11y_frame = self.a11y_document_frame(window);
         let root = div()
             .size_full()
             .flex()
@@ -585,7 +589,8 @@ impl EditorView {
                         }))
                         .child(div().h(px(bottom_space))),
                 )
-                .children(editor_scrollbar),
+                .children(editor_scrollbar)
+                .a11y_document(a11y_frame, cx.entity().downgrade()),
         );
         let editor_column_width =
             (f32::from(window.viewport_size().width) - sidebar_width).max(0.0);

@@ -89,6 +89,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+mod a11y_links;
 mod ai_document_context;
 mod ai_prompts;
 mod ai_selection;
@@ -997,6 +998,8 @@ pub struct EditorView {
     pending_reading_link: Option<PendingReadingLink>,
     /// Transient pointer and hovered-link state for link emphasis (Issue #700).
     link_hover: link_hover::LinkHover,
+    /// Content generation for the body's accessibility link nodes (Issue #704).
+    a11y: a11y_links::A11yState,
     /// Which edge of the editor viewport the current text-selection drag is
     /// held against, if any. `None` means no autoscroll is currently ticking.
     text_autoscroll: Option<AutoscrollDirection>,
@@ -7645,6 +7648,273 @@ mod tests {
         assert_eq!(hovered(&view, cx), None);
         hover_at(cx, inside_link);
         assert_eq!(hovered(&view, cx), Some(first_url));
+    }
+
+    /// The accessibility frame the next active frame would publish. The test
+    /// window is not accessibility-active, so this drives the same builder the
+    /// gated entry point calls.
+    fn a11y_frame_of(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> a11y_links::A11yDocumentFrame {
+        cx.update(|window, app| {
+            view.update(app, |view, _| {
+                let shaper = WindowShaper::new(window, view.zoom);
+                view.build_a11y_frame(
+                    &shaper,
+                    f64::from(window.scale_factor()),
+                    f32::from(window.viewport_size().width),
+                )
+            })
+        })
+    }
+
+    fn a11y_request_for(
+        frame: &a11y_links::A11yDocumentFrame,
+        index: usize,
+    ) -> a11y_links::A11yLinkRequest {
+        frame.request_for(&frame.links[index])
+    }
+
+    fn a11y_editor_state(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (String, Revision, Selection, bool, bool) {
+        view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+                view.editor().selection(),
+                view.editor().can_undo(),
+                view.editor().can_redo(),
+            )
+        })
+    }
+
+    /// Issue #704: the document root and the visible links, with the label from
+    /// the displayed text, bounds inside the painted row in the unit GPUI uses
+    /// for its own nodes, one node per occurrence, and a Click declaration
+    /// backed by a request for the exact link.
+    #[gpui::test]
+    fn a11y_frame_lists_visible_links_with_label_bounds_and_distinct_ids(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "see https://example.com/a and https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let frame = a11y_frame_of(&view, cx);
+        assert!(!frame.name.is_empty());
+        assert!(!frame.name.contains('/'));
+        assert_eq!(frame.links.len(), 2);
+        assert_eq!(frame.links[0].link_text_range, SourceRange::new(4, 25));
+        assert_eq!(frame.links[1].link_text_range, SourceRange::new(30, 51));
+        for link in &frame.links {
+            assert_eq!(link.label, "https://example.com/a");
+            assert_eq!(&*link.destination, "https://example.com/a");
+            assert!(!link.partial);
+            assert!(link.bounds.x0 < link.bounds.x1);
+            assert!(link.bounds.y0 < link.bounds.y1);
+        }
+        assert_ne!(frame.links[0].key, frame.links[1].key);
+        assert!(frame.links[0].bounds.x1 <= frame.links[1].bounds.x0);
+
+        let scale = f64::from(cx.update(|window, _| window.scale_factor()));
+        let row = cx.debug_bounds("row-0-0").expect("row painted");
+        for link in &frame.links {
+            assert!(link.bounds.y0 >= f64::from(f32::from(row.top())) * scale - 1.0);
+            assert!(link.bounds.y1 <= f64::from(f32::from(row.bottom())) * scale + 1.0);
+        }
+        let request = a11y_request_for(&frame, 1);
+        assert_eq!(request.link_text_range, SourceRange::new(30, 51));
+        assert_eq!(request.document, view.read_with(cx, |view, _| view.document_key()));
+    }
+
+    /// Issue #704: reference links to one definition are separate nodes
+    /// labelled by their displayed text.
+    #[gpui::test]
+    fn a11y_frame_distinguishes_reference_links_sharing_a_definition(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "intro\n\n[one][r] and [two][r]\n\n[r]: https://example.com/r\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let frame = a11y_frame_of(&view, cx);
+        let labels = frame
+            .links
+            .iter()
+            .map(|link| link.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["one", "two"]);
+        assert!(
+            frame
+                .links
+                .iter()
+                .all(|link| &*link.destination == "https://example.com/r")
+        );
+        assert_ne!(frame.links[0].key, frame.links[1].key);
+    }
+
+    /// Issue #704: a link wrapped over several rows is one node whose bounds
+    /// cover all of its visible rows.
+    #[gpui::test]
+    fn a11y_frame_merges_a_wrapped_link_into_one_node(cx: &mut gpui::TestAppContext) {
+        let long = "alpha ".repeat(120);
+        let text = format!("intro\n\n[{long}](https://example.com/w)\n");
+        let (view, cx, _) = open_view_for_mouse_tests(cx, &text, false);
+        let frame = a11y_frame_of(&view, cx);
+        assert_eq!(frame.links.len(), 1);
+        assert!(frame.links[0].label.starts_with("alpha alpha"));
+        let line_height = view.read_with(cx, |view, _| view.line_height());
+        let scale = f64::from(cx.update(|window, _| window.scale_factor()));
+        let bounds = frame.links[0].bounds;
+        assert!(
+            bounds.y1 - bounds.y0 > f64::from(line_height) * scale * 1.5,
+            "a wrapped link is one node covering every visible row"
+        );
+    }
+
+    /// Issue #704: only links in the viewport are published, scrolling keeps
+    /// the id key of a link that stays visible, and any content change
+    /// retires every old key and refuses an old request without opening or
+    /// changing anything.
+    #[gpui::test]
+    fn a11y_keys_survive_scroll_and_expire_on_edit(cx: &mut gpui::TestAppContext) {
+        let text = format!(
+            "intro\n\n[first](https://example.com/first)\n\n{}[last](https://example.com/last)\n",
+            "filler paragraph\n\n".repeat(150)
+        );
+        let (view, cx, _) = open_view_for_mouse_tests(cx, &text, false);
+        let before = a11y_frame_of(&view, cx);
+        let labels = before
+            .links
+            .iter()
+            .map(|link| link.label.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["first"], "an off-screen link is not published");
+        let keys = |frame: &a11y_links::A11yDocumentFrame| {
+            frame.links.iter().map(|link| link.key).collect::<Vec<_>>()
+        };
+        let unique = keys(&before).into_iter().collect::<HashSet<_>>();
+        assert_eq!(unique.len(), before.links.len());
+
+        view.update(cx, |view, cx| {
+            view.scroll_y = 4.0;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let scrolled = a11y_frame_of(&view, cx);
+        assert_eq!(keys(&scrolled), keys(&before));
+        assert_eq!(scrolled.content_generation, before.content_generation);
+
+        let old_request = a11y_request_for(&before, 0);
+        let state_before = a11y_editor_state(&view, cx);
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::Insert("x"), cx);
+        });
+        cx.run_until_parked();
+        let state_after_edit = a11y_editor_state(&view, cx);
+        let edited = a11y_frame_of(&view, cx);
+        assert_ne!(edited.content_generation, before.content_generation);
+        assert!(
+            keys(&edited)
+                .iter()
+                .all(|key| !keys(&before).contains(key)),
+            "an edit retires every old key"
+        );
+        let opened = view.update(cx, |view, cx| view.activate_a11y_link(&old_request, cx));
+        assert!(!opened);
+        assert!(cx.opened_url().is_none());
+        assert_eq!(a11y_editor_state(&view, cx), state_after_edit);
+        assert_ne!(state_before, state_after_edit);
+
+        view.update(cx, |view, cx| {
+            view.dispatch(EditorCommand::Undo, cx);
+        });
+        cx.run_until_parked();
+        let undone = a11y_frame_of(&view, cx);
+        assert_ne!(undone.content_generation, edited.content_generation);
+        assert_ne!(undone.content_generation, before.content_generation);
+    }
+
+    /// Issue #704: a click on a published link opens its destination without
+    /// moving the caret or touching the document and its history, and works
+    /// the same in editing and reading mode without any modifier.
+    #[gpui::test]
+    fn a11y_click_opens_the_published_destination_without_editing_state(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        const URL: &str = "https://example.com/a";
+        let text = "see https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(2)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let editing = a11y_frame_of(&view, cx);
+        assert_eq!(editing.links.len(), 1);
+        let request = a11y_request_for(&editing, 0);
+        let state_before = a11y_editor_state(&view, cx);
+
+        // A request for another destination at the same range is refused.
+        let mut forged = request.clone();
+        forged.destination = "https://example.com/other".into();
+        assert!(!view.update(cx, |view, cx| view.activate_a11y_link(&forged, cx)));
+        assert!(cx.opened_url().is_none());
+
+        assert!(view.update(cx, |view, cx| view.activate_a11y_link(&request, cx)));
+        assert_eq!(cx.opened_url().as_deref(), Some(URL));
+        assert_eq!(a11y_editor_state(&view, cx), state_before);
+
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let reading = a11y_frame_of(&view, cx);
+        assert_eq!(reading.links.len(), 1);
+        assert_eq!(reading.links[0].link_text_range, editing.links[0].link_text_range);
+        assert!(view.update(cx, |view, cx| {
+            view.activate_a11y_link(&a11y_request_for(&reading, 0), cx)
+        }));
+        assert_eq!(a11y_editor_state(&view, cx), state_before);
+    }
+
+    /// Issue #704: while accessibility is inactive a frame runs no collector,
+    /// label builder or handler registration.
+    #[gpui::test]
+    fn a11y_work_does_not_run_while_accessibility_is_inactive(cx: &mut gpui::TestAppContext) {
+        let text = "see https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        let reset = || {
+            a11y_links::COLLECTOR_CALLS.with(|calls| calls.set(0));
+            a11y_links::LABEL_CALLS.with(|calls| calls.set(0));
+            a11y_links::HANDLER_REGISTRATIONS.with(|calls| calls.set(0));
+        };
+        let counts = || {
+            (
+                a11y_links::COLLECTOR_CALLS.with(std::cell::Cell::get),
+                a11y_links::LABEL_CALLS.with(std::cell::Cell::get),
+                a11y_links::HANDLER_REGISTRATIONS.with(std::cell::Cell::get),
+            )
+        };
+        assert!(!cx.update(|window, _| window.is_a11y_active()));
+        reset();
+        view.update(cx, |_, cx| cx.notify());
+        cx.run_until_parked();
+        assert_eq!(counts(), (0, 0, 0));
+        assert_eq!(
+            view.read_with(cx, |view, _| view.a11y.content_generation_for_test()),
+            0,
+            "no edit tracking while inactive"
+        );
+
+        // The same builder does run when it is asked for.
+        let frame = a11y_frame_of(&view, cx);
+        assert_eq!(frame.links.len(), 1);
+        let (collector, labels, handlers) = counts();
+        assert!(collector >= 1 && labels >= 1);
+        assert_eq!(handlers, 0);
     }
 
     fn relative_luminance(color: u32) -> f32 {
