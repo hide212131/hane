@@ -54,11 +54,11 @@ fn inactive_table_cell_hides_bold_markers_and_keeps_mapping() {
 fn inactive_table_cell_styles_inline_syntax_in_header_and_body() {
     for header in [true, false] {
         let line = inactive_table_row("| *i* | ~~s~~ | `c` | [l](https://e.com) |", header);
-        assert_eq!(line.visual_text, " i  s  c  [l](https://e.com) ");
+        assert_eq!(line.visual_text, " i  s  c  l ");
         assert_eq!(style_ranges(&line, StyleKind::Italic).len(), 1);
         assert_eq!(style_ranges(&line, StyleKind::Strikethrough).len(), 1);
         assert_eq!(style_ranges(&line, StyleKind::InlineCode).len(), 1);
-        assert!(style_ranges(&line, StyleKind::Link).is_empty());
+        assert_eq!(style_ranges(&line, StyleKind::Link).len(), 1);
         assert_eq!(style_ranges(&line, StyleKind::Table).len(), 1);
     }
 }
