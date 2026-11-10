@@ -1771,7 +1771,7 @@ mod tests {
         );
         assert!(segments
             .iter()
-            .any(|segment| segment_shows_code_background(segment)));
+            .any(segment_shows_code_background));
     }
 
     #[test]
