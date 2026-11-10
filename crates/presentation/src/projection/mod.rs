@@ -3013,6 +3013,18 @@ fn project_table_cell(
     if !in_table_cell {
         return None;
     }
+    // Links stay raw in an inactive table cell: the formal table projection
+    // alone decides link targets and Link colors (bare URLs only), so a cell
+    // holding a Markdown link or autolink is shown as its source.
+    let has_link_node = projection
+        .nodes
+        .intersecting(virtual_range)
+        .iter()
+        .filter_map(|id| parsed.tree.node(**id))
+        .any(|node| node.kind == NodeKind::Link);
+    if has_link_node {
+        return None;
+    }
     let line = present_markdown_from_parse(
         0,
         revision,
@@ -3050,7 +3062,6 @@ fn project_table_cell(
                     | StyleKind::Italic
                     | StyleKind::Strikethrough
                     | StyleKind::InlineCode
-                    | StyleKind::Link
             ) && run.visual_range.end.0 <= line.visual_text.len()
         })
         .collect();
