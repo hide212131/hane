@@ -645,6 +645,26 @@ fn table_reference_label_is_colored_and_keeps_the_formal_destination() {
     assert_eq!(texts[1], bare);
 }
 
+/// A reference label that is not itself a URL still gets exactly one Link
+/// style; the `[docs][r]` syntax display and the LinkTarget stay as they were.
+#[test]
+fn table_reference_label_that_is_not_a_url_gets_one_link_style() {
+    let source = "| h | k |\n| --- | --- |\n| [docs][r] | x |\n\n[r]: https://dest.example/\n";
+    let blocks = present(source);
+    let row = table_body_row(&blocks, source);
+    assert!(row.visual_text.contains("[docs][r]"), "{:?}", row.visual_text);
+    let reference = row
+        .links
+        .iter()
+        .find(|link| &*link.destination == "https://dest.example/")
+        .expect("reference target");
+    assert!(reference.uses_reference);
+    assert_eq!(reference.source_range, range_of(source, "docs"));
+    let texts = link_run_texts(row);
+    assert_eq!(texts.len(), 1, "{:?}", row.style_runs);
+    assert!(texts[0].contains("docs"), "{texts:?}");
+}
+
 #[test]
 fn projection_creators_keep_text_origin_only_for_bare_urls() {
     let source = "| h | k |\n| --- | --- |\n| [https://a.example](https://a.example) [m](https://m.example/) <https://auto.example> | https://bare.example |\n";

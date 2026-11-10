@@ -353,19 +353,20 @@ pub fn present_block_with_table_projection(
                                 destination: link.destination.clone(),
                                 uses_reference: link.uses_reference,
                             },
-                            link.is_bare_url,
+                            link.is_bare_url || link.uses_reference,
                         )
                     })
                 })
                 .collect::<Vec<_>>();
-            // The table presenter has no Markdown Link node for a bare URL, so
-            // give the targets the formal parser owns as bare URLs the link
-            // color here. The origin comes from the projection, never from
-            // comparing the source text with the destination.
-            // Markdown links and reference labels stay raw in the cell and get
-            // no Link color; only bare URLs are colored, and only when no
-            // existing Link run already spans them.
-            for (link, _) in missing.iter().filter(|(_, is_bare_url)| *is_bare_url) {
+            // The table presenter has no Markdown Link node for a bare URL or a
+            // reference link resolved by a definition elsewhere, so give those
+            // targets the link color here. The origin comes from the
+            // projection, never from comparing the source text with the
+            // destination.
+            // The reference syntax (`[docs][r]`) stays raw in the cell; only
+            // the color is supplied, and only when no existing Link run
+            // already spans the target.
+            for (link, _) in missing.iter().filter(|(_, colored)| *colored) {
                 if let (Some(start), Some(end)) = (
                     presented
                         .source_map
