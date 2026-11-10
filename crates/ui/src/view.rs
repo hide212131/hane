@@ -21323,6 +21323,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inactive_table_cell_with_inline_markers_clicks_to_the_source_position_and_edits_there(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "| A | B |\n| --- | --- |\n| **bold** | `c` |\n| short | 別の行 |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        cx.simulate_resize(gpui::size(px(420.0), px(760.0)));
+        cx.run_until_parked();
+
+        let (point, expected) = table_fragment_click(&view, cx, "row-2-2", 2, 0, 0);
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(expected));
+        });
+
+        cx.simulate_input("Z");
+        cx.run_until_parked();
+        let mut want = text.to_string();
+        want.insert(expected.0, 'Z');
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), want);
+        });
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn issue_14_table_example_paints_the_header_and_both_body_rows(cx: &mut gpui::TestAppContext) {
         let text = "| Name | Count | Status |\n|:-----|------:|:------:|\n| Hane | 3 | Ready |\n| Long value | 120 | Working |";
         let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);

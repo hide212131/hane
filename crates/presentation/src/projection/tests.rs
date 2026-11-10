@@ -1,5 +1,88 @@
 use super::*;
 
+fn inactive_table_row(source: &str, header: bool) -> VisualLine {
+    present_table_line(
+        1,
+        Revision(1),
+        SourceRange::new(0, source.len()),
+        source,
+        20.0,
+        header,
+        &[TableAlignment::Default, TableAlignment::Default],
+    )
+}
+
+fn style_ranges(line: &VisualLine, kind: StyleKind) -> Vec<(usize, usize)> {
+    line.style_runs
+        .iter()
+        .filter(|run| run.kind == kind)
+        .map(|run| (run.visual_range.start.0, run.visual_range.end.0))
+        .collect()
+}
+
+#[test]
+fn inactive_table_cell_hides_bold_markers_and_keeps_mapping() {
+    let source = "| **h1** | h2 |";
+    let line = inactive_table_row(source, true);
+    assert_eq!(line.visual_text, " h1  h2 ");
+    let cells = &line.table_row.as_ref().expect("table row").cells;
+    assert_eq!(cells[0].source_range, SourceRange::new(1, 9));
+    assert_eq!(cells[0].visual_range, VisualRange::new(0, 4));
+    assert_eq!(cells[1].source_range, SourceRange::new(10, 14));
+    assert_eq!(cells[1].visual_range, VisualRange::new(4, 8));
+    assert_eq!(style_ranges(&line, StyleKind::Bold), vec![(1, 3)]);
+    assert_eq!(style_ranges(&line, StyleKind::Table), vec![(0, 8)]);
+    assert!(segments_tile_range(
+        SourceRange::new(0, source.len()),
+        &line.source_map.segments
+    ));
+    let hidden = line
+        .source_map
+        .segments
+        .iter()
+        .filter(|segment| {
+            segment.visibility == Visibility::HiddenMarkup && segment.marker_edge.is_some()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(hidden.len(), 2);
+    assert!(hidden.iter().all(|segment| {
+        segment.visual_range.start == segment.visual_range.end
+    }));
+}
+
+#[test]
+fn inactive_table_cell_styles_inline_syntax_in_header_and_body() {
+    for header in [true, false] {
+        let line = inactive_table_row("| *i* | ~~s~~ | `c` | [l](https://e.com) |", header);
+        assert_eq!(line.visual_text, " i  s  c  l ");
+        assert_eq!(style_ranges(&line, StyleKind::Italic).len(), 1);
+        assert_eq!(style_ranges(&line, StyleKind::Strikethrough).len(), 1);
+        assert_eq!(style_ranges(&line, StyleKind::InlineCode).len(), 1);
+        assert_eq!(style_ranges(&line, StyleKind::Link).len(), 1);
+        assert_eq!(style_ranges(&line, StyleKind::Table).len(), 1);
+    }
+}
+
+#[test]
+fn inactive_table_cell_respects_syntax_boundaries() {
+    let escaped = inactive_table_row("| a \\| **b** | c |", false);
+    assert_eq!(
+        escaped.table_row.as_ref().expect("table row").cells.len(),
+        2
+    );
+    let crossing = inactive_table_row("| **a | b** |", false);
+    assert_eq!(crossing.visual_text, " **a  b** ");
+    let unclosed = inactive_table_row("| **a | b |", false);
+    assert_eq!(unclosed.visual_text, " **a  b ");
+    let code = inactive_table_row("| `**x**` | b |", false);
+    assert_eq!(code.visual_text, " **x**  b ");
+    assert_eq!(style_ranges(&code, StyleKind::InlineCode).len(), 1);
+    assert!(style_ranges(&code, StyleKind::Bold).is_empty());
+    let blocks = inactive_table_row("| # title | --- | - item |", false);
+    assert_eq!(blocks.visual_text, " # title  ---  - item ");
+    assert_eq!(blocks.kind, BlockKind::TableRow);
+}
+
 #[test]
 fn initial_block_heights_account_for_heading_scale_and_trailing_blank_lines() {
     let document = RopeBuffer::from_text("# title\n\n## section\n\nbody\n");

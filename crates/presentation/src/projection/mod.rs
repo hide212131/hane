@@ -2970,6 +2970,156 @@ fn unescaped_table_pipes(source: &str, content_end: usize) -> Vec<usize> {
     pipes
 }
 
+/// Inline projection of one inactive table cell, in absolute source
+/// coordinates and visual coordinates relative to the start of the cell text.
+struct TableCellProjection {
+    visual_text: String,
+    segments: Vec<MappingSegment>,
+    style_runs: Vec<StyleRun>,
+}
+
+/// Projects the inline syntax of one table cell with the ordinary presenter.
+///
+/// The cell is wrapped as the first cell of a throwaway two-column table so the
+/// parser reads it as inline content: `# title`, `---` or `- item` stay text.
+/// Only the range of the original cell is projected; the auxiliary bytes never
+/// reach the result. `None` means the projection could not be verified and the
+/// caller must show the raw source.
+fn project_table_cell(
+    revision: Revision,
+    cell_range: SourceRange,
+    cell: &str,
+    line_height: f32,
+) -> Option<TableCellProjection> {
+    const PREFIX: &str = "| ";
+    const SUFFIX: &str = " | x |\n| --- | --- |\n";
+    if cell.trim().is_empty() || cell.contains(['\r', '\n']) {
+        return None;
+    }
+    let mut wrapped = String::with_capacity(PREFIX.len() + cell.len() + SUFFIX.len());
+    wrapped.push_str(PREFIX);
+    wrapped.push_str(cell);
+    wrapped.push_str(SUFFIX);
+    let wrapped_range = SourceRange::new(0, wrapped.len());
+    let parsed = parse_document(revision, wrapped_range, &wrapped);
+    let projection = ProjectionIndex::new(&parsed);
+    let virtual_range = SourceRange::new(PREFIX.len(), PREFIX.len() + cell.len());
+    let in_table_cell = projection
+        .nodes
+        .intersecting(virtual_range)
+        .iter()
+        .filter_map(|id| parsed.tree.node(**id))
+        .any(|node| node.kind == NodeKind::TableCell);
+    if !in_table_cell {
+        return None;
+    }
+    let line = present_markdown_from_parse(
+        0,
+        revision,
+        virtual_range,
+        cell,
+        line_height,
+        None,
+        &SharedParse {
+            parsed: &parsed,
+            projection: &projection,
+            list_projection: None,
+            source: cell,
+            local_bare: LocalBareLinks::Trusted,
+        },
+    );
+    if !matches!(line.kind, BlockKind::Paragraph | BlockKind::TableRow)
+        || !segments_tile_range(virtual_range, &line.source_map.segments)
+        || line.source_map.segments.iter().any(|segment| {
+            !matches!(
+                segment.visibility,
+                Visibility::Visible | Visibility::HiddenMarkup
+            )
+        })
+    {
+        return None;
+    }
+    let style_runs = line
+        .style_runs
+        .iter()
+        .copied()
+        .filter(|run| {
+            matches!(
+                run.kind,
+                StyleKind::Bold
+                    | StyleKind::Italic
+                    | StyleKind::Strikethrough
+                    | StyleKind::InlineCode
+                    | StyleKind::Link
+            ) && run.visual_range.end.0 <= line.visual_text.len()
+        })
+        .collect();
+    let segments = line
+        .source_map
+        .segments
+        .iter()
+        .map(|segment| MappingSegment {
+            source_range: SourceRange::new(
+                segment.source_range.start.0 - virtual_range.start.0 + cell_range.start.0,
+                segment.source_range.end.0 - virtual_range.start.0 + cell_range.start.0,
+            ),
+            ..*segment
+        })
+        .collect();
+    Some(TableCellProjection {
+        visual_text: line.visual_text,
+        segments,
+        style_runs,
+    })
+}
+
+/// Appends one table cell to the row being built, projecting its inline syntax
+/// when that can be verified and falling back to the raw source otherwise.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the row builder threads its accumulators and the cell's source coordinates"
+)]
+fn append_table_cell(
+    visual: &mut String,
+    segments: &mut Vec<MappingSegment>,
+    inline_styles: &mut Vec<StyleRun>,
+    revision: Revision,
+    source: &str,
+    row_range: SourceRange,
+    cell_range: SourceRange,
+    line_height: f32,
+) {
+    let cell = &source[cell_range.start.0 - row_range.start.0..cell_range.end.0 - row_range.start.0];
+    let Some(projected) = project_table_cell(revision, cell_range, cell, line_height) else {
+        append_segment(
+            visual,
+            segments,
+            source,
+            row_range,
+            cell_range,
+            Visibility::Visible,
+            None,
+        );
+        return;
+    };
+    let base = visual.len();
+    visual.push_str(&projected.visual_text);
+    segments.extend(projected.segments.into_iter().map(|segment| MappingSegment {
+        visual_range: VisualRange::new(
+            segment.visual_range.start.0 + base,
+            segment.visual_range.end.0 + base,
+        ),
+        ..segment
+    }));
+    inline_styles.extend(projected.style_runs.into_iter().map(|run| StyleRun {
+        visual_range: VisualRange::new(
+            run.visual_range.start.0 + base,
+            run.visual_range.end.0 + base,
+        ),
+        kind: run.kind,
+    }));
+}
+
 pub(crate) fn present_table_line(
     line_id: u64,
     revision: Revision,
@@ -3021,6 +3171,7 @@ pub(crate) fn present_table_line(
     let mut visual = String::new();
     let mut segments = Vec::new();
     let mut cells = Vec::new();
+    let mut inline_styles = Vec::new();
     let base = range.start.0;
     if leading_indent > 0 {
         segments.push(MappingSegment {
@@ -3035,14 +3186,15 @@ pub(crate) fn present_table_line(
     for index in pipes {
         if cursor < index {
             let visual_start = visual.len();
-            append_segment(
+            append_table_cell(
                 &mut visual,
                 &mut segments,
+                &mut inline_styles,
+                revision,
                 source,
                 range,
                 SourceRange::new(base + cursor, base + index),
-                Visibility::Visible,
-                None,
+                line_height,
             );
             if alignments.is_empty() || column < alignments.len() {
                 cells.push(TableCellDisplay {
@@ -3081,14 +3233,15 @@ pub(crate) fn present_table_line(
     }
     if cursor < content_end {
         let visual_start = visual.len();
-        append_segment(
+        append_table_cell(
             &mut visual,
             &mut segments,
+            &mut inline_styles,
+            revision,
             source,
             range,
             SourceRange::new(base + cursor, base + content_end),
-            Visibility::Visible,
-            None,
+            line_height,
         );
         if alignments.is_empty() || column < alignments.len() {
             cells.push(TableCellDisplay {
@@ -3133,15 +3286,17 @@ pub(crate) fn present_table_line(
         });
     }
     let visual_len = visual.len();
+    let mut style_runs = vec![StyleRun {
+        visual_range: VisualRange::new(0, visual_len),
+        kind: StyleKind::Table,
+    }];
+    style_runs.extend(inline_styles);
     VisualLine {
         line_id,
         source_range: range,
         revision,
         visual_text: visual,
-        style_runs: vec![StyleRun {
-            visual_range: VisualRange::new(0, visual_len),
-            kind: StyleKind::Table,
-        }],
+        style_runs,
         links: Vec::new(),
         kind: BlockKind::TableRow,
         source_map: SourceMap { segments },
