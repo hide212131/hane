@@ -362,10 +362,10 @@ pub fn present_block_with_table_projection(
             // give the targets the formal parser owns as bare URLs the link
             // color here. The origin comes from the projection, never from
             // comparing the source text with the destination.
-            // Inline links already carry a Link run from the cell projection;
-            // bare URLs and reference labels do not, so cover every target
-            // that no existing Link run spans.
-            for (link, _is_bare_url) in &missing {
+            // Markdown links and reference labels stay raw in the cell and get
+            // no Link color; only bare URLs are colored, and only when no
+            // existing Link run already spans them.
+            for (link, _) in missing.iter().filter(|(_, is_bare_url)| *is_bare_url) {
                 if let (Some(start), Some(end)) = (
                     presented
                         .source_map
