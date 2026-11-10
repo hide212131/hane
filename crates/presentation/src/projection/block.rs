@@ -353,19 +353,20 @@ pub fn present_block_with_table_projection(
                                 destination: link.destination.clone(),
                                 uses_reference: link.uses_reference,
                             },
-                            link.is_bare_url,
+                            link.is_bare_url || link.uses_reference,
                         )
                     })
                 })
                 .collect::<Vec<_>>();
-            // The table presenter has no Markdown Link node for a bare URL, so
-            // give the targets the formal parser owns as bare URLs the link
-            // color here. The origin comes from the projection, never from
-            // comparing the source text with the destination.
-            for (link, is_bare_url) in &missing {
-                if !*is_bare_url {
-                    continue;
-                }
+            // The table presenter has no Markdown Link node for a bare URL or a
+            // reference link resolved by a definition elsewhere, so give those
+            // targets the link color here. The origin comes from the
+            // projection, never from comparing the source text with the
+            // destination.
+            // The reference syntax (`[docs][r]`) stays raw in the cell; only
+            // the color is supplied, and only when no existing Link run
+            // already spans the target.
+            for (link, _) in missing.iter().filter(|(_, colored)| *colored) {
                 if let (Some(start), Some(end)) = (
                     presented
                         .source_map
@@ -374,6 +375,11 @@ pub fn present_block_with_table_projection(
                         .source_map
                         .source_to_visual(link.source_range.end, Bias::Before),
                 ) && start.visual_offset.0 < end.visual_offset.0
+                    && !presented.style_runs.iter().any(|run| {
+                        run.kind == StyleKind::Link
+                            && run.visual_range.start.0 <= start.visual_offset.0
+                            && end.visual_offset.0 <= run.visual_range.end.0
+                    })
                 {
                     presented.style_runs.push(StyleRun {
                         visual_range: VisualRange::new(

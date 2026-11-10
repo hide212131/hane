@@ -1195,13 +1195,11 @@ fn table_row_element(
                 let fragment_matches = clip_visual_ranges(&cell_matches, fragment_range.clone());
                 let fragment_current_match =
                     clip_visual_range(cell_current_match.as_ref(), fragment_range.clone());
-                // Only a stretch the formal projection marked as a link needs the
-                // per-segment path; everything else keeps the single-text fast path.
-                let fragment_has_link = line.style_runs.iter().any(|run| {
-                    run.kind.display().link_color
-                        && run.visual_range.start.0 < fragment_range.end
-                        && fragment_range.start < run.visual_range.end.0
-                });
+                // Only a stretch the formal projection marked as a link, a
+                // strikethrough or a code span needs the per-segment path;
+                // everything else keeps the single-text fast path.
+                let fragment_has_link =
+                    table_fragment_needs_segments(&line.style_runs, &fragment_range);
                 let fragment_hover = clip_visual_ranges(&hover_visuals, fragment_range.clone());
                 let fragment_links = clip_visual_ranges(&all_link_visuals, fragment_range.clone());
                 if fragment_selected.is_none()
@@ -1294,6 +1292,9 @@ fn table_row_element(
                             })
                             .when(segment.display.monospace, |element| {
                                 element.font_family("ui-monospace")
+                            })
+                            .when(segment_shows_code_background(&segment), |element| {
+                                element.text_bg(rgb(theme.code_background))
                             })
                             .when(segment.display.link_color, |element| {
                                 let selector = format!(
@@ -1458,6 +1459,20 @@ fn link_visuals(line: &VisualLine, only: Option<SourceRange>) -> Vec<Range<usize
             (start < end).then_some(start..end)
         })
         .collect()
+}
+
+/// Whether a table-cell fragment has a style run whose decoration only the
+/// per-segment path paints (link colour, strikethrough, code background).
+fn table_fragment_needs_segments(
+    style_runs: &[hane_presentation::StyleRun],
+    fragment_range: &Range<usize>,
+) -> bool {
+    style_runs.iter().any(|run| {
+        let display = run.kind.display();
+        (display.link_color || display.strikethrough || display.code_background)
+            && run.visual_range.start.0 < fragment_range.end
+            && fragment_range.start < run.visual_range.end.0
+    })
 }
 
 /// Whether a segment's div should carry the code span's `text_bg`.
@@ -1704,6 +1719,68 @@ mod tests {
         // Narrow, constrained table and a single column share the same rule.
         assert_eq!(table_grid_bounds(&cells[1..]), Some((160.0, 60.0)));
         assert_eq!(table_grid_bounds(&[]), None);
+    }
+
+    fn style_run(range: Range<usize>, kind: hane_presentation::StyleKind) -> hane_presentation::StyleRun {
+        hane_presentation::StyleRun {
+            visual_range: hane_presentation::VisualRange::new(range.start, range.end),
+            kind,
+        }
+    }
+
+    #[test]
+    fn table_fragment_with_strikethrough_takes_the_segment_path() {
+        let runs = [style_run(2..6, hane_presentation::StyleKind::Strikethrough)];
+        assert!(table_fragment_needs_segments(&runs, &(0..8)));
+        let segments = line_segments_with_hover(
+            0..8,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &runs,
+            None,
+            &[],
+            &[],
+        );
+        assert!(segments
+            .iter()
+            .any(|segment| segment.display.strikethrough && segment.visual_range == (2..6)));
+    }
+
+    #[test]
+    fn table_fragment_with_inline_code_takes_the_segment_path() {
+        let runs = [style_run(2..6, hane_presentation::StyleKind::InlineCode)];
+        assert!(table_fragment_needs_segments(&runs, &(0..8)));
+        let segments = line_segments_with_hover(
+            0..8,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &runs,
+            None,
+            &[],
+            &[],
+        );
+        assert!(segments
+            .iter()
+            .any(segment_shows_code_background));
+    }
+
+    #[test]
+    fn table_fragment_without_decoration_keeps_the_fast_path() {
+        let runs = [
+            style_run(0..2, hane_presentation::StyleKind::Bold),
+            style_run(8..10, hane_presentation::StyleKind::Strikethrough),
+        ];
+        assert!(!table_fragment_needs_segments(&runs, &(2..8)));
     }
 
     // A single-Range fixture built via `collect`, not a `Vec`-like sequence

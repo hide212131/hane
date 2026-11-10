@@ -482,15 +482,15 @@ fn table_row_keeps_one_target_each_for_markdown_and_bare_links() {
     for url in ["https://t.example/c", "https://u.example/d"] {
         assert_colored_and_targeted(row, source, url);
     }
-    // Existing behavior (same on main): an inactive table row keeps the raw
-    // `[m](https://m.example/)` visual and source, and the Markdown link gets a
-    // target only, with no individual Link color. Issue #673 adds the bare-URL
-    // color/target only; it must not decorate the Markdown link, re-target its
-    // raw destination as a bare URL, or widen the target beyond the label.
+    // Issue #712 (product owner decision, 2026-11-11): an inactive table cell
+    // decorates a Markdown link like a paragraph does. The markers and the
+    // destination are hidden, only the label is shown, and it gets a Link
+    // style. The targets stay as they were: it must not re-target the
+    // destination as a bare URL or widen the target beyond the label.
     let markdown = "[m](https://m.example/)";
     assert!(
-        row.visual_text.contains(markdown),
-        "raw Markdown link stays visible: {:?}",
+        !row.visual_text.contains(markdown) && !row.visual_text.contains("m.example"),
+        "Markdown markers and destination are hidden: {:?}",
         row.visual_text
     );
     let label = range_of(source, "[m]");
@@ -515,17 +515,19 @@ fn table_row_keeps_one_target_each_for_markdown_and_bare_links() {
                 || link.source_range.start >= raw_destination.end),
         "no other target overlaps the raw Markdown destination"
     );
-    // No Link color is added over the Markdown link; only the two bare URLs
-    // (checked above) are colored.
-    let visual = row.visual_text.find(markdown).expect("markdown link visible");
-    assert!(
-        link_runs(row)
-            .iter()
-            .all(|run| run.1 <= visual || run.0 >= visual + markdown.len()),
-        "Markdown link is not given a Link color: {:?}",
-        row.style_runs
+    // The label gets a Link style, in addition to the two bare URLs (checked
+    // above).
+    assert_eq!(
+        link_run_texts(row),
+        ["m", "https://t.example/c", "https://u.example/d"]
     );
-    assert_eq!(link_runs(row).len(), 2, "only the two bare URLs are colored");
+}
+
+fn link_run_texts(line: &VisualLine) -> Vec<&str> {
+    link_runs(line)
+        .into_iter()
+        .map(|(start, end)| &line.visual_text[start..end])
+        .collect()
 }
 
 /// Selects the single-body-row fixture's body row by its source range (the
@@ -563,17 +565,24 @@ fn table_body_row<'a>(blocks: &'a [VisualBlock], source: &str) -> &'a VisualLine
     row
 }
 
-/// Issue #673: a table cell's Link color follows the formal parser's origin
-/// (a real `Text` owner), never a source-equals-destination string guess.
+/// Issue #673 / #712: a bare URL's Link color follows the formal parser's
+/// origin (a real `Text` owner), never a source-equals-destination string
+/// guess; Markdown link labels are decorated like a paragraph.
 #[test]
 fn table_link_color_follows_formal_origin_not_label_text() {
     let source = "| h | k |\n| --- | --- |\n| [https://a.example](https://a.example) [m](https://m.example/) | https://bare.example |\n";
     let blocks = present(source);
     let row = table_body_row(&blocks, source);
-    // Markdown links: raw text and targets kept, no Link color.
+    // Markdown links: labels shown with a Link color, markers and destinations
+    // hidden; the bare URL is colored as before.
     let bare = "https://bare.example";
-    let visual = row.visual_text.rfind(bare).expect("bare url visible");
-    assert_eq!(link_runs(row), [(visual, visual + bare.len())]);
+    assert_eq!(
+        link_run_texts(row),
+        ["https://a.example", "m", bare],
+        "{:?}",
+        row.visual_text
+    );
+    assert!(!row.visual_text.contains("]("));
     let destinations = row
         .links
         .iter()
@@ -600,20 +609,21 @@ fn table_link_color_follows_formal_origin_not_label_text() {
 }
 
 #[test]
-fn table_same_url_in_markdown_label_and_bare_cell_colors_only_the_bare() {
+fn table_same_url_in_markdown_label_and_bare_cell_colors_both_by_origin() {
     let url = "https://same.example";
     let source =
         format!("| h | k |\n| --- | --- |\n| [{url}]({url}) | {url} |\n");
     let blocks = present(&source);
     let row = table_body_row(&blocks, &source);
-    let visual = row.visual_text.rfind(url).expect("bare url visible");
-    assert_eq!(link_runs(row), [(visual, visual + url.len())]);
+    // The label (destination hidden) and the bare cell each get one Link run.
+    assert_eq!(link_run_texts(row), [url, url], "{:?}", row.visual_text);
+    assert_eq!(row.visual_text.matches(url).count(), 2);
     assert_eq!(row.links.len(), 2);
     assert_eq!(row.links[1].source_range.start.0, source.rfind(url).unwrap());
 }
 
 #[test]
-fn table_reference_label_is_not_colored_and_keeps_the_formal_destination() {
+fn table_reference_label_is_colored_and_keeps_the_formal_destination() {
     let source = format!(
         "| h | k |\n| --- | --- |\n| [{LABEL}][r] | https://bare.example |\n\n[r]: {DEST}\n"
     );
@@ -627,8 +637,32 @@ fn table_reference_label_is_not_colored_and_keeps_the_formal_destination() {
     assert!(reference.uses_reference);
     assert_eq!(reference.source_range, range_of(&source, LABEL));
     let bare = "https://bare.example";
-    let visual = row.visual_text.rfind(bare).expect("bare url visible");
-    assert_eq!(link_runs(row), [(visual, visual + bare.len())]);
+    // The reference label gets a Link style (its syntax display is unchanged);
+    // the bare URL is colored as before.
+    let texts = link_run_texts(row);
+    assert_eq!(texts.len(), 2, "{:?}", row.style_runs);
+    assert!(texts[0].contains(LABEL), "{texts:?}");
+    assert_eq!(texts[1], bare);
+}
+
+/// A reference label that is not itself a URL still gets exactly one Link
+/// style; the `[docs][r]` syntax display and the LinkTarget stay as they were.
+#[test]
+fn table_reference_label_that_is_not_a_url_gets_one_link_style() {
+    let source = "| h | k |\n| --- | --- |\n| [docs][r] | x |\n\n[r]: https://dest.example/\n";
+    let blocks = present(source);
+    let row = table_body_row(&blocks, source);
+    assert!(row.visual_text.contains("[docs][r]"), "{:?}", row.visual_text);
+    let reference = row
+        .links
+        .iter()
+        .find(|link| &*link.destination == "https://dest.example/")
+        .expect("reference target");
+    assert!(reference.uses_reference);
+    assert_eq!(reference.source_range, range_of(source, "docs"));
+    let texts = link_run_texts(row);
+    assert_eq!(texts.len(), 1, "{:?}", row.style_runs);
+    assert!(texts[0].contains("docs"), "{texts:?}");
 }
 
 #[test]

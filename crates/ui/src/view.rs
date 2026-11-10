@@ -21323,6 +21323,36 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inactive_table_cell_with_inline_markers_clicks_to_the_source_position_and_edits_there(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "| A | B |\n| --- | --- |\n| **bold** | `c` |\n| short | 別の行 |";
+        let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
+        cx.simulate_resize(gpui::size(px(420.0), px(760.0)));
+        cx.run_until_parked();
+
+        let (point, expected) = table_fragment_click(&view, cx, "row-2-2", 2, 0, 0);
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), Selection::caret(expected));
+        });
+
+        cx.simulate_input("Z");
+        cx.run_until_parked();
+        let mut want = text.to_string();
+        want.insert(expected.0, 'Z');
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), want);
+        });
+
+        if let Some(root) = root {
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[gpui::test]
     fn issue_14_table_example_paints_the_header_and_both_body_rows(cx: &mut gpui::TestAppContext) {
         let text = "| Name | Count | Status |\n|:-----|------:|:------:|\n| Hane | 3 | Ready |\n| Long value | 120 | Working |";
         let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
@@ -21387,11 +21417,15 @@ mod tests {
         drop(view);
     }
 
-    /// Issue #673: the table renderer must paint a bare URL cell through the
-    /// link-styled element, without extending it to the adjacent Markdown label
-    /// cell. The selector exists only on elements that receive `link_foreground`.
+    /// Issue #712 (owner decision on 2026-11-11) replaced the Issue #673
+    /// boundary: Markdown links in table cells are decorated like paragraph
+    /// links, so both the Markdown label cell and the bare URL cell are
+    /// painted through the link-styled element. The selector exists only on
+    /// elements that receive `link_foreground`; header cells stay unstyled.
     #[gpui::test]
-    fn table_bare_url_cell_is_painted_with_link_style_only(cx: &mut gpui::TestAppContext) {
+    fn table_markdown_and_bare_url_cells_are_painted_with_link_style(
+        cx: &mut gpui::TestAppContext,
+    ) {
         let text = "| 既存 | 裸URL |\n| --- | --- |\n| [Markdown](https://example.com/?hane=673-table-existing) | https://example.com/?hane=673-table-bare |";
         let (view, cx, root) = open_view_for_mouse_tests(cx, text, false);
         cx.run_until_parked();
@@ -21434,10 +21468,10 @@ mod tests {
             .debug_bounds("table-cell-link-2-1-0")
             .expect("the bare URL cell must be painted with the link style");
         assert!(link.size.width > px(0.0));
-        assert!(
-            cx.debug_bounds("table-cell-link-2-0-0").is_none(),
-            "the Markdown label cell must not gain the link style"
-        );
+        let markdown_link = cx
+            .debug_bounds("table-cell-link-2-0-0")
+            .expect("the Markdown label cell must be painted with the link style");
+        assert!(markdown_link.size.width > px(0.0));
         assert!(
             cx.debug_bounds("table-cell-link-0-1-0").is_none(),
             "the header cell must not gain the link style"
