@@ -2261,3 +2261,207 @@ fn present_block_keeps_an_unterminated_fences_closing_lookalike_line_literal() {
         "an unterminated fence's closing-lookalike last line is not markup"
     );
 }
+
+/// Presents the first list / quote block of `source` the way the editor does:
+/// every line of the block's span, with the trailing blank run reported by
+/// [`trailing_blank_lines`]. Returns the visual block and the first trailing
+/// blank line number.
+fn present_container_block(
+    source: &str,
+    formal: bool,
+    cached: bool,
+    tail_only: bool,
+) -> (VisualBlock, usize) {
+    let document = RopeBuffer::from_text(source);
+    let index = BlockIndex::build(Revision(1), source);
+    let block = index
+        .blocks()
+        .find(|block| matches!(block.kind, NodeKind::List { .. } | NodeKind::Quote))
+        .expect("list or quote block");
+    let span = block_line_span(&document, &block).expect("block line span");
+    let trailing = trailing_blank_lines(&document, &span);
+    let content_end = span.end - trailing;
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    for text in source.split_inclusive('\n') {
+        ranges.push(SourceRange::new(offset, offset + text.len()));
+        offset += text.len();
+    }
+    if source.ends_with('\n') || source.is_empty() {
+        ranges.push(SourceRange::new(offset, offset));
+    }
+    let render = if tail_only {
+        content_end..span.end
+    } else {
+        span.clone()
+    };
+    let joined = cached
+        .then(|| parse_joined_span(&document, span.start..content_end, block.source_range, Revision(1)))
+        .flatten();
+    let line_span = if cached { render.clone() } else { span.clone() };
+    let lines = line_span
+        .map(|line| BlockLine {
+            line,
+            range: ranges[line],
+            text: &source[ranges[line].start.0..ranges[line].end.0],
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    let list_projection = if formal {
+        index.list_projection(&block)
+    } else {
+        None
+    };
+    let visual = present_block_with_table_projection(
+        &block,
+        Revision(1),
+        &BlockWindow {
+            span: span.clone(),
+            trailing_blank_lines: trailing,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
+            render,
+            joined: joined.as_ref(),
+            block_disclosure: None,
+        },
+        26.0,
+        list_projection,
+        None,
+    );
+    (visual, content_end)
+}
+
+fn assert_trailing_blank_lines_are_plain(source: &str) {
+    let shaper = testing::FixedAdvanceShaper::default();
+    for formal in [false, true] {
+        for cached in [false, true] {
+            for tail_only in [false, true] {
+                let (visual, content_end) =
+                    present_container_block(source, formal, cached, tail_only);
+                let layout = layout_block(&visual, 400.0, &shaper);
+                let mut checked = 0;
+                for line in visual
+                    .lines
+                    .iter()
+                    .filter(|line| line.line_id as usize >= content_end)
+                {
+                    let variant = format!(
+                        "{source:?} formal={formal} cached={cached} tail_only={tail_only}"
+                    );
+                    assert!(line.list.is_none(), "list owner on blank line: {variant}");
+                    assert!(line.quote.is_none(), "quote owner on blank line: {variant}");
+                    let point = layout
+                        .point_for_source(&visual, line.source_range.start, &shaper)
+                        .expect("caret point");
+                    assert_eq!(point.x, 0.0, "caret indented on blank line: {variant}");
+                    checked += 1;
+                }
+                assert!(checked > 0, "no trailing blank line presented: {source:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn trailing_blank_line_after_a_list_is_a_plain_paragraph_at_every_offset() {
+    let source = "# 2026-11-10_test\n\n- abc\n\n";
+    assert_eq!(source.len(), 26);
+    assert_trailing_blank_lines_are_plain(source);
+
+    let (visual, _) = present_container_block(source, true, true, false);
+    let starts = visual
+        .lines
+        .iter()
+        .map(|line| line.source_range.start.0)
+        .collect::<Vec<_>>();
+    assert!(starts.contains(&25) && starts.contains(&26));
+    let shaper = testing::FixedAdvanceShaper::default();
+    let layout = layout_block(&visual, 400.0, &shaper);
+    for offset in [25, 26] {
+        let point = layout
+            .point_for_source(&visual, SourceOffset(offset), &shaper)
+            .expect("caret point");
+        assert_eq!(point.x, 0.0, "offset {offset}");
+        let hit = layout
+            .row_for_source(SourceOffset(offset))
+            .map(|row| layout.lines[row].line);
+        let line = &visual.lines[hit.expect("row for offset")];
+        assert!(line.list.is_none() && line.quote.is_none(), "offset {offset}");
+    }
+
+    // Reverse direction: points on the blank rows resolve back to the same
+    // offsets, including a point where the old list marker column would sit.
+    for offset in [25, 26] {
+        let row = layout
+            .row_for_source(SourceOffset(offset))
+            .expect("row for offset");
+        for x in [0.0, 16.0] {
+            assert_eq!(
+                layout.source_at_x(&visual, row, x, &shaper),
+                Some(SourceOffset(offset)),
+                "x={x} on the row of offset {offset}"
+            );
+        }
+        let point = layout
+            .point_for_source(&visual, SourceOffset(offset), &shaper)
+            .expect("caret point");
+        assert_eq!(
+            layout.source_for_point(&visual, 0.0, point.y + point.height / 2.0, &shaper),
+            Some(SourceOffset(offset)),
+            "source_for_point at x=0 for offset {offset}"
+        );
+        let line = &visual.lines[layout.lines[row].line];
+        assert!(line.list.is_none(), "offset {offset} resolved into a list");
+    }
+}
+
+#[test]
+fn trailing_blank_lines_after_list_variants_and_quotes_are_plain() {
+    for source in [
+        "- abc\n\n",
+        "1. abc\n\n",
+        "- [ ] task\n\n",
+        "- a\n  - b\n\n",
+        "- abc\n\n\n\n",
+        "- abc\r\n\r\n",
+        "- abc\n\nafter\n",
+        "> quote\n\n",
+        "> quote\n\n\n",
+    ] {
+        assert_trailing_blank_lines_are_plain(source);
+    }
+}
+
+#[test]
+fn list_continuation_and_inner_blank_lines_keep_their_owner() {
+    for source in ["- abc\nlazy\n\n", "- abc\n  more\n\n", "- a\n\n  b\n\n"] {
+        for formal in [false, true] {
+            for cached in [false, true] {
+                let (visual, content_end) = present_container_block(source, formal, cached, false);
+                let owned = visual
+                    .lines
+                    .iter()
+                    .filter(|line| (line.line_id as usize) < content_end)
+                    .skip(1)
+                    .collect::<Vec<_>>();
+                assert!(!owned.is_empty(), "{source:?}");
+                assert!(
+                    owned.iter().all(|line| line.list.is_some()),
+                    "{source:?} formal={formal} cached={cached}: body rows keep list ownership"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn quote_inner_blank_marker_line_keeps_its_quote_owner() {
+    let (visual, content_end) = present_container_block("> a\n>\n> b\n\n", true, true, false);
+    assert_eq!(content_end, 3);
+    for line in visual.lines.iter().filter(|line| (line.line_id as usize) < 3) {
+        assert!(line.quote.is_some(), "line {}", line.line_id);
+    }
+}
