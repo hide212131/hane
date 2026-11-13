@@ -3941,7 +3941,7 @@ fn finish_login_reconciliation(
                     connection: settings.active_connection,
                     settings_generation: settings.settings_generation,
                     runtime_generation: runtime.snapshot().generation,
-                    network_revision: state.network.revision,
+                    network_revision: state.network.latest.load(Ordering::Acquire),
                 };
                 state.prep.record_login_reconciliation(context, true);
                 state.prep.request(PreparationTrigger::LoginCompleted);
