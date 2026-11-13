@@ -4380,11 +4380,13 @@ mod tests {
     ) {
         let (view, cx) =
             cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
-        let mut snapshot = AiSnapshot::default();
-        snapshot.busy = Some((OperationId(8), ServiceBusyReason::Probe));
-        snapshot.preparation = PreparationStatus::Running(PreparationStage::Probing);
-        snapshot.last_result = Some((OperationId(7), SafeOperationResult::Succeeded));
-        snapshot.persistence = PersistenceState::Saved;
+        let snapshot = AiSnapshot {
+            busy: Some((OperationId(8), ServiceBusyReason::Probe)),
+            preparation: PreparationStatus::Running(PreparationStage::Probing),
+            last_result: Some((OperationId(7), SafeOperationResult::Succeeded)),
+            persistence: PersistenceState::Saved,
+            ..Default::default()
+        };
 
         view.update(cx, |view, cx| {
             view.ai_settings.save_then_leave = Some((OperationId(7), LeaveTarget::Close));
