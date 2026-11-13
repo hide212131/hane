@@ -2701,7 +2701,7 @@ mod tests {
     }
 
     fn pin_selector(row_index: usize) -> &'static str {
-        row_selector("sidebar-pin-toggle-row:work-folder-pin-toggle", row_index)
+        row_selector("sidebar-pin-toggle-slot:work-folder-pin-toggle", row_index)
     }
 
     fn today_file_name(suffix: &str) -> String {
