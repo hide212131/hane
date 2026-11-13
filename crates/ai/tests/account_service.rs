@@ -4,9 +4,10 @@ use std::time::{Duration, Instant};
 
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiService, AiServiceConfig,
-    AiSettingsLock, BrowserOpenError, BrowserOpener, CredentialStore, CustomConnectionSettings,
-    FakeCredentialStore, LoginState, ModelListState, OperationId, OwnerLock, OwnershipState,
-    PersistenceState, ProbeErrorCode, ProbeStatus, SafeOperationResult, ServiceBusyReason,
+    AiSettingsLock, AiSnapshot, BrowserOpenError, BrowserOpener, CredentialStore,
+    CustomConnectionSettings, FakeCredentialStore, LoginState, ModelListState, OperationId,
+    OwnerLock, OwnershipState, PersistenceState, PreparationFailure, PreparationStatus,
+    ProbeErrorCode, ProbeStatus, SafeOperationResult, ServiceBusyReason,
     ShellEnvironmentPolicyFormat,
 };
 
@@ -873,6 +874,151 @@ fn failed_runtime_start_marks_ownership_unknown_and_allows_reopen() {
         handle.snapshot().runtime_state,
         hane_ai::RuntimeState::Ready
     );
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+fn wait_for_preparation(
+    service: &AiService,
+    done: impl Fn(&AiSnapshot) -> bool,
+) -> AiSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = service.handle().snapshot();
+        if snapshot.busy.is_none() && done(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "preparation did not reach the expected state: {snapshot:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// How many times the fake App Server received `method`, from its RPC record.
+fn rpc_count(root: &std::path::Path, method: &str) -> usize {
+    let record =
+        std::fs::read_to_string(root.join("ai/codex-chatgpt/.hane-fake-app-server-rpc-record"))
+            .unwrap_or_default();
+    let needle = format!("RPC:{method}");
+    record.lines().filter(|line| *line == needle).count()
+}
+
+#[test]
+fn one_login_reaches_probe_success_without_more_commands() {
+    let data_root = unique_data_root();
+    configure_fake_scenario(&data_root, "probe_success");
+    let service = spawn_service(data_root.clone(), Arc::new(RecordingBrowser::default()));
+    let handle = service.handle();
+
+    handle.try_submit(AiCommand::PrepareConnection).unwrap();
+    let opened = wait_for_preparation(&service, |snapshot| {
+        snapshot.preparation == PreparationStatus::Stopped(PreparationFailure::NeedsLogin)
+    });
+    assert_eq!(opened.account, AccountState::SignedOut);
+    assert_eq!(rpc_count(&data_root, "account/read"), 1);
+    assert_eq!(rpc_count(&data_root, "turn/start"), 0, "no probe without login");
+
+    // The only user command from here on is the login itself.
+    handle.try_submit(AiCommand::StartLogin).unwrap();
+    let ready = wait_for_preparation(&service, |snapshot| {
+        snapshot.preparation == PreparationStatus::Ready
+    });
+
+    assert_eq!(ready.probe_status, ProbeStatus::Succeeded);
+    assert_eq!(ready.probe_result.as_ref().unwrap().model, "gpt-fake-text");
+    assert_eq!(
+        ready.settings.chatgpt.model_id.as_deref(),
+        Some("gpt-fake-text"),
+        "the default model is saved without a save button"
+    );
+    assert_eq!(ready.persistence, PersistenceState::Saved);
+    assert!(matches!(ready.model_list, ModelListState::Loaded(_)));
+    // open (1) + login start (1) + login reconciliation (1) + the re-check
+    // after the model save changed the settings generation (1). A login
+    // continuation that re-read the account or the catalog would add more.
+    assert_eq!(rpc_count(&data_root, "account/read"), 4);
+    assert_eq!(rpc_count(&data_root, "model/list"), 2);
+    assert_eq!(rpc_count(&data_root, "turn/start"), 1);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[test]
+fn saved_login_is_detected_when_settings_open() {
+    let data_root = unique_data_root();
+    configure_fake_scenario(&data_root, "probe_success");
+    std::fs::write(
+        data_root.join("ai/codex-chatgpt/.hane-fake-app-server-signed-in"),
+        b"signed-in",
+    )
+    .unwrap();
+    let service = spawn_service(data_root.clone(), Arc::new(RecordingBrowser::default()));
+
+    service
+        .handle()
+        .try_submit(AiCommand::PrepareConnection)
+        .unwrap();
+    let ready = wait_for_preparation(&service, |snapshot| {
+        snapshot.preparation == PreparationStatus::Ready
+    });
+
+    assert!(matches!(ready.account, AccountState::SignedIn { .. }));
+    assert_eq!(ready.probe_status, ProbeStatus::Succeeded);
+    assert_eq!(
+        ready.settings.chatgpt.model_id.as_deref(),
+        Some("gpt-fake-text")
+    );
+    assert_eq!(rpc_count(&data_root, "turn/start"), 1);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[test]
+fn closing_and_reopening_does_not_duplicate_preparation() {
+    let data_root = unique_data_root();
+    configure_fake_scenario(&data_root, "probe_success");
+    std::fs::write(
+        data_root.join("ai/codex-chatgpt/.hane-fake-app-server-signed-in"),
+        b"signed-in",
+    )
+    .unwrap();
+    let service = spawn_service(data_root.clone(), Arc::new(RecordingBrowser::default()));
+    let handle = service.handle();
+
+    handle.try_submit(AiCommand::PrepareConnection).unwrap();
+    // A second open while the first preparation holds the service joins it:
+    // it is refused as busy and queues nothing.
+    assert_eq!(
+        handle.try_submit(AiCommand::PrepareConnection),
+        Err(AdmissionError::Busy)
+    );
+    wait_for_preparation(&service, |snapshot| {
+        snapshot.preparation == PreparationStatus::Ready
+    });
+    let reads = rpc_count(&data_root, "account/read");
+    let catalogs = rpc_count(&data_root, "model/list");
+    assert_eq!(rpc_count(&data_root, "turn/start"), 1);
+
+    // Closing the screen drops its subscription; the service state stays.
+    drop(handle.subscribe());
+    handle.try_submit(AiCommand::PrepareConnection).unwrap();
+    let reopened = wait_for_preparation(&service, |snapshot| {
+        snapshot.preparation == PreparationStatus::Ready
+    });
+
+    assert_eq!(reopened.probe_status, ProbeStatus::Succeeded);
+    assert_eq!(
+        rpc_count(&data_root, "turn/start"),
+        1,
+        "a fresh successful probe is reused, not sent again"
+    );
+    assert_eq!(rpc_count(&data_root, "account/read"), reads + 1);
+    assert_eq!(rpc_count(&data_root, "model/list"), catalogs + 1);
 
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);

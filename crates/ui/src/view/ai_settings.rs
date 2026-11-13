@@ -13,9 +13,9 @@ use gpui_component::{Icon, Sizable};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiCommand, AiServiceHandle, AiSettings,
     AiSnapshot, ChatGptConnectionSettings, CustomConnectionSettings, LoginState, ModelListState,
-    OperationId, OwnershipState, PersistenceState, ProbeDiagnostic, ProbeErrorCode, ProbeStatus,
-    RuntimeDistributionErrorCode, RuntimeInstallErrorCode, RuntimeInstallState,
-    SafeOperationResult, ServiceBusyReason,
+    OperationId, OwnershipState, PersistenceState, PreparationFailure, PreparationStage,
+    PreparationStatus, ProbeDiagnostic, ProbeErrorCode, ProbeStatus, RuntimeDistributionErrorCode,
+    RuntimeInstallErrorCode, RuntimeInstallState, SafeOperationResult, ServiceBusyReason,
 };
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
@@ -256,6 +256,10 @@ pub(super) struct AiSettingsPage {
     service: Option<AiServiceHandle>,
     snapshot: AiSnapshot,
     inputs: Option<AiInputs>,
+    /// The saved ChatGPT model the model input was last synchronized with. An
+    /// automatic model save changes the saved value while the screen is open;
+    /// only an input the user has not edited follows it.
+    synced_chatgpt_model: Option<String>,
     active_connection: ActiveConnection,
     custom_preset: CustomProviderPreset,
     custom_details_open: bool,
@@ -280,6 +284,7 @@ impl Default for AiSettingsPage {
             service: None,
             snapshot: AiSnapshot::default(),
             inputs: None,
+            synced_chatgpt_model: None,
             active_connection: ActiveConnection::ChatGpt,
             custom_preset: CustomProviderPreset::Other,
             custom_details_open: false,
@@ -403,11 +408,14 @@ impl AiSettingsPage {
         let Some(service) = &self.service else {
             return;
         };
-        match service.try_submit(AiCommand::OpenSettings) {
+        // Opening the screen is a permitted trigger of the automatic
+        // connection preparation; rendering and snapshot updates never send it.
+        match service.try_submit(AiCommand::PrepareConnection) {
             Ok(_) => {}
             Err(AdmissionError::Busy) => {
-                // Existing app-owned work continues; the subscription will
-                // supply its eventual snapshot without restarting it.
+                // Existing app-owned work, including a preparation already
+                // running, continues; the subscription will supply its
+                // eventual snapshot without restarting it.
             }
             Err(error) => self.message = Some(admission_message(error)),
         }
@@ -654,17 +662,56 @@ impl AiSettingsPage {
                     )))
     }
 
+    /// Whether the inputs may be created while the service is busy. The
+    /// automatic preparation (and its model save) must not hide the form:
+    /// the page needs its cancel action and status while it runs.
+    fn busy_allows_inputs(&self) -> bool {
+        match self.snapshot.busy {
+            None => true,
+            Some((_, ServiceBusyReason::Preparing | ServiceBusyReason::Probe)) => true,
+            Some((_, ServiceBusyReason::Saving)) => matches!(
+                self.snapshot.preparation,
+                PreparationStatus::Running(PreparationStage::SavingModel)
+            ),
+            Some(_) => false,
+        }
+    }
+
+    /// Follows an automatic model save: the model input takes the new saved
+    /// value only while the user has not edited it.
+    fn sync_unedited_model_input(&mut self, window: &mut Window, cx: &mut Context<EditorView>) {
+        let Some(inputs) = &self.inputs else {
+            return;
+        };
+        let saved = self
+            .snapshot
+            .settings
+            .chatgpt
+            .model_id
+            .clone()
+            .unwrap_or_default();
+        let synced = self.synced_chatgpt_model.clone().unwrap_or_default();
+        if saved == synced {
+            return;
+        }
+        if value(&inputs.chatgpt_model, cx) == synced {
+            set_value(&inputs.chatgpt_model, &saved, window, cx);
+        }
+        self.synced_chatgpt_model = Some(saved);
+    }
+
     fn ensure_inputs(&mut self, window: &mut Window, cx: &mut Context<EditorView>) {
         if self.inputs.is_some()
             || self.snapshot.ownership != OwnershipState::Owned
             || (self.snapshot.recovery_required && !self.needs_durability_reconfirmation())
-            || self.snapshot.busy.is_some()
+            || !self.busy_allows_inputs()
         {
             return;
         }
         let settings = &self.snapshot.settings;
         let custom = settings.custom.as_ref();
         let chatgpt_model = settings.chatgpt.model_id.as_deref().unwrap_or_default();
+        self.synced_chatgpt_model = Some(chatgpt_model.to_owned());
         let custom_name = custom.map_or("", |custom| custom.name.as_str());
         let custom_base_url = custom.map_or("", |custom| custom.base_url.as_str());
         let custom_model = custom.map_or("", |custom| custom.model_id.as_str());
@@ -736,6 +783,14 @@ impl AiSettingsPage {
             cx,
         );
         set_value(&inputs.custom_api_key, "", window, cx);
+        self.synced_chatgpt_model = Some(
+            settings
+                .chatgpt
+                .model_id
+                .as_deref()
+                .unwrap_or_default()
+                .to_owned(),
+        );
         self.active_connection = settings.active_connection;
         self.custom_preset = custom.map_or(CustomProviderPreset::Other, |custom| {
             if custom_settings_match_openai(&custom.name, &custom.base_url) {
@@ -775,6 +830,34 @@ impl AiSettingsPage {
             });
         }
         Some(proposed)
+    }
+
+    /// A model picked from the catalog on an otherwise clean form is a confirmed
+    /// choice: it is saved right away instead of waiting for a save button.
+    /// Other unsaved input keeps the pick as a draft, so it is never saved
+    /// together with edits the user has not confirmed. The service starts the
+    /// connection preparation after the save is applied.
+    fn commit_model_selection(&mut self, model: &str, cx: &App) {
+        let Some(service) = &self.service else {
+            return;
+        };
+        let saved = &self.snapshot.settings;
+        if saved.active_connection != ActiveConnection::ChatGpt
+            || self.active_connection != ActiveConnection::ChatGpt
+            || saved.chatgpt.model_id.as_deref() == Some(model)
+            || self.connection_draft_is_dirty(ActiveConnection::Custom, cx)
+            || !self.settings_editable()
+        {
+            return;
+        }
+        let mut proposed = saved.clone();
+        proposed.chatgpt = ChatGptConnectionSettings {
+            model_id: Some(model.to_owned()),
+        };
+        match service.try_save_settings(saved.revision, proposed) {
+            Ok(_) => self.message = None,
+            Err(error) => self.message = Some(admission_message(error)),
+        }
     }
 
     fn save(
@@ -931,6 +1014,7 @@ impl AiSettingsPage {
         theme: Theme,
     ) -> impl IntoElement {
         self.ensure_inputs(window, cx);
+        self.sync_unedited_model_input(window, cx);
         let durability_reconfirmation = self.needs_durability_reconfirmation();
         let editable = self.settings_editable();
         let ready = self.snapshot.ownership == OwnershipState::Owned
@@ -1694,7 +1778,7 @@ impl AiSettingsPage {
         }
         if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt {
             if self.snapshot.account_refresh_failed {
-                return "ChatGPTのログイン状態を確認できません。状態を更新してください。"
+                return "ChatGPTのログイン状態を確認できません。下の「接続状態」から再試行してください。"
                     .to_owned();
             }
             if !matches!(self.snapshot.account, AccountState::SignedIn { .. }) {
@@ -1710,7 +1794,11 @@ impl AiSettingsPage {
             ProbeStatus::Canceled => "直近の応答確認は取り消されました。".to_owned(),
             ProbeStatus::Isolated => self.probe_summary(),
             ProbeStatus::NotRun => {
-                "応答はまだ確認していません。必要なら下の「応答を確認」で試せます。".to_owned()
+                if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt {
+                    "接続は自動で確認します。結果は下の「接続状態」に表示します。".to_owned()
+                } else {
+                    "応答はまだ確認していません。必要なら下の「応答を確認」で試せます。".to_owned()
+                }
             }
         }
     }
@@ -1750,6 +1838,9 @@ impl AiSettingsPage {
                 && !matches!(self.snapshot.account, AccountState::SignedIn { .. }) =>
             {
                 "次の操作: この接続を使うにはChatGPTにログインしてください。".to_owned()
+            }
+            _ if self.snapshot.settings.active_connection == ActiveConnection::ChatGpt => {
+                "接続の準備と確認は自動で進みます。設定の保存そのものでは通信しません。".to_owned()
             }
             _ => "必要なら「応答を確認」を実行してください。設定保存だけでは通信しません。"
                 .to_owned(),
@@ -2145,14 +2236,9 @@ impl AiSettingsPage {
         _window: &Window,
         theme: Theme,
     ) -> gpui::AnyElement {
-        let actions_allowed = self.snapshot.settings.active_connection == ActiveConnection::ChatGpt
-            && !dirty
-            && self.snapshot.busy.is_none()
-            && !self.snapshot.recovery_required;
         let is_signed_in = matches!(self.snapshot.account, AccountState::SignedIn { .. });
         let account = self.chatgpt_account_content(cx, dirty, theme);
-        let models =
-            self.chatgpt_model_controls(cx, is_signed_in, editable, actions_allowed, theme);
+        let models = self.chatgpt_model_controls(cx, is_signed_in, editable, theme);
         let dark = theme.editor_background < 0x888888;
         div()
             .id("ai-chatgpt-section")
@@ -2264,24 +2350,6 @@ impl AiSettingsPage {
         } else {
             None
         };
-        let service = self.service.clone();
-        let view = cx.entity();
-        let refresh_account = Button::new("ai-chatgpt-refresh-account")
-            .label("状態を更新")
-            .small()
-            .disabled(!actions_allowed)
-            .on_click(move |_, _, app| {
-                if let Some(service) = &service
-                    && let Err(error) = service.try_submit(AiCommand::RefreshAccount {
-                        refresh_token: false,
-                    })
-                {
-                    view.update(app, |view, cx| {
-                        view.ai_settings.message = Some(admission_message(error));
-                        cx.notify();
-                    });
-                }
-            });
         let view = cx.entity();
         let logout = Button::new("ai-chatgpt-logout")
             .label("ログアウト")
@@ -2383,11 +2451,10 @@ impl AiSettingsPage {
                             .flex_wrap()
                             .gap_2()
                             .children((!is_signed_in).then_some(login))
-                            .children(cancel_login)
-                            .child(refresh_account),
+                            .children(cancel_login),
                     )
                     .child(if active_saved {
-                        "ログイン後、モデルを選びます。ログインだけでは応答確認を行いません。"
+                        "ログインすると、モデルの準備と接続の確認まで自動で進みます。"
                     } else {
                         "ChatGPTを使うには、先に選んで「保存して適用」します。"
                     }),
@@ -2403,7 +2470,6 @@ impl AiSettingsPage {
         cx: &mut Context<EditorView>,
         is_signed_in: bool,
         editable: bool,
-        actions_allowed: bool,
         theme: Theme,
     ) -> gpui::AnyElement {
         let Some(inputs) = self.inputs.as_ref() else {
@@ -2412,12 +2478,12 @@ impl AiSettingsPage {
         let dark = theme.editor_background < 0x888888;
         let model_list = match &self.snapshot.model_list {
             ModelListState::NotLoaded => {
-                "モデル一覧は未取得です。「モデル一覧を更新」から取得できます。".to_owned()
+                "モデル一覧は、接続の準備中に自動で取得します。".to_owned()
             }
             ModelListState::Loading => "モデル一覧を取得しています…".to_owned(),
             ModelListState::Loaded(models) => format!("{}件のモデルを取得しました。", models.len()),
             ModelListState::Failed(error) => format!(
-                "モデル一覧を取得できませんでした（{}）。保存済みモデルは変更していません。再取得するか、下のモデルIDを手入力してください。",
+                "モデル一覧を取得できませんでした（{}）。保存済みモデルは変更していません。下の「再試行」で再取得するか、モデルIDを手入力してください。",
                 model_list_error_message(error)
             ),
         };
@@ -2466,6 +2532,7 @@ impl AiSettingsPage {
                                         state.set_value(model.clone(), window, cx)
                                     });
                                 }
+                                view.ai_settings.commit_model_selection(&model, cx);
                                 cx.notify();
                             });
                         }),
@@ -2477,22 +2544,6 @@ impl AiSettingsPage {
             .id("ai-chatgpt-model-picker-wrapper")
             .debug_selector(|| "ai-chatgpt-model-picker".to_owned())
             .child(model_picker);
-        let service = self.service.clone();
-        let view = cx.entity();
-        let refresh_models = Button::new("ai-chatgpt-refresh-models")
-            .label("モデル一覧を更新")
-            .small()
-            .disabled(!actions_allowed)
-            .on_click(move |_, _, app| {
-                if let Some(service) = &service
-                    && let Err(error) = service.try_submit(AiCommand::RefreshModels)
-                {
-                    view.update(app, |view, cx| {
-                        view.ai_settings.message = Some(admission_message(error));
-                        cx.notify();
-                    });
-                }
-            });
         let model_available = matches!(self.snapshot.model_list, ModelListState::Loaded(_));
         let saved_model = self
             .snapshot
@@ -2520,8 +2571,7 @@ impl AiSettingsPage {
                         .items_center()
                         .justify_between()
                         .gap_3()
-                        .child(div().font_weight(gpui::FontWeight::BOLD).child("モデル"))
-                        .child(refresh_models),
+                        .child(div().font_weight(gpui::FontWeight::BOLD).child("モデル")),
                 )
                 .child(model_list)
                 .child(model_picker)
@@ -2544,10 +2594,10 @@ impl AiSettingsPage {
                 )
                 .children(model_stale.then_some(
                     div().text_color(rgb(0xb54708)).child(
-                        "保存済みモデルは一覧で見つかりません。自動変更していません。IDを確認するか、一覧を更新してください。",
+                        "保存済みモデルは一覧で見つかりません。自動変更していません。IDを確認するか、一覧からモデルを選び直してください。",
                     ),
                 ))
-                .child("モデル一覧から選ぶか、モデルIDを手入力できます。")
+                .child("初回は一覧の既定モデルを自動で選んで保存します。変更は一覧から選ぶか、モデルIDを手入力できます。")
                 .into_any_element()
         } else {
             div()
@@ -3077,56 +3127,105 @@ impl AiSettingsPage {
         theme: Theme,
     ) -> impl IntoElement {
         let result = self.probe_summary();
+        // A saved ChatGPT connection is prepared and confirmed automatically
+        // (Issue #724): no manual confirm button, only the status, the cancel
+        // of a running preparation and, after a failure, one retry. The
+        // APIキー connection keeps its explicit confirm button.
+        let automatic = self.snapshot.settings.active_connection == ActiveConnection::ChatGpt;
         let probe_disabled_reason = self.probe_disabled_reason(dirty);
         let probe_enabled = probe_disabled_reason.is_none();
+        let note = if automatic {
+            self.preparation_note()
+        } else {
+            probe_disabled_reason
+        };
         let target = if self.saved_configuration_is_applied() {
             self.saved_connection_description()
         } else {
             "保存済み設定は適用状態を確認できません".to_owned()
         };
-        let (action, action_selector) =
-            if let Some((operation, ServiceBusyReason::Probe)) = self.snapshot.busy {
-                let service = self.service.clone();
-                let view = cx.entity();
-                (
-                    Button::new("ai-probe-cancel")
-                        .label("接続確認を取り消す")
-                        .on_click(move |_, _, app| {
-                            if let Some(service) = &service
-                                && let Err(error) = service.cancel(operation)
-                            {
-                                view.update(app, |view, cx| {
-                                    view.ai_settings.message = Some(admission_message(error));
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                    "ai-probe-cancel",
-                )
+        let action: Option<(gpui::AnyElement, &'static str)> = if let Some((
+            operation,
+            reason @ (ServiceBusyReason::Probe | ServiceBusyReason::Preparing),
+        )) = self.snapshot.busy
+        {
+            let service = self.service.clone();
+            let view = cx.entity();
+            let label = if reason == ServiceBusyReason::Preparing {
+                "接続準備を取り消す"
             } else {
+                "接続確認を取り消す"
+            };
+            Some((
+                Button::new("ai-probe-cancel")
+                    .label(label)
+                    .on_click(move |_, _, app| {
+                        if let Some(service) = &service
+                            && let Err(error) = service.cancel(operation)
+                        {
+                            view.update(app, |view, cx| {
+                                view.ai_settings.message = Some(admission_message(error));
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element(),
+                "ai-probe-cancel",
+            ))
+        } else if automatic {
+            self.preparation_retry_visible().then(|| {
                 let service = self.service.clone();
                 let view = cx.entity();
                 (
-                    Button::new("ai-probe-run")
-                        .label("応答を確認")
-                        .disabled(!probe_enabled)
+                    Button::new("ai-preparation-retry")
+                        .label("再試行")
+                        .disabled(
+                            self.snapshot.ownership != OwnershipState::Owned
+                                || self.snapshot.busy.is_some()
+                                || self.snapshot.recovery_required
+                                || dirty,
+                        )
                         .on_click(move |_, _, app| {
                             if let Some(service) = &service
-                                && let Err(error) = service.try_submit(AiCommand::Probe)
+                                && let Err(error) = service.try_submit(AiCommand::RetryPreparation)
                             {
                                 view.update(app, |view, cx| {
                                     view.ai_settings.message = Some(admission_message(error));
                                     cx.notify();
                                 });
                             }
-                        }),
-                    "ai-probe-run",
+                        })
+                        .into_any_element(),
+                    "ai-preparation-retry",
                 )
-            };
-        let action = div()
-            .id(format!("{action_selector}-wrapper"))
-            .debug_selector(|| action_selector.to_owned())
-            .child(action);
+            })
+        } else {
+            let service = self.service.clone();
+            let view = cx.entity();
+            Some((
+                Button::new("ai-probe-run")
+                    .label("応答を確認")
+                    .disabled(!probe_enabled)
+                    .on_click(move |_, _, app| {
+                        if let Some(service) = &service
+                            && let Err(error) = service.try_submit(AiCommand::Probe)
+                        {
+                            view.update(app, |view, cx| {
+                                view.ai_settings.message = Some(admission_message(error));
+                                cx.notify();
+                            });
+                        }
+                    })
+                    .into_any_element(),
+                "ai-probe-run",
+            ))
+        };
+        let action = action.map(|(button, selector)| {
+            div()
+                .id(format!("{selector}-wrapper"))
+                .debug_selector(|| selector.to_owned())
+                .child(button)
+        });
         let result_state =
             (!matches!(&self.snapshot.probe_status, ProbeStatus::NotRun)).then(|| {
                 div()
@@ -3165,7 +3264,11 @@ impl AiSettingsPage {
                         div()
                             .text_size(px(10.0))
                             .text_color(rgb(theme.quote_foreground))
-                            .child("短いテストメッセージを送信します。文書は送信しません。"),
+                            .child(if automatic {
+                                "接続の準備と確認を自動で行います。確認には短いテストメッセージを使い、文書は送信しません。"
+                            } else {
+                                "短いテストメッセージを送信します。文書は送信しません。"
+                            }),
                     )
                     .child(
                         div()
@@ -3174,7 +3277,7 @@ impl AiSettingsPage {
                             .child("利用料金・利用枠を消費する場合があります。"),
                     ),
             )
-            .child(action);
+            .children(action);
         let test_panel = div()
             .id("ai-probe-test-box")
             .w_full()
@@ -3196,7 +3299,7 @@ impl AiSettingsPage {
             .flex_col()
             .gap_3()
             .child(test_header)
-            .children(probe_disabled_reason)
+            .children(note)
             .children(result_state);
         div()
             .id("ai-probe-section")
@@ -3215,7 +3318,7 @@ impl AiSettingsPage {
                         div()
                             .text_size(px(16.0))
                             .font_weight(gpui::FontWeight::BOLD)
-                            .child("応答を確認"),
+                            .child(if automatic { "接続状態" } else { "応答を確認" }),
                     )
                     .child(
                         div()
@@ -3225,6 +3328,101 @@ impl AiSettingsPage {
                     ),
             )
             .child(test_panel)
+    }
+
+    /// What the automatic preparation of the saved ChatGPT connection is doing
+    /// or why it stopped, in words that name the one action that helps. Never
+    /// carries provider text, a key, a token or a sign-in URL.
+    fn preparation_note(&self) -> Option<String> {
+        if self.service.is_none() {
+            return Some(
+                "AIサービスを利用できません。Markdown編集は引き続き利用できます。".to_owned(),
+            );
+        }
+        if matches!(self.snapshot.runtime_install, RuntimeInstallState::NotInstalled) {
+            return Some(runtime_install_not_installed_probe_guidance());
+        }
+        if let RuntimeInstallState::Failed(code) = self.snapshot.runtime_install {
+            return Some(format!(
+                "Codex App Serverを導入できません: {}",
+                runtime_install_error_label(code)
+            ));
+        }
+        let message = match self.snapshot.preparation {
+            PreparationStatus::Idle | PreparationStatus::Ready => return None,
+            PreparationStatus::Running(stage) => match stage {
+                PreparationStage::ReadingAccount => "ログイン状態を確認しています…",
+                PreparationStage::ReadingModels => "利用できるモデルを取得しています…",
+                PreparationStage::SavingModel => "モデルを自動で選んで保存しています…",
+                PreparationStage::Probing => "接続を確認しています…",
+            },
+            PreparationStatus::Canceled => {
+                "接続の準備を取り消しました。「再試行」で続きから確認できます。"
+            }
+            PreparationStatus::Stopped(failure) => match failure {
+                // Ownership and recovery problems are explained, with their
+                // own action, by the status card above.
+                PreparationFailure::NotReady => return None,
+                PreparationFailure::AccountReadFailed => {
+                    "ログイン状態を取得できませんでした。「再試行」を押してください。"
+                }
+                PreparationFailure::NeedsLogin => {
+                    "ChatGPTにログインしてください。ログインすると、モデルの準備と接続の確認まで自動で進みます。"
+                }
+                PreparationFailure::ModelListFailed => {
+                    "モデル一覧を取得できませんでした。保存済みモデルは保持しています。「再試行」で再取得できます。"
+                }
+                PreparationFailure::NoModelCandidates => {
+                    "利用できるモデルが見つかりませんでした。「再試行」で再取得できます。"
+                }
+                PreparationFailure::SavedModelMissing => {
+                    "保存済みモデルを一覧で確認できません。自動では変更していません。モデルを選び直してください。"
+                }
+                PreparationFailure::ModelSaveFailed => {
+                    "モデルを保存できませんでした。「再試行」を押してください。"
+                }
+                PreparationFailure::ProbeFailed => match self.snapshot.probe_status {
+                    ProbeStatus::Failed(ProbeErrorCode::Unauthorized | ProbeErrorCode::Forbidden) => {
+                        "接続を確認できませんでした。いったんログアウトして、ChatGPTに再ログインしてください。"
+                    }
+                    ProbeStatus::Failed(ProbeErrorCode::RateLimited) => {
+                        "利用制限のため確認できませんでした。時間をおいて「再試行」してください。"
+                    }
+                    _ => "接続を確認できませんでした。「再試行」を押してください。",
+                },
+            },
+        };
+        Some(message.to_owned())
+    }
+
+    /// The failed stages a plain retry can resolve. A rejected sign-in needs a
+    /// new login instead, and a missing saved model needs a new choice.
+    fn preparation_retry_visible(&self) -> bool {
+        if matches!(
+            self.snapshot.runtime_install,
+            RuntimeInstallState::NotInstalled | RuntimeInstallState::Failed(_)
+        ) {
+            return false;
+        }
+        match self.snapshot.preparation {
+            PreparationStatus::Canceled => true,
+            PreparationStatus::Stopped(failure) => match failure {
+                PreparationFailure::AccountReadFailed
+                | PreparationFailure::ModelListFailed
+                | PreparationFailure::NoModelCandidates
+                | PreparationFailure::ModelSaveFailed => true,
+                PreparationFailure::ProbeFailed => !matches!(
+                    self.snapshot.probe_status,
+                    ProbeStatus::Failed(ProbeErrorCode::Unauthorized | ProbeErrorCode::Forbidden)
+                ),
+                PreparationFailure::NotReady
+                | PreparationFailure::NeedsLogin
+                | PreparationFailure::SavedModelMissing => false,
+            },
+            PreparationStatus::Idle
+            | PreparationStatus::Running(_)
+            | PreparationStatus::Ready => false,
+        }
     }
 
     fn probe_disabled_reason(&self, dirty: bool) -> Option<String> {
@@ -3390,6 +3588,10 @@ impl AiSettingsPage {
                 ServiceBusyReason::InstallingRuntime => (
                     "Codex App Serverを導入中です",
                     "取得と検証が終わるまで、ほかのAI操作は実行できません。",
+                ),
+                ServiceBusyReason::Preparing => (
+                    "接続を準備しています",
+                    "状態の確認とモデルの準備を自動で進めています。画面を閉じても続き、取り消すこともできます。",
                 ),
             }
         } else if self.snapshot.persistence == PersistenceState::NotCommitted {
@@ -3567,7 +3769,7 @@ fn probe_error_message(error: ProbeErrorCode) -> &'static str {
     match error {
         ProbeErrorCode::InvalidConfiguration => "設定値を確認してください。",
         ProbeErrorCode::AccountUnavailable => {
-            "ChatGPTアカウント状態を取得できません。状態更新または再ログインをお試しください。"
+            "ChatGPTアカウント状態を取得できません。再試行または再ログインをお試しください。"
         }
         ProbeErrorCode::ModelUnavailable => "モデルを利用できません。モデルIDを確認してください。",
         ProbeErrorCode::CredentialUnavailable => {
@@ -4119,6 +4321,84 @@ mod tests {
             )
         });
         assert_eq!(second_draft, "model-two");
+    }
+
+    #[test]
+    fn preparation_retry_is_offered_only_for_failures_a_retry_can_resolve() {
+        let mut page = AiSettingsPage::default();
+        page.snapshot.runtime_install = RuntimeInstallState::Installed;
+
+        for failure in [
+            PreparationFailure::AccountReadFailed,
+            PreparationFailure::ModelListFailed,
+            PreparationFailure::NoModelCandidates,
+            PreparationFailure::ModelSaveFailed,
+        ] {
+            page.snapshot.preparation = PreparationStatus::Stopped(failure);
+            assert!(page.preparation_retry_visible(), "{failure:?}");
+        }
+        for failure in [
+            PreparationFailure::NotReady,
+            PreparationFailure::NeedsLogin,
+            PreparationFailure::SavedModelMissing,
+        ] {
+            page.snapshot.preparation = PreparationStatus::Stopped(failure);
+            assert!(!page.preparation_retry_visible(), "{failure:?}");
+        }
+
+        page.snapshot.preparation = PreparationStatus::Stopped(PreparationFailure::ProbeFailed);
+        page.snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::Network);
+        assert!(page.preparation_retry_visible());
+        page.snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::Unauthorized);
+        assert!(
+            !page.preparation_retry_visible(),
+            "a rejected sign-in needs a new login, not a retry"
+        );
+
+        page.snapshot.preparation = PreparationStatus::Canceled;
+        assert!(page.preparation_retry_visible());
+        page.snapshot.preparation = PreparationStatus::Running(PreparationStage::Probing);
+        assert!(!page.preparation_retry_visible());
+        page.snapshot.preparation = PreparationStatus::Ready;
+        assert!(!page.preparation_retry_visible());
+
+        page.snapshot.runtime_install = RuntimeInstallState::NotInstalled;
+        page.snapshot.preparation = PreparationStatus::Stopped(PreparationFailure::ModelListFailed);
+        assert!(
+            !page.preparation_retry_visible(),
+            "the install section owns a missing runtime"
+        );
+    }
+
+    #[gpui::test]
+    fn chatgpt_connection_has_no_manual_confirm_button(cx: &mut gpui::TestAppContext) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(1600.0), px(2400.0)));
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::Connection;
+            view.ai_settings.snapshot.ownership = OwnershipState::Owned;
+            view.ai_settings.snapshot.persistence = PersistenceState::Clean;
+            view.ai_settings.snapshot.settings.revision = 1;
+            view.ai_settings.snapshot.settings.active_connection = ActiveConnection::ChatGpt;
+            view.ai_settings.snapshot.runtime_install = RuntimeInstallState::Installed;
+            view.ai_settings.snapshot.account = AccountState::SignedIn {
+                email: Some("user@example.invalid".to_owned()),
+                plan_type: "plus".to_owned(),
+            };
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("ai-probe-run").is_none(),
+            "the ChatGPT connection is confirmed automatically, not by a button"
+        );
+        assert!(
+            cx.debug_bounds("ai-chatgpt-model-picker").is_some(),
+            "the model can still be changed"
+        );
     }
 
     #[gpui::test]

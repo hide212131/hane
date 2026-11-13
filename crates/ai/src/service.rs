@@ -23,6 +23,10 @@ use crate::connect::{
     ConnectError, ExpectedCredentialState, SaveOutcome, build_runtime_config_for_active_connection,
     delete_custom_credential_detailed, recover_at_startup, update_custom_credential_detailed,
 };
+use crate::connection_preparation::{
+    ConnectionPreparation, Facts, ModelsFact, PreparationFailure, PreparationStage,
+    PreparationStatus, PreparationTrigger, ProbeOutcome, StageContext, Step,
+};
 use crate::credential_journal::CredentialJournal;
 use crate::owner_lock::{OwnerLock, OwnerLockGuard};
 use crate::paths::AiPaths;
@@ -75,6 +79,10 @@ pub enum ServiceBusyReason {
     /// (`AiCommand::InstallRuntime`). Cancelable, like `Login`/`Probe`/
     /// `TextTransform`.
     InstallingRuntime,
+    /// One automatic connection preparation stage (account/model read).
+    /// Cancelable between stages; its probe and model-save stages report
+    /// `Probe` and `Saving` instead.
+    Preparing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +171,9 @@ pub struct AiSnapshot {
     /// ever surfaced once an actual AI operation attempts to use the
     /// runtime.
     pub runtime_install: RuntimeInstallState,
+    /// Progress of the automatic ChatGPT connection preparation. It is owned
+    /// by the service, so closing the settings screen does not end it.
+    pub preparation: PreparationStatus,
 }
 
 impl Default for AiSnapshot {
@@ -189,6 +200,7 @@ impl Default for AiSnapshot {
             runtime_isolated: false,
             runtime_distribution_error: None,
             runtime_install: RuntimeInstallState::NotInstalled,
+            preparation: PreparationStatus::Idle,
         }
     }
 }
@@ -224,6 +236,15 @@ pub enum AiCommand {
     /// downloads anything because the user explicitly chose "install" in
     /// the AI settings screen; never run automatically.
     InstallRuntime,
+    /// `OpenSettings` for the screen's open trigger: the same ownership and
+    /// recovery handling, then the automatic preparation of the active
+    /// ChatGPT connection (account, model, probe). The screen sends this when
+    /// it opens; it is never sent by rendering. A running preparation is
+    /// joined, not restarted.
+    PrepareConnection,
+    /// Retries a stopped preparation from its failed stage. Lifts the
+    /// suppression of a failed probe for the same connection condition.
+    RetryPreparation,
 }
 
 #[derive(Clone)]
@@ -331,7 +352,11 @@ impl AiServiceHandle {
         let isolated = snapshot.runtime_isolated;
         let owned_elsewhere = snapshot.ownership == OwnershipState::OwnedElsewhere;
         drop(snapshot);
-        if owned_elsewhere && command != AiCommand::OpenSettings {
+        let open_settings = matches!(
+            command,
+            AiCommand::OpenSettings | AiCommand::PrepareConnection
+        );
+        if owned_elsewhere && !open_settings {
             return Err(AdmissionError::Unavailable);
         }
         // `OpenSettings` is the existing recovery entry point users already
@@ -339,17 +364,17 @@ impl AiServiceHandle {
         // addition to the explicit `RetryProbeStop`. Every other command
         // stays rejected at admission so it never touches busy/ownership
         // state against a runtime whose prior child exit is unconfirmed.
-        if isolated
-            && command != AiCommand::RetryProbeStop
-            && command != AiCommand::OpenSettings
-        {
+        if isolated && command != AiCommand::RetryProbeStop && !open_settings {
             return Err(AdmissionError::Unavailable);
         }
         if !isolated && command == AiCommand::RetryProbeStop {
             return Err(AdmissionError::WrongOperation);
         }
         let reason = match command {
-            AiCommand::OpenSettings => ServiceBusyReason::Recovering,
+            AiCommand::OpenSettings | AiCommand::PrepareConnection => {
+                ServiceBusyReason::Recovering
+            }
+            AiCommand::RetryPreparation => ServiceBusyReason::Preparing,
             AiCommand::RefreshAccount { .. } | AiCommand::Logout => ServiceBusyReason::Account,
             AiCommand::StartLogin => ServiceBusyReason::Login,
             AiCommand::RefreshModels => ServiceBusyReason::Models,
@@ -490,7 +515,10 @@ impl AiServiceHandle {
         if !*self.shared.available.lock().unwrap() {
             return Err(AdmissionError::Unavailable);
         }
-        let is_open_settings = matches!(&command, WorkerCommand::Action(AiCommand::OpenSettings));
+        let is_open_settings = matches!(
+            &command,
+            WorkerCommand::Action(AiCommand::OpenSettings | AiCommand::PrepareConnection)
+        );
         if self.shared.snapshot.lock().unwrap().ownership == OwnershipState::OwnedElsewhere
             && !is_open_settings
         {
@@ -535,6 +563,7 @@ impl AiServiceHandle {
                     | ServiceBusyReason::Probe
                     | ServiceBusyReason::TextTransform
                     | ServiceBusyReason::InstallingRuntime
+                    | ServiceBusyReason::Preparing
             )) if id == target
         ) {
             return Err(AdmissionError::WrongOperation);
@@ -729,6 +758,10 @@ struct WorkerState {
     /// The network snapshot of the command being handled, taken once when
     /// the worker dequeued it.
     network: NetworkSnapshot,
+    /// Decision state of the automatic connection preparation. Only this
+    /// worker touches it, so triggers from a closed or reopened screen join
+    /// the same preparation.
+    prep: ConnectionPreparation,
 }
 
 fn service_worker(
@@ -757,6 +790,7 @@ fn service_worker(
         runtime_binary: None,
         runtime_binary_error: None,
         network: network_cell.lock().unwrap().clone(),
+        prep: ConnectionPreparation::default(),
     };
     resolve_runtime_binary_at_startup(&paths, &mut state, &shared);
     let mut settings = AiSettings::default();
@@ -824,6 +858,24 @@ fn service_worker(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => shutdown = true,
         }
+        // A trigger that arrived while another operation held the gate (a
+        // login that just completed, an applied save) runs as soon as the
+        // gate is free. At most one is kept pending.
+        if !shutdown && state.attempt.is_none() && state.prep.has_pending() {
+            state.network = network_cell.lock().unwrap().clone();
+            run_preparation(
+                None,
+                &config,
+                &paths,
+                &settings_store,
+                &shared,
+                &mut state,
+                &mut settings,
+                &cancel_rx,
+                &shutdown_rx,
+                &mut shutdown,
+            );
+        }
     }
 
     if let Some(runtime) = state.runtime.take() {
@@ -862,7 +914,9 @@ fn handle_command(
         return;
     }
     match queued.command {
-        WorkerCommand::Action(AiCommand::OpenSettings) => {
+        WorkerCommand::Action(
+            command @ (AiCommand::OpenSettings | AiCommand::PrepareConnection),
+        ) => {
             publish_busy(shared, queued.id, ServiceBusyReason::Recovering);
             // `OpenSettings` is the existing recovery entry point users
             // already reach (the settings view's own recover action), so it
@@ -904,12 +958,33 @@ fn handle_command(
                             PersistenceState::Clean
                         };
                     });
-                    finish(
-                        shared,
-                        queued.id,
-                        SafeOperationResult::Succeeded,
-                        LoginState::Idle,
-                    );
+                    if command == AiCommand::PrepareConnection
+                        && chatgpt_active(settings)
+                        && state.prep.request(PreparationTrigger::OpenSettings)
+                            != crate::connection_preparation::Admission::Ignored
+                    {
+                        // The preparation continues this operation: the gate
+                        // stays held, so no other operation slips in between.
+                        run_preparation(
+                            Some(queued.id),
+                            config,
+                            paths,
+                            settings_store,
+                            shared,
+                            state,
+                            settings,
+                            cancel_rx,
+                            shutdown_rx,
+                            shutdown,
+                        );
+                    } else {
+                        finish(
+                            shared,
+                            queued.id,
+                            SafeOperationResult::Succeeded,
+                            LoginState::Idle,
+                        );
+                    }
                 }
                 Err(OwnerOpenError::Elsewhere) => {
                     mutate(shared, |snapshot| {
@@ -1152,6 +1227,44 @@ fn handle_command(
                 },
                 LoginState::Idle,
             );
+            if result.is_ok() && chatgpt_active(settings) {
+                // A successful apply retry resumes the preparation (ignored
+                // unless the settings screen has been opened).
+                state.prep.request(PreparationTrigger::Applied);
+            }
+        }
+        WorkerCommand::Action(AiCommand::RetryPreparation) => {
+            if !settings_actions_allowed(shared) {
+                finish(
+                    shared,
+                    queued.id,
+                    SafeOperationResult::Failed("recovery_required"),
+                    LoginState::Idle,
+                );
+                return;
+            }
+            if !chatgpt_active(settings) {
+                finish(
+                    shared,
+                    queued.id,
+                    SafeOperationResult::Failed("chatgpt_not_active"),
+                    LoginState::Idle,
+                );
+                return;
+            }
+            state.prep.request(PreparationTrigger::Retry);
+            run_preparation(
+                Some(queued.id),
+                config,
+                paths,
+                settings_store,
+                shared,
+                state,
+                settings,
+                cancel_rx,
+                shutdown_rx,
+                shutdown,
+            );
         }
         WorkerCommand::Action(AiCommand::RetryProbeStop) => {
             retry_probe_stop(queued.id, paths, shared, state);
@@ -1262,6 +1375,37 @@ fn run_probe_command(
     shutdown_rx: &Receiver<()>,
     shutdown: &mut bool,
 ) {
+    let result = run_probe_operation(
+        id,
+        config,
+        paths,
+        settings_store,
+        shared,
+        state,
+        settings,
+        cancel_rx,
+        shutdown_rx,
+        shutdown,
+    );
+    finish(shared, id, result, LoginState::Idle);
+}
+
+/// The probe itself, without ending the operation, so the automatic
+/// preparation can run it as its last stage under its own operation. Keeps the
+/// busy gate held until the caller finishes.
+#[allow(clippy::too_many_arguments)] // Probe owns the runtime/settings locks for this full logical operation.
+fn run_probe_operation(
+    id: OperationId,
+    config: &AiServiceConfig,
+    paths: &AiPaths,
+    settings_store: &AiSettingsStore,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &AiSettings,
+    cancel_rx: &Receiver<OperationId>,
+    shutdown_rx: &Receiver<()>,
+    shutdown: &mut bool,
+) -> SafeOperationResult {
     let snapshot = shared.snapshot.lock().unwrap().clone();
     let model = match probe_model_checked(settings, &snapshot, config.credential_store.as_ref()) {
         Ok(model) => model,
@@ -1272,13 +1416,7 @@ fn run_probe_command(
                 snapshot.probe_diagnostic =
                     Some(probe_diagnostic(id, "validate_settings", code, cause.to_owned()));
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed(code.stable_code()),
-                LoginState::Idle,
-            );
-            return;
+            return SafeOperationResult::Failed(code.stable_code());
         }
     };
     publish_busy(shared, id, ServiceBusyReason::Probe);
@@ -1327,13 +1465,7 @@ fn run_probe_command(
                 snapshot.ownership = OwnershipState::OwnedElsewhere;
             }
         });
-        finish(
-            shared,
-            id,
-            SafeOperationResult::Failed(code.stable_code()),
-            LoginState::Idle,
-        );
-        return;
+        return SafeOperationResult::Failed(code.stable_code());
     }
     let runtime = state
         .runtime
@@ -1350,13 +1482,7 @@ fn run_probe_command(
                 "runtime_event_channel_missing".to_owned(),
             ));
         });
-        finish(
-            shared,
-            id,
-            SafeOperationResult::Failed(ProbeErrorCode::RuntimeUnavailable.stable_code()),
-            LoginState::Idle,
-        );
-        return;
+        return SafeOperationResult::Failed(ProbeErrorCode::RuntimeUnavailable.stable_code());
     };
     let workspace = match paths.create_probe_workspace() {
         Ok(workspace) => workspace,
@@ -1372,13 +1498,7 @@ fn run_probe_command(
                     cause,
                 ));
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed(ProbeErrorCode::RuntimeUnavailable.stable_code()),
-                LoginState::Idle,
-            );
-            return;
+            return SafeOperationResult::Failed(ProbeErrorCode::RuntimeUnavailable.stable_code());
         }
     };
 
@@ -1416,19 +1536,13 @@ fn run_probe_command(
             snapshot.runtime_isolated = true;
         });
         sync_runtime_snapshot(shared, runtime);
-        finish(
-            shared,
-            id,
-            SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code()),
-            LoginState::Idle,
-        );
-        return;
+        return SafeOperationResult::Failed(ProbeErrorCode::Isolated.stable_code());
     }
     let owns_runtime_lock = runtime
         .with_owner_lock(|owner| owner.is_some())
         .unwrap_or(false);
     sync_runtime_snapshot(shared, runtime);
-    let operation_result = publish_probe_execution(
+    publish_probe_execution(
         shared,
         id,
         &state.network.revision_guard(),
@@ -1436,8 +1550,355 @@ fn run_probe_command(
         execution.result,
         execution.diagnostic,
         owns_runtime_lock,
+    )
+}
+
+/// Takes the busy gate for a service-started operation, or `None` when another
+/// operation holds it. Same ordering as `AiServiceHandle::enqueue`.
+fn claim_busy(shared: &Arc<SharedServiceState>, reason: ServiceBusyReason) -> Option<OperationId> {
+    let mut busy = shared.busy.lock().unwrap();
+    if busy.is_some() {
+        return None;
+    }
+    let id = OperationId(shared.next_operation_id.fetch_add(1, Ordering::Relaxed));
+    *busy = Some((id, reason));
+    mutate(shared, |snapshot| snapshot.busy = Some((id, reason)));
+    drop(busy);
+    Some(id)
+}
+
+/// Ends a service-started operation without recording a `last_result`, so it
+/// cannot overwrite the result of the user's own operation (a save a screen is
+/// still waiting on).
+fn release_busy(shared: &Arc<SharedServiceState>) {
+    let mut busy = shared.busy.lock().unwrap();
+    *busy = None;
+    mutate(shared, |snapshot| snapshot.busy = None);
+    drop(busy);
+}
+
+fn preparation_ready(snapshot: &AiSnapshot) -> bool {
+    snapshot.ownership == OwnershipState::Owned
+        && !snapshot.recovery_required
+        && !snapshot.runtime_isolated
+        && matches!(
+            snapshot.persistence,
+            PersistenceState::Clean | PersistenceState::Saved
+        )
+}
+
+fn stage_context(state: &WorkerState, settings: &AiSettings) -> StageContext {
+    StageContext {
+        connection: settings.active_connection,
+        settings_generation: settings.settings_generation,
+        runtime_generation: state
+            .runtime
+            .as_ref()
+            .map_or(0, |runtime| runtime.snapshot().generation),
+        network_revision: state.network.revision,
+    }
+}
+
+fn preparation_canceled(cancel_rx: &Receiver<OperationId>, id: OperationId) -> bool {
+    let mut canceled = false;
+    while let Ok(target) = cancel_rx.try_recv() {
+        canceled |= target == id;
+    }
+    canceled
+}
+
+fn set_preparation_stage(
+    shared: &Arc<SharedServiceState>,
+    id: OperationId,
+    stage: PreparationStage,
+    reason: ServiceBusyReason,
+) {
+    publish_busy(shared, id, reason);
+    mutate(shared, |snapshot| {
+        snapshot.preparation = PreparationStatus::Running(stage)
+    });
+}
+
+/// Runs the pending connection preparation (Issue #724) as one service-owned
+/// operation. `reuse_id` continues the operation of the command that started
+/// it (`PrepareConnection`, `RetryPreparation`); otherwise the busy gate is
+/// claimed, and the run waits (stays pending) while another operation holds it.
+/// Stages share the worker's existing paths: no command is re-submitted, so a
+/// duplicate trigger can only join the pending run.
+#[allow(clippy::too_many_arguments)] // The bounded worker owns these references for one preparation.
+fn run_preparation(
+    reuse_id: Option<OperationId>,
+    config: &AiServiceConfig,
+    paths: &AiPaths,
+    settings_store: &AiSettingsStore,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &mut AiSettings,
+    cancel_rx: &Receiver<OperationId>,
+    shutdown_rx: &Receiver<()>,
+    shutdown: &mut bool,
+) {
+    let id = match reuse_id {
+        Some(id) => id,
+        None => match claim_busy(shared, ServiceBusyReason::Preparing) {
+            Some(id) => id,
+            None => return,
+        },
+    };
+    let (result, status) = if state.prep.begin().is_some() {
+        drive_preparation(
+            id,
+            config,
+            paths,
+            settings_store,
+            shared,
+            state,
+            settings,
+            cancel_rx,
+            shutdown_rx,
+            shutdown,
+        )
+    } else {
+        (SafeOperationResult::Succeeded, PreparationStatus::Idle)
+    };
+    state.prep.finish_run();
+    mutate(shared, |snapshot| snapshot.preparation = status);
+    if reuse_id.is_some() {
+        finish(shared, id, result, LoginState::Idle);
+    } else {
+        release_busy(shared);
+    }
+}
+
+/// Steps the decision machine until it stops. Each stage result is adopted
+/// only while the configuration it started under is unchanged. A cancel or
+/// shutdown request ends the run before the next stage; a setting that was
+/// already saved is never rolled back.
+#[allow(clippy::too_many_arguments)] // The bounded worker owns these references for one preparation.
+fn drive_preparation(
+    id: OperationId,
+    config: &AiServiceConfig,
+    paths: &AiPaths,
+    settings_store: &AiSettingsStore,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &mut AiSettings,
+    cancel_rx: &Receiver<OperationId>,
+    shutdown_rx: &Receiver<()>,
+    shutdown: &mut bool,
+) -> (SafeOperationResult, PreparationStatus) {
+    let stale = (
+        SafeOperationResult::Failed(ProbeErrorCode::StaleGeneration.stable_code()),
+        PreparationStatus::Idle,
     );
-    finish(shared, id, operation_result, LoginState::Idle);
+    loop {
+        if *shutdown || shutdown_rx.try_recv().is_ok() {
+            *shutdown = true;
+            return (SafeOperationResult::Canceled, PreparationStatus::Idle);
+        }
+        if preparation_canceled(cancel_rx, id) {
+            return (SafeOperationResult::Canceled, PreparationStatus::Canceled);
+        }
+        let snapshot = shared.snapshot.lock().unwrap().clone();
+        let context = stage_context(state, settings);
+        let step = {
+            let facts = Facts {
+                context,
+                auth_epoch: snapshot.auth_epoch,
+                ready: preparation_ready(&snapshot),
+                signed_in: matches!(snapshot.account, AccountState::SignedIn { .. }),
+                account_read_failed: snapshot.account_refresh_failed,
+                models: match &snapshot.model_list {
+                    ModelListState::Loaded(models) => ModelsFact::Loaded(models),
+                    ModelListState::Failed(_) => ModelsFact::Failed,
+                    ModelListState::NotLoaded | ModelListState::Loading => ModelsFact::NotLoaded,
+                },
+                saved_model: settings.chatgpt.model_id.as_deref(),
+            };
+            state.prep.next_step(&facts, Instant::now())
+        };
+        match step {
+            Step::Skip => return (SafeOperationResult::Succeeded, PreparationStatus::Idle),
+            Step::Ready => return (SafeOperationResult::Succeeded, PreparationStatus::Ready),
+            Step::Stop(failure) => {
+                return (
+                    SafeOperationResult::Failed(failure.stable_code()),
+                    PreparationStatus::Stopped(failure),
+                );
+            }
+            Step::ReadAccount => {
+                set_preparation_stage(
+                    shared,
+                    id,
+                    PreparationStage::ReadingAccount,
+                    ServiceBusyReason::Preparing,
+                );
+                let result = ensure_runtime(config, paths, settings, shared, state)
+                    .and_then(|runtime| call_account_read(runtime, false));
+                if let Some(runtime) = state.runtime.as_ref() {
+                    sync_runtime_snapshot(shared, runtime);
+                }
+                match result {
+                    Ok(account) => mutate(shared, |snapshot| {
+                        if snapshot.account != account {
+                            snapshot.auth_epoch += 1;
+                            snapshot.model_list = ModelListState::NotLoaded;
+                        }
+                        snapshot.account = account;
+                        snapshot.account_refresh_failed = false;
+                    }),
+                    Err(()) => mutate(shared, |snapshot| snapshot.account_refresh_failed = true),
+                }
+                let after = stage_context(state, settings);
+                if !after.same_configuration(&context) {
+                    return stale;
+                }
+                state.prep.record_account_read(after);
+            }
+            Step::ReadModels => {
+                set_preparation_stage(
+                    shared,
+                    id,
+                    PreparationStage::ReadingModels,
+                    ServiceBusyReason::Preparing,
+                );
+                mutate(shared, |snapshot| {
+                    snapshot.model_list = ModelListState::Loading
+                });
+                let result = match ensure_runtime(config, paths, settings, shared, state) {
+                    Ok(runtime) => crate::models::fetch_chatgpt_models(|method, params| {
+                        runtime
+                            .call(method, Some(params), RPC_TIMEOUT)
+                            .map_err(|_| ())
+                    }),
+                    Err(()) => Err(crate::models::ModelListError::Rpc),
+                };
+                if let Some(runtime) = state.runtime.as_ref() {
+                    sync_runtime_snapshot(shared, runtime);
+                }
+                mutate(shared, |snapshot| {
+                    snapshot.model_list = match result {
+                        Ok(models) => ModelListState::Loaded(models),
+                        Err(error) => ModelListState::Failed(error),
+                    }
+                });
+                let after = stage_context(state, settings);
+                if !after.same_configuration(&context) {
+                    return stale;
+                }
+                state.prep.record_models_read(after);
+            }
+            Step::SaveModel(model) => {
+                set_preparation_stage(
+                    shared,
+                    id,
+                    PreparationStage::SavingModel,
+                    ServiceBusyReason::Saving,
+                );
+                let mut proposed = settings.clone();
+                proposed.chatgpt.model_id = Some(model);
+                let expected_revision = settings.revision;
+                match auto_save_settings(
+                    expected_revision,
+                    proposed,
+                    paths,
+                    settings_store,
+                    config,
+                    shared,
+                    state,
+                    settings,
+                ) {
+                    Ok(()) => state.prep.record_model_saved(),
+                    Err(code) => {
+                        return (
+                            SafeOperationResult::Failed(code),
+                            PreparationStatus::Stopped(PreparationFailure::ModelSaveFailed),
+                        );
+                    }
+                }
+            }
+            Step::Probe(key) => {
+                set_preparation_stage(
+                    shared,
+                    id,
+                    PreparationStage::Probing,
+                    ServiceBusyReason::Preparing,
+                );
+                let result = run_probe_operation(
+                    id,
+                    config,
+                    paths,
+                    settings_store,
+                    shared,
+                    state,
+                    settings,
+                    cancel_rx,
+                    shutdown_rx,
+                    shutdown,
+                );
+                let probe_status = shared.snapshot.lock().unwrap().probe_status.clone();
+                let outcome = if probe_status == ProbeStatus::Succeeded {
+                    ProbeOutcome::Succeeded
+                } else {
+                    ProbeOutcome::Failed
+                };
+                state.prep.record_probe(key, outcome, Instant::now());
+                let status = match probe_status {
+                    ProbeStatus::Succeeded => PreparationStatus::Ready,
+                    ProbeStatus::Canceled => PreparationStatus::Canceled,
+                    _ => PreparationStatus::Stopped(PreparationFailure::ProbeFailed),
+                };
+                return (result, status);
+            }
+        }
+    }
+}
+
+/// Persists a model chosen by the preparation through the ordinary save path
+/// (`expected_revision`, ownership, journal check, durability handling, runtime
+/// apply), without ending the operation. A revision conflict re-reads the
+/// latest settings and stops; it never overwrites a newer setting. Saving
+/// itself runs no inference; the probe is a separate stage.
+#[allow(clippy::too_many_arguments)] // One serialized worker operation spans persistence and runtime application.
+fn auto_save_settings(
+    expected_revision: u64,
+    proposed: AiSettings,
+    paths: &AiPaths,
+    settings_store: &AiSettingsStore,
+    config: &AiServiceConfig,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &mut AiSettings,
+) -> Result<(), &'static str> {
+    if !settings_save_allowed(shared) {
+        return Err("recovery_required");
+    }
+    let settings_path = settings_store.path().to_path_buf();
+    let settings_lock_path = settings_store.settings_lock().path().to_path_buf();
+    let owner_lock_path = settings_store.owner_lock_path().to_path_buf();
+    let owned_paths = paths.clone();
+    let save = with_state_owner(state, move |owner| {
+        let store = AiSettingsStore::new(settings_path, settings_lock_path, owner_lock_path);
+        let journal = CredentialJournal::new(owned_paths.credential_journal_path());
+        store.save(owner, expected_revision, proposed, || journal.is_empty())
+    });
+    match save {
+        Ok(Ok(saved)) => apply_persisted_save(saved, false, paths, config, shared, state, settings),
+        Ok(Err(error)) => Err(apply_plain_save_error(
+            error,
+            paths,
+            settings_store,
+            shared,
+            state,
+            settings,
+        )),
+        Err(()) => {
+            mutate(shared, |snapshot| {
+                snapshot.persistence = PersistenceState::NotCommitted
+            });
+            Err("owner_unavailable")
+        }
+    }
 }
 
 /// Publishes the probe's final status/result. The last network revision check
@@ -2314,6 +2775,26 @@ fn handle_plain_save_error(
     state: &mut WorkerState,
     settings: &mut AiSettings,
 ) {
+    let code = apply_plain_save_error(error, paths, settings_store, shared, state, settings);
+    finish(
+        shared,
+        id,
+        SafeOperationResult::Failed(code),
+        LoginState::Idle,
+    );
+}
+
+/// Records a failed plain save and returns its stable code. Ending the
+/// operation is the caller's job, so the automatic model save can stop its
+/// preparation with the same state handling as a user's save.
+fn apply_plain_save_error(
+    error: SaveError,
+    paths: &AiPaths,
+    settings_store: &AiSettingsStore,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &mut AiSettings,
+) -> &'static str {
     match error {
         SaveError::RevisionConflict { current } => {
             *settings = *current;
@@ -2322,12 +2803,7 @@ fn handle_plain_save_error(
                 snapshot.settings = current;
                 snapshot.persistence = PersistenceState::NotCommitted;
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed("revision_conflict"),
-                LoginState::Idle,
-            );
+            "revision_conflict"
         }
         SaveError::PendingCredentialJournal => {
             let current = settings_store.load().ok();
@@ -2339,12 +2815,7 @@ fn handle_plain_save_error(
                 snapshot.recovery_required = true;
                 snapshot.persistence = PersistenceState::RecoveryRequired;
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed("recovery_required"),
-                LoginState::Idle,
-            );
+            "recovery_required"
         }
         SaveError::PersistedDurabilityUnconfirmed(_) => {
             if let Ok(current) = settings_store.load() {
@@ -2356,46 +2827,26 @@ fn handle_plain_save_error(
                 snapshot.recovery_required = true;
                 snapshot.persistence = PersistenceState::DurabilityUnconfirmed;
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed("durability_unconfirmed"),
-                LoginState::Idle,
-            );
+            "durability_unconfirmed"
         }
         SaveError::CredentialRefMutationRequiresJournal => {
             mutate(shared, |snapshot| {
                 snapshot.persistence = PersistenceState::NotCommitted
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed("credential_transaction_required"),
-                LoginState::Idle,
-            );
+            "credential_transaction_required"
         }
         SaveError::Busy => {
             mutate(shared, |snapshot| {
                 snapshot.persistence = PersistenceState::NotCommitted
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed("busy"),
-                LoginState::Idle,
-            );
+            "busy"
         }
         _ => {
             let _ = paths;
             mutate(shared, |snapshot| {
                 snapshot.persistence = PersistenceState::NotCommitted
             });
-            finish(
-                shared,
-                id,
-                SafeOperationResult::Failed("save_failed"),
-                LoginState::Idle,
-            );
+            "save_failed"
         }
     }
 }
@@ -2485,6 +2936,35 @@ fn finish_persisted_save(
     state: &mut WorkerState,
     settings: &mut AiSettings,
 ) {
+    let result =
+        apply_persisted_save(saved, cleanup_pending, paths, config, shared, state, settings);
+    finish(
+        shared,
+        id,
+        match result {
+            Ok(()) => SafeOperationResult::Succeeded,
+            Err(code) => SafeOperationResult::Failed(code),
+        },
+        LoginState::Idle,
+    );
+    if result.is_ok() && chatgpt_active(settings) {
+        // A saved and applied change re-checks the ChatGPT connection. Ignored
+        // unless the settings screen has been opened.
+        state.prep.request(PreparationTrigger::Applied);
+    }
+}
+
+/// Publishes a committed save and applies it to the running runtime, without
+/// ending the operation. `Err` carries the stable code of the failed apply.
+fn apply_persisted_save(
+    saved: AiSettings,
+    cleanup_pending: bool,
+    paths: &AiPaths,
+    config: &AiServiceConfig,
+    shared: &Arc<SharedServiceState>,
+    state: &mut WorkerState,
+    settings: &mut AiSettings,
+) -> Result<(), &'static str> {
     let previous = settings.clone();
     let runtime_affecting = previous.settings_generation != saved.settings_generation;
     let connection_changed = previous.active_connection != saved.active_connection;
@@ -2507,13 +2987,7 @@ fn finish_persisted_save(
 
     if cleanup_pending {
         stop_runtime_for_recovery(state, paths, shared);
-        finish(
-            shared,
-            id,
-            SafeOperationResult::Failed("cleanup_pending"),
-            LoginState::Idle,
-        );
-        return;
+        return Err("cleanup_pending");
     }
 
     let mut apply_failed = false;
@@ -2564,16 +3038,11 @@ fn finish_persisted_save(
     if let Some(runtime) = state.runtime.as_ref() {
         sync_runtime_snapshot(shared, runtime);
     }
-    finish(
-        shared,
-        id,
-        if apply_failed {
-            SafeOperationResult::Failed("apply_failed")
-        } else {
-            SafeOperationResult::Succeeded
-        },
-        LoginState::Idle,
-    );
+    if apply_failed {
+        Err("apply_failed")
+    } else {
+        Ok(())
+    }
 }
 
 /// Sets the child's proxy plan from the command's network snapshot. Fails
@@ -3389,7 +3858,7 @@ fn drain_runtime_events(
 
 fn finish_login_reconciliation(
     id: OperationId,
-    _settings: &AiSettings,
+    settings: &AiSettings,
     shared: &Arc<SharedServiceState>,
     state: &mut WorkerState,
 ) {
@@ -3426,6 +3895,19 @@ fn finish_login_reconciliation(
                 });
             }
             state.attempt = None;
+            if signed_in && chatgpt_active(settings) {
+                // The account and the catalog were just read above; the
+                // preparation this login triggers continues from them
+                // instead of sending the same requests again.
+                let context = StageContext {
+                    connection: settings.active_connection,
+                    settings_generation: settings.settings_generation,
+                    runtime_generation: runtime.snapshot().generation,
+                    network_revision: state.network.revision,
+                };
+                state.prep.record_login_reconciliation(context, true);
+                state.prep.request(PreparationTrigger::LoginCompleted);
+            }
             finish(
                 shared,
                 id,
@@ -3979,6 +4461,7 @@ mod tests {
             runtime_binary: None,
             runtime_binary_error: None,
             network: NetworkSnapshot::default(),
+            prep: ConnectionPreparation::default(),
         };
 
         reset_early_login_buffer(&mut state);
@@ -4128,6 +4611,7 @@ mod tests {
             runtime_binary: None,
             runtime_binary_error: None,
             network: NetworkSnapshot::default(),
+            prep: ConnectionPreparation::default(),
         };
         let config = AiServiceConfig {
             app_data_root: data_root.clone(),
@@ -4206,6 +4690,7 @@ mod tests {
             runtime_binary: None,
             runtime_binary_error: None,
             network: NetworkSnapshot::default(),
+            prep: ConnectionPreparation::default(),
         };
         let config = AiServiceConfig {
             app_data_root: data_root.clone(),
@@ -4285,6 +4770,7 @@ mod tests {
             runtime_binary: None,
             runtime_binary_error: None,
             network: NetworkSnapshot::default(),
+            prep: ConnectionPreparation::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -4343,6 +4829,7 @@ mod tests {
             runtime_binary: None,
             runtime_binary_error: None,
             network: NetworkSnapshot::default(),
+            prep: ConnectionPreparation::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
@@ -4390,6 +4877,7 @@ mod tests {
             runtime_binary: None,
             runtime_binary_error: None,
             network: NetworkSnapshot::default(),
+            prep: ConnectionPreparation::default(),
         };
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot {
