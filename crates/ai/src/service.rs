@@ -990,6 +990,14 @@ fn handle_command(
                             PersistenceState::Clean
                         };
                     });
+                    if command == AiCommand::PrepareConnection {
+                        // The recovery above is part of this preparation: a
+                        // re-display that arrived meanwhile joins it instead
+                        // of staying behind as a separate pending request.
+                        shared
+                            .deferred_open_settings
+                            .store(false, Ordering::Release);
+                    }
                     if command == AiCommand::PrepareConnection
                         && state.prep.request(PreparationTrigger::OpenSettings)
                             != crate::connection_preparation::Admission::Ignored
@@ -1645,6 +1653,11 @@ fn set_preparation_stage(
     reason: ServiceBusyReason,
 ) {
     publish_busy(shared, id, reason);
+    // From here a re-display joins the running preparation (admission no
+    // longer defers it), so anything deferred in the gap is already covered.
+    shared
+        .deferred_open_settings
+        .store(false, Ordering::Release);
     mutate(shared, |snapshot| {
         snapshot.preparation = PreparationStatus::Running(stage)
     });
@@ -1769,6 +1782,12 @@ fn drive_preparation(
                 if let Some(runtime) = state.runtime.as_ref() {
                     sync_runtime_snapshot(shared, runtime);
                 }
+                // Freshness is checked before anything is published, so a
+                // result read under an older configuration never lands.
+                let after = stage_context(state, settings);
+                if !after.same_configuration(&context) {
+                    return stale;
+                }
                 match result {
                     Ok(account) => mutate(shared, |snapshot| {
                         if snapshot.account != account {
@@ -1779,10 +1798,6 @@ fn drive_preparation(
                         snapshot.account_refresh_failed = false;
                     }),
                     Err(()) => mutate(shared, |snapshot| snapshot.account_refresh_failed = true),
-                }
-                let after = stage_context(state, settings);
-                if !after.same_configuration(&context) {
-                    return stale;
                 }
                 state.prep.record_account_read(after);
             }
@@ -1807,16 +1822,21 @@ fn drive_preparation(
                 if let Some(runtime) = state.runtime.as_ref() {
                     sync_runtime_snapshot(shared, runtime);
                 }
+                let after = stage_context(state, settings);
+                if !after.same_configuration(&context) {
+                    // The result of the older configuration is dropped; the
+                    // list must not stay Loaded (or Loading) for the UI.
+                    mutate(shared, |snapshot| {
+                        snapshot.model_list = ModelListState::NotLoaded
+                    });
+                    return stale;
+                }
                 mutate(shared, |snapshot| {
                     snapshot.model_list = match result {
                         Ok(models) => ModelListState::Loaded(models),
                         Err(error) => ModelListState::Failed(error),
                     }
                 });
-                let after = stage_context(state, settings);
-                if !after.same_configuration(&context) {
-                    return stale;
-                }
                 state.prep.record_models_read(after);
             }
             Step::SaveModel(model) => {
@@ -3904,6 +3924,10 @@ fn finish_login_reconciliation(
         return;
     };
     mutate(shared, |snapshot| snapshot.login = LoginState::Reconciling);
+    // The revision of the runtime these reads go through, taken before the
+    // RPCs: a network setting saved while the login was awaited must not let
+    // an older catalog be carried as the current one.
+    let fetched_revision = runtime.configured_network_revision();
     let account = call_account_read(runtime, false);
     match account {
         Ok(account) => {
@@ -3941,9 +3965,17 @@ fn finish_login_reconciliation(
                     connection: settings.active_connection,
                     settings_generation: settings.settings_generation,
                     runtime_generation: runtime.snapshot().generation,
-                    network_revision: state.network.latest.load(Ordering::Acquire),
+                    network_revision: fetched_revision,
                 };
-                state.prep.record_login_reconciliation(context, true);
+                if fetched_revision == state.network.latest.load(Ordering::Acquire) {
+                    state.prep.record_login_reconciliation(context, true);
+                } else {
+                    // Not current any more: the next preparation reads both
+                    // again, and the stale catalog is not left selectable.
+                    mutate(shared, |snapshot| {
+                        snapshot.model_list = ModelListState::NotLoaded
+                    });
+                }
                 state.prep.request(PreparationTrigger::LoginCompleted);
             }
             finish(
@@ -4593,6 +4625,42 @@ mod tests {
             Err(AdmissionError::Busy)
         );
         assert!(shared.deferred_open_settings.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn preparation_stage_clears_a_re_display_deferred_during_recovery() {
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot::default()),
+            busy: Mutex::new(Some((OperationId(1), ServiceBusyReason::Recovering))),
+            deferred_open_settings: AtomicBool::new(false),
+            next_operation_id: AtomicU64::new(2),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared: shared.clone(),
+        };
+
+        // OpenSettings arrives while PrepareConnection is still recovering.
+        assert_eq!(
+            handle.try_submit(AiCommand::OpenSettings),
+            Err(AdmissionError::Busy)
+        );
+        assert!(shared.deferred_open_settings.load(Ordering::Acquire));
+
+        set_preparation_stage(
+            &shared,
+            OperationId(1),
+            PreparationStage::ReadingAccount,
+            ServiceBusyReason::Preparing,
+        );
+
+        // It joined the preparation: nothing is left to restart it after a cancel.
+        assert!(!shared.deferred_open_settings.load(Ordering::Acquire));
     }
 
     #[test]
