@@ -68,6 +68,9 @@
 //!   placed in `RuntimeConfig::extra_env` actually reaches this child
 //!   process's own environment end-to-end through `AiRuntime`, without
 //!   requiring a real Codex binary or a real HTTP call.
+//! - With a dedicated `CODEX_HOME`, every `account/read`, `model/list` and
+//!   `turn/start` request is appended as `RPC:<method>` to
+//!   `.hane-fake-app-server-rpc-record` there.
 //! - Test-only files in the dedicated `CODEX_HOME` can select
 //!   `hold_login` or `complete_on_cancel` and persist the fake account across
 //!   fake process restarts. They are never read by the shipped runtime.
@@ -221,6 +224,17 @@ fn main() {
             .get("method")
             .and_then(|m| m.as_str())
             .map(|s| s.to_string());
+
+        // Lets a test count the reads and probe turns the service sent, so
+        // "no duplicate request" is asserted on RPCs, not on notifications.
+        if let (Some(home), Some(name)) = (&fake_home, &method)
+            && matches!(name.as_str(), "account/read" | "model/list" | "turn/start")
+        {
+            append_record(
+                &home.join(".hane-fake-app-server-rpc-record").to_string_lossy(),
+                &format!("RPC:{name}"),
+            );
+        }
 
         match (id, method) {
             (Some(id), Some(method)) if method == "initialize" => {

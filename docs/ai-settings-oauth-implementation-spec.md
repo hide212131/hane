@@ -14,7 +14,9 @@
 
 既存の全画面設定にAI設定を追加し、ChatGPT/Codexへのログイン、Custom Providerとの明示的切替、モデル選択、固定入力の応答確認を提供する。ChatGPT接続1件とCustom接続1件を保持し、稼働するApp Serverは1つだけとする。
 
-保存は推論を実行しない。ログイン・モデル一覧取得も接続テストの代わりではない。文書本文、選択範囲、編集中ファイルのパスを接続テストへ自動添付しない。
+保存処理自体は推論を実行しない。ログイン・モデル一覧取得も接続テストの代わりではない。文書本文、選択範囲、編集中ファイルのパスを接続テストへ自動添付しない。
+
+ただし、設定画面を開く・ログインを完了する・モデル選択を確定する・変更を適用する・失敗から再試行するという利用者の文脈では、サービスが**別段階として**接続準備（§3.1）を自動で進め、最後に固定入力の応答確認を1回開始する（Issue #724 P1、ChatGPT接続のみ）。保存の完了が推論を開始するのではなく、保存後にサービスが段階を連結する。アプリ起動、通常の文書編集、未確定の入力からは開始しない。
 
 対象外はチャット画面、文書編集エージェント、履歴管理、任意プロンプト、shell/MCP/Skills/Pluginsの利用、プロバイダーの自動fallback、複数接続の同時実行。配布物への同梱・署名・インストーラーの完成は後続#380で扱う。ただし、本Issueの実機検証には製品と同じstandalone実行形式を使う。
 
@@ -42,16 +44,29 @@
 | 変更を破棄 | draftを保存済みsnapshotに戻す。OAuthを取り消さず、ログアウトもしない |
 | ログイン | **保存済みのアクティブChatGPT接続**に対して実行する |
 | ログイン取消 | 対象attemptの取消を要求し、account/readで実状態を確認する。ログアウトとは別操作 |
-| 状態を更新 | account/readを実行する。必要に応じたtoken更新はApp Serverに委ねる |
-| モデル一覧を更新 | ChatGPT接続のmodel/list。選択・保存・推論を自動実行しない |
-| ログアウト | ChatGPT用App Serverのaccount/logoutのみ。Custom keyや一般のCodex CLI資格情報に触れない |
-| 接続・応答を確認 | 保存済みの接続・モデル・資格情報で固定入力を1回実行する。課金/利用枠消費の可能性を表示する |
-| ランタイムを再起動 | 保存済み設定を再適用する。ログイン/テストの自動再実行はしない |
+| 状態の取得（ChatGPT） | account/readを接続準備が自動で実行する。通常画面に「状態を更新」ボタンは置かない。取得失敗時だけ文脈に沿った「再試行」を出す |
+| モデル一覧の取得（ChatGPT） | model/listを接続準備が自動で実行する。通常画面に「モデル一覧を更新」ボタンは置かない。取得失敗時は「再試行」で再取得する |
+| ログアウト | ChatGPT用App Serverのaccount/logoutのみ。Custom keyや一般のCodex CLI資格情報に触れない。自動の再ログインはしない |
+| 接続・応答を確認 | ChatGPT接続は§3.1の接続準備が保存済みの接続・モデルで固定入力を1回自動実行する（手動の「応答を確認」ボタンは置かない）。Custom接続は従来どおり利用者の明示操作で1回実行する。いずれも課金/利用枠消費の可能性を表示する |
+| ランタイムを再起動 | 保存済み設定を再適用する。成功後、ChatGPT接続は接続準備を再開する（画面を開いた後に限る） |
+| 接続準備の再試行 | 失敗段階から再開し、同じ接続条件で抑止されている失敗probeの自動再試行禁止を解除して1回実行する |
 | 復旧を再試行 | 所有権と排他ロックの下でjournal/耐久性確認を再実行し、最新状態を読み直す |
 
 未保存のAI変更がある間、新しいログイン・ログアウト・モデル取得・接続確認・再起動を無効にして「先に保存または変更を破棄してください」と表示する。ただし進行中のログイン/接続確認の**取消は常に可能**にする。
 
 プロバイダー切替は選択直後ではなく保存時に確定する。切替時に他方の設定・key・ChatGPTセッションを削除しない。アクティブでないChatGPTのログイン状態を調べるためだけに別のApp Serverを起動しない。
+
+### 3.1 接続準備（ChatGPT、Issue #724 P1）
+
+`AiService`のworkerが接続準備の進行を所有する。純粋な遷移判断は`crates/ai/src/connection_preparation.rs`に置き、通信・保存・probeは既存の経路を使う。別のruntimeや汎用workflow基盤は追加しない。
+
+- 起点: AI設定を開く（`AiCommand::PrepareConnection`）、ログイン完了、モデル選択の確定・設定の適用（保存成功）・適用再試行の成功、明示的な再試行（`AiCommand::RetryPreparation`）。描画やsnapshot受信では開始しない。設定画面を一度も開いていないプロセスでは、ログインや保存だけでは開始しない。
+- 段階: account/read → model/list → モデル決定（必要なら既存の保存経路で永続化）→ 固定入力のprobe。段階は同一のbusy操作内で進み、既存コマンドを再投入しない。重複した起点は実行中・保留中の準備へ合流し、保留は最新の一件だけ。他のAI操作がbusyなら終了後に前提を再確認して開始する。
+- ログイン完了時は、`finish_login_reconciliation`が取得したaccount/readとmodel/listの結果を引き継ぎ、同じ取得を直後に再送しない。
+- 設定・世代・network revisionが段階の途中で変わった場合、その段階の結果は採用しない。モデル保存でruntimeが再構成された場合は、新しい条件でaccountとモデル一覧を確認してからprobeへ進む。
+- 失敗した段階では後続へ進まず、同じ実行内で再試行しない。理由（`PreparationFailure`）と、原因に対応する主要操作を一つ表示する。生のproviderエラー、key、token、認証URLは表示・記録しない。別接続へ自動fallbackしない。
+- 準備中も取消（`ServiceBusyReason::Preparing`/`Probe`）と画面離脱を可能にする。画面を閉じても開始済みの準備は継続し、再表示で二重起動しない。取消は後続段階の開始を止めるだけで、保存済みの設定やログインを巻き戻さない。
+- Custom接続の自動準備・未登録キーの入力改善・runtime初回導入の統合は本フェーズの対象外（P2）。
 
 ## 4. 所有者と責務
 
@@ -221,7 +236,7 @@ OAuth client、callback HTTP server、token交換、refresh token管理は**App 
 6. 該当loginIdの`account/login/completed`を受けたらaccount/readで整合確認する。success通知だけでSignedInにしない。
 7. account/readでChatGPT accountが確認できたらSignedIn、auth_epoch更新、モデル一覧を取得する。モデルは自動保存しない。推論はしない。
 
-通常読込はrefreshToken=false相当、明示的な「状態を更新」は同版schemaのrefreshToken=trueを利用する。通信失敗はSignedOutの証拠ではない。最後の既知accountと「状態を確認できません」を分けて表示し、古い状態だけで新しいProbeを許可しない。
+通常読込（接続準備の自動取得を含む）はrefreshToken=false相当とする。通常画面から手動の「状態を更新」は削除した（§3.1）。通信失敗はSignedOutの証拠ではない。最後の既知accountと「状態を確認できません」を分けて表示し、古い状態だけで新しいProbeを許可しない。
 
 ### 9.2 競合・取消・期限
 
@@ -246,9 +261,11 @@ account/updatedはaccount/readを促す契機にし、並行readを多重起動�
 
 ChatGPTはmodel/listをcursorが無くなるまで取得する。同版schemaのcursor/limit/includeHiddenを使用し、重複cursor、50ページ超、1000モデル超は明示エラーにする。途中取得を完全一覧と表示しない。hiddenモデルとtext非対応モデルは選択候補から除く。
 
-**Model.idとModel.modelを混同しない。** 推論に渡して保存する値は同版Model.model。表示はdisplayNameとmodel文字列。isDefaultは候補表示に使うだけで、既存保存モデルを黙って変更しない。
+**Model.idとModel.modelを混同しない。** 推論に渡して保存する値は同版Model.model。表示はdisplayNameとmodel文字列。isDefaultは、保存済みモデルが未設定の初回だけ自動選択に使う。既存保存モデルを黙って変更しない。
 
-保存済みモデルが一覧に無い場合は値を保持して「現在の一覧にありません」と表示する。先頭候補への自動置換・自動推論をしない。認証状態が確認済みで、現在の一覧で有効な保存モデルがあることをChatGPT Probeの条件とする。一覧取得失敗時も既存の保存設定は消さない。
+保存済みモデルが一覧に無い場合は値を保持して「現在の一覧にありません」と表示し、モデル変更の操作を案内して停止する。先頭候補への自動置換・自動推論をしない。認証状態が確認済みで、現在の一覧で有効な保存モデルがあることをChatGPT Probeの条件とする。一覧取得失敗時も既存の保存設定は消さない。
+
+自動選択（接続準備）の優先順位は「利用者が確定した選択 ＞ 一覧に存在する保存済みモデル ＞ `isDefault`の最初の候補 ＞ 全ページ取得後の先頭候補」。自動選択できるのは保存済みモデルが未設定の場合だけで、結果は既存の保存経路（`expected_revision`・所有権・journal・耐久性確認）で永続化し、保存ボタンを要求しない。候補は§10冒頭の条件を通った全ページ分で、UIの表示件数制限は使わない。候補が空・取得失敗のときは自動保存もprobeもしない。
 
 Customは必須model IDを手入力する。汎用`/models`探索やChatGPT model/listでの検証は行わない。入力は前後空白を除いた非空の単一行で制御文字を拒否し、大文字小文字やprovider固有の区切り文字を勝手に変換しない。
 
@@ -296,6 +313,8 @@ Probe全体の期限は90秒。ユーザー取消/期限切れ時、turnIdが既
 
 直近結果はメモリ内で接続ごとに保持してよい。ただし(settings_generation, runtime_generation, auth_epoch, model, probe_profile_version)を紐付け、変化後はStale/未確認にする。response本文のログ記録・テスト履歴の永続化は本Issueでは追加しない。
 
+接続準備（§3.1）が実行するprobeの成功は、(接続, settings_generation, runtime_generation, auth_epoch, model, probe_profile_version, network_revision)をキーにサービスのメモリ内で10分間再利用する。同じキーでの再表示では送信しない。10分は通信量と鮮度の初期値であり、時間経過だけで実行するタイマーは設けない。失敗・取消・timeoutの後は、同じ接続条件（接続・settings_generation・model・network_revision）では再表示、通知、runtime再生成だけでは自動再試行しない。明示的な再試行、再ログイン、モデル・接続先などの実質変更で再開する。成功時刻・抑止情報はアプリ再起動で失われ、永続化しない。
+
 ## 12. 安全プロファイルと最初の契約検証
 
 ### 12.1 必須の実行境界
@@ -332,9 +351,9 @@ AIページは上から次の構成とする。
 | --- | --- |
 | Runtime | 同梱版、Stopped/Ready/Failed、適用状態、再起動、非owner説明/再試行 |
 | 使用する接続 | ChatGPT/Codex / Custom選択。保存済み接続とdraftが異なるときは明示 |
-| ChatGPT | account状態、APIが返すアカウント表示、login/cancel/refresh/logout、モデル選択/更新 |
+| ChatGPT | account状態、APIが返すアカウント表示、login/cancel/logout、モデル変更（状態取得・モデル一覧取得は自動。手動のrefreshボタンなし） |
 | Custom | name、Base URL、model ID、key登録状態、変更/削除。秘密値のreadbackなし |
-| 接続・応答確認 | 課金/利用枠の注意、実行/取消、最終結果・時刻・Stale表示、短いplain text応答 |
+| 接続・応答確認 | 課金/利用枠の注意、結果・Stale表示、短いplain text応答。ChatGPTは自動実行のため「接続状態」として進捗・取消・失敗時の再試行のみ、Customは実行/取消 |
 | 保存操作 | 保存/変更を破棄、未保存表示。保存済みと適用失敗/cleanup_pendingを別メッセージで表示 |
 
 フォームはロード中も突然消さず、操作可否と状態表示を更新する。snapshot更新のたびにInput entityを作り直さず、IME compositionとカーソルを維持する。タブ順は表示順、masked keyにaccessible label、各エラーは対応項目へ紐付ける。
@@ -422,7 +441,8 @@ P0と推論を含まないP1/P2の実装は独立に進められるが、P3の�
 | T21 | Probe取消/timeout/停止失敗 | ACKでguardを解放しない。停止未確認は隔離 |
 | T22 | owner競合/owner終了/世代不一致 | 非owner即時失敗、明示再操作で最新設定によるtakeover |
 | T23 | 401/403/429/timeout/不正RPC | 安全な分類、secret露出なし、別providerへのfallbackなし |
-| T24 | AI画面各操作/dirty離脱 | draftと保存済みを区別。Saveで推論しない。秘密欄を再表示しない |
+| T24 | AI画面各操作/dirty離脱 | draftと保存済みを区別。保存処理自体は推論しない（ChatGPTの接続準備は保存後にサービスが別段階として開始）。秘密欄を再表示しない。ChatGPT節に状態更新・モデル一覧更新・応答確認の各ボタンがない |
+| T32 | 接続準備（ChatGPT、Issue #724 P1） | 開く・ログイン完了・選択確定・適用・再試行から自動で進み、重複起点は合流。ログイン完了後に同じ取得を再送しない。初回モデルを自動保存。失敗段階で停止し後続・再実行なし。成功probeは10分再利用、失敗後は再表示で再送しない。閉じて再表示しても二重起動しない |
 | T25 | 日本語IME/Escape/Tab/Cmd+S | 入力先だけへ作用し背後Editorへ漏れない |
 | T26 | settings中外部open/非同期更新/戻る | focus漏れ・古いDocumentSessionへの巻戻しなし |
 | T27 | dirty/undo/selection/scroll比較 | AI操作前後で無関係なEditor状態が不変 |
