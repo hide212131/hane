@@ -953,6 +953,9 @@ impl EditorView {
             Ok(()) => {
                 self.settings_store_error = None;
                 self.restart_message = None;
+                // The service forgets what it counted as shown; the view must
+                // report the next display again so its suppression is saved.
+                self.app_update_prompt_reported.borrow_mut().take();
                 if let Some(controller) = self.app_update.as_ref() {
                     controller.set_auto_check(enabled);
                 }
@@ -2465,6 +2468,42 @@ mod tests {
             view.read_with(cx, |view, _| view.restart_in_progress),
             "the button of the current candidate goes through the normal restart path"
         );
+    }
+
+    #[gpui::test]
+    fn saving_the_auto_check_setting_makes_the_next_display_report_again(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let controller = FakeController::new(promptable(AppUpdatePhase::Ready));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(controller.calls(), vec!["shown:cand".to_owned()]);
+
+        // Disable and re-enable in the settings screen, then close it: the
+        // service forgot the earlier display, so the view reports this one.
+        view.update(cx, |view, cx| {
+            view.settings_open = true;
+            view.set_auto_update_check(false, cx);
+            view.set_auto_update_check(true, cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.settings_open = false;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let shown = controller
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "shown:cand")
+            .count();
+        assert_eq!(shown, 2, "the new display is reported: {:?}", controller.calls());
     }
 
     #[gpui::test]

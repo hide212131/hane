@@ -1389,18 +1389,26 @@ impl Inner {
     // ----------------------------------------------------------- cancel
 
     fn cancel_running(&self) {
-        let mut state = self.lock();
-        match &state.stage {
-            Stage::Checking { cancel, .. } => {
-                cancel.cancel();
-                state.stage = Stage::Idle;
+        let cancelled = {
+            let mut state = self.lock();
+            match &state.stage {
+                Stage::Checking { cancel, .. } => {
+                    cancel.cancel();
+                    state.stage = Stage::Idle;
+                    true
+                }
+                Stage::Downloading { cancel, offer, .. } => {
+                    cancel.cancel();
+                    let offer = Arc::clone(offer);
+                    state.stage = Stage::Available(offer);
+                    true
+                }
+                _ => false,
             }
-            Stage::Downloading { cancel, offer, .. } => {
-                cancel.cancel();
-                let offer = Arc::clone(offer);
-                state.stage = Stage::Available(offer);
-            }
-            _ => {}
+        };
+        if cancelled {
+            // A manual cancel is not resumed by an overdue automatic check.
+            self.note_attempt();
         }
     }
 
@@ -1450,6 +1458,9 @@ impl Inner {
             .and_then(|()| create_private_dir(&self.trash_dir()))
             .and_then(|()| fs::rename(dir, &trash));
         if moved.is_ok() {
+            // An explicit discard is not undone by an overdue automatic check:
+            // the next one is a full interval away.
+            self.note_attempt();
             // The candidate directory is out of the way; only now may another
             // process publish the same CandidateId.
             *self
@@ -2905,6 +2916,34 @@ mod tests {
         assert!(candidates.read_dir().unwrap().next().is_none());
         let trash = fixture.service.inner.trash_dir();
         assert!(!trash.exists() || trash.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn discard_waits_for_the_next_interval_before_checking_again() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        fixture.auto_tick_after(31_000);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+
+        // The check is long overdue when the user discards the Ready update.
+        fixture.clock.advance(7 * HOURS_MS);
+        fixture.service.discard_ready();
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+
+        // Neither a check nor a re-download starts until a full interval passed.
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.auto_tick_after(0);
+        assert!(fixture.queue.lock().unwrap().is_empty());
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+        fixture.auto_tick_after(auto_update::CHECK_INTERVAL_SECS as u64 * 1000 - 1);
+        assert!(fixture.queue.lock().unwrap().is_empty());
+        fixture.auto_tick_after(1);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Checking);
     }
 
     #[test]

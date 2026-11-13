@@ -2600,7 +2600,10 @@ impl EditorView {
 
     fn store_settings(&mut self) {
         match self.stores.settings().store(&self.settings) {
-            Ok(()) => self.settings_store_error = None,
+            Ok(()) => {
+                self.settings_store_error = None;
+                self.app_update_prompt_reported.borrow_mut().take();
+            }
             Err(error) => {
                 self.settings_store_error = Some(error.to_string());
                 self.status = Some(format!("Settings failed: {error}"));
