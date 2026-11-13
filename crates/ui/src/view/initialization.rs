@@ -148,6 +148,7 @@ impl EditorView {
             app_update_polling: false,
             app_update_restart_focus: cx.focus_handle(),
             app_update_later_focus: cx.focus_handle(),
+            app_update_prompt_reported: std::cell::RefCell::new(None),
             restart_freeze: false,
             external_open_generation: 0,
             external_open_inbox: None,

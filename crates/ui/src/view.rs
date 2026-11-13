@@ -833,6 +833,10 @@ pub struct EditorView {
     /// tracked by the buttons; showing the prompt never focuses them.
     app_update_restart_focus: gpui::FocusHandle,
     app_update_later_focus: gpui::FocusHandle,
+    /// The candidate whose prompt display was already reported to the
+    /// controller, so repeated renders notify it at most once. Cleared while
+    /// no prompt is drawn.
+    app_update_prompt_reported: std::cell::RefCell<Option<String>>,
     /// Held only for the synchronous restart check; while set, the shared
     /// external-open entrance answers `Busy`.
     restart_freeze: bool,

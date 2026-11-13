@@ -1018,8 +1018,16 @@ impl EditorView {
             return None;
         }
         let controller = self.app_update.as_ref()?;
-        let model = prompt_model(&controller.snapshot())?;
-        controller.prompt_shown(&model.candidate_id);
+        let Some(model) = prompt_model(&controller.snapshot()) else {
+            self.app_update_prompt_reported.borrow_mut().take();
+            return None;
+        };
+        let mut reported = self.app_update_prompt_reported.borrow_mut();
+        if reported.as_deref() != Some(model.candidate_id.as_str()) {
+            controller.prompt_shown(&model.candidate_id);
+            *reported = Some(model.candidate_id.clone());
+        }
+        drop(reported);
         let border = rgb(self.theme.sidebar_active_background);
         let restart_id = model.candidate_id.clone();
         let later_id = model.candidate_id;
@@ -2473,10 +2481,10 @@ mod tests {
         cx.run_until_parked();
         assert!(cx.debug_bounds("app-update-prompt").is_some());
         assert!(cx.update(|window, _| handle.is_focused(window)));
-        assert!(
-            controller.calls().is_empty(),
-            "showing the prompt starts nothing: {:?}",
-            controller.calls()
+        assert_eq!(
+            controller.calls(),
+            vec!["shown:cand".to_owned()],
+            "showing the prompt only records the display, once, and starts no work"
         );
     }
 
@@ -2505,7 +2513,11 @@ mod tests {
         cx.simulate_keystrokes("space");
         assert_eq!(
             controller.calls(),
-            vec!["snooze:cand".to_owned(), "snooze:cand".to_owned()]
+            vec![
+                "shown:cand".to_owned(),
+                "snooze:cand".to_owned(),
+                "snooze:cand".to_owned()
+            ]
         );
         let clicked = cx
             .debug_bounds("app-update-prompt-later")
