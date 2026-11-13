@@ -24,6 +24,10 @@ const FOOTER_NARROW_MIN_WIDTH: f32 = 280.0;
 const FOOTER_FULL_FIXED_WIDTH: f32 = 380.0;
 const FOOTER_COMPACT_FIXED_WIDTH: f32 = 340.0;
 const FOOTER_COUNT_CHAR_WIDTH: f32 = 12.0;
+/// Width the dedicated update button needs with its long label (Full /
+/// Compact) and with its short label (Narrow / Single).
+const FOOTER_UPDATE_WIDE_WIDTH: f32 = 130.0;
+const FOOTER_UPDATE_SHORT_WIDTH: f32 = 70.0;
 
 /// Zoom levels the footer menu offers. The wheel and pinch keep their own
 /// continuous range; this is only a shortcut list.
@@ -160,19 +164,35 @@ pub(super) enum FooterLayout {
 
 /// Chooses the layout for the editor column's width. A count text longer than
 /// the layout can hold steps the layout down rather than being cut off.
+#[cfg(test)]
 pub(super) fn footer_layout_for_width(
     width: f32,
     full_count_chars: usize,
     compact_count_chars: usize,
 ) -> FooterLayout {
-    let full_needed = FOOTER_FULL_FIXED_WIDTH + FOOTER_COUNT_CHAR_WIDTH * full_count_chars as f32;
+    footer_layout_with_update(width, full_count_chars, compact_count_chars, false)
+}
+
+/// [`footer_layout_for_width`] that also keeps room for the dedicated update
+/// button (its long label in Full / Compact, a short one in Narrow). The
+/// button's width is part of every threshold, so it is never cut off.
+pub(super) fn footer_layout_with_update(
+    width: f32,
+    full_count_chars: usize,
+    compact_count_chars: usize,
+    update_entry: bool,
+) -> FooterLayout {
+    let wide_extra = if update_entry { FOOTER_UPDATE_WIDE_WIDTH } else { 0.0 };
+    let narrow_extra = if update_entry { FOOTER_UPDATE_SHORT_WIDTH } else { 0.0 };
+    let full_needed =
+        FOOTER_FULL_FIXED_WIDTH + FOOTER_COUNT_CHAR_WIDTH * full_count_chars as f32 + wide_extra;
     let compact_needed =
-        FOOTER_COMPACT_FIXED_WIDTH + FOOTER_COUNT_CHAR_WIDTH * compact_count_chars as f32;
-    if width >= FOOTER_FULL_MIN_WIDTH && width >= full_needed {
+        FOOTER_COMPACT_FIXED_WIDTH + FOOTER_COUNT_CHAR_WIDTH * compact_count_chars as f32 + wide_extra;
+    if width >= FOOTER_FULL_MIN_WIDTH + wide_extra && width >= full_needed {
         FooterLayout::Full
-    } else if width >= FOOTER_COMPACT_MIN_WIDTH && width >= compact_needed {
+    } else if width >= FOOTER_COMPACT_MIN_WIDTH + wide_extra && width >= compact_needed {
         FooterLayout::Compact
-    } else if width >= FOOTER_NARROW_MIN_WIDTH {
+    } else if width >= FOOTER_NARROW_MIN_WIDTH + narrow_extra {
         FooterLayout::Narrow
     } else {
         FooterLayout::Single
@@ -542,10 +562,16 @@ impl EditorView {
             Some(selected) => format!("選択{}文字", format_count(selected)),
             None => format!("{}文字", format_count(total)),
         };
-        let layout = footer_layout_for_width(
+        let update_entry = self.update_entry_state();
+        let update_version = self
+            .app_update
+            .as_ref()
+            .and_then(|controller| controller.snapshot().candidate_version);
+        let layout = footer_layout_with_update(
             column_width,
             full_count.chars().count(),
             compact_count.chars().count(),
+            update_entry.is_some(),
         );
 
         let short = !matches!(layout, FooterLayout::Full | FooterLayout::Compact);
@@ -595,7 +621,11 @@ impl EditorView {
             left.push(
                 div()
                     .debug_selector(|| "footer-single-entry".to_owned())
-                    .flex_none()
+                    // The entry gives way before the update button does, so
+                    // the button stays whole and operable at a narrow width.
+                    .flex_shrink(1.0)
+                    .min_w(px(0.0))
+                    .overflow_hidden()
                     .child(
                         Button::new("footer-single-entry-button")
                             .label(format!("{warning_mark}{} · 状態と操作", display.label(true)))
@@ -763,6 +793,35 @@ impl EditorView {
             }
         }
 
+        // The dedicated update entry (Issue #649). It only opens the shared
+        // update panel; the save state and warnings stay at the left. It is
+        // reachable by keyboard like the other footer buttons, and is inert
+        // while a composition is unconfirmed.
+        if let Some(entry) = update_entry {
+            let update_view = view.clone();
+            let button = div()
+                .debug_selector(|| "footer-update".to_owned())
+                .flex_none()
+                .child(
+                    Button::new("footer-update-button")
+                        .label(entry.label(short))
+                        .xsmall()
+                        .ghost()
+                        .tooltip(entry.tooltip(update_version.as_deref()))
+                        .disabled(ime_active)
+                        .on_click(move |_, _window, app| {
+                            update_view.update(app, |view, cx| view.toggle_update_panel(cx));
+                        }),
+                )
+                .into_any_element();
+            if layout == FooterLayout::Single {
+                // Keeps its own width (`flex_none`); the entry before it shrinks.
+                left.push(button);
+            } else {
+                right.insert(0, button);
+            }
+        }
+
         // The most recent operation message fits the row only when there is
         // room; its full text is always in the details menu.
         let middle = match (&notice, layout) {
@@ -901,6 +960,26 @@ mod tests {
         // A very long count steps the layout down instead of being cut off.
         assert_eq!(footer_layout_for_width(700.0, 40, 12), FooterLayout::Compact);
         assert_eq!(footer_layout_for_width(500.0, 40, 40), FooterLayout::Narrow);
+    }
+
+    #[test]
+    fn the_update_button_keeps_its_width_in_every_threshold() {
+        // Without an update entry the layout is exactly as before.
+        for width in [740.0, 640.0, 639.0, 440.0, 439.0, 280.0, 279.0] {
+            assert_eq!(
+                footer_layout_with_update(width, 7, 7, false),
+                footer_layout_for_width(width, 7, 7)
+            );
+        }
+        // With one, each layout needs the button's room before it is chosen.
+        assert_eq!(footer_layout_with_update(770.0, 7, 7, true), FooterLayout::Full);
+        assert_eq!(footer_layout_with_update(769.0, 7, 7, true), FooterLayout::Compact);
+        assert_eq!(footer_layout_with_update(640.0, 7, 7, true), FooterLayout::Compact);
+        assert_eq!(footer_layout_with_update(440.0, 7, 7, true), FooterLayout::Narrow);
+        assert_eq!(footer_layout_with_update(280.0, 7, 7, true), FooterLayout::Single);
+        assert_eq!(footer_layout_with_update(350.0, 7, 7, true), FooterLayout::Narrow);
+        // A long count still steps down instead of squeezing the button.
+        assert_eq!(footer_layout_with_update(800.0, 40, 12, true), FooterLayout::Compact);
     }
 
     fn open_view<'a>(
