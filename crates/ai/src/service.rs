@@ -4455,7 +4455,7 @@ mod tests {
 
     #[test]
     fn preparation_context_uses_the_latest_network_revision() {
-        let mut state = WorkerState {
+        let state = WorkerState {
             runtime: None,
             runtime_events: None,
             owner_guard: None,
@@ -4477,9 +4477,11 @@ mod tests {
 
     #[test]
     fn not_committed_persistence_can_retry_preparation_but_recovery_cannot() {
-        let mut snapshot = AiSnapshot::default();
-        snapshot.ownership = OwnershipState::Owned;
-        snapshot.persistence = PersistenceState::NotCommitted;
+        let mut snapshot = AiSnapshot {
+            ownership: OwnershipState::Owned,
+            persistence: PersistenceState::NotCommitted,
+            ..Default::default()
+        };
         assert!(preparation_ready(&snapshot));
 
         snapshot.recovery_required = true;
