@@ -470,8 +470,10 @@ mod tests {
         let scroll = view.read_with(cx, |view, _| view.scroll_y);
         assert!(scroll > 0.0, "the caret at the top is off screen");
 
+        let row_selector: &'static str =
+            Box::leak(format!("row-{task_line}-0").into_boxed_str());
         let row = cx
-            .debug_bounds(&format!("row-{task_line}-0"))
+            .debug_bounds(row_selector)
             .expect("the task row is painted");
         let (glyph_x, _) = drawn_checkbox_x(&view, cx, task_line);
         click(cx, glyph_x, row.center().y);
