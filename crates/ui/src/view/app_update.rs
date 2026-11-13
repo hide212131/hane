@@ -2332,6 +2332,16 @@ mod tests {
                 .unwrap()
                 .push(format!("snooze:{candidate_id}"));
         }
+        fn prepare_restart(
+            &self,
+            candidate_id: &str,
+        ) -> Result<Box<dyn PreparedUpdate>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("prepare:{candidate_id}"));
+            Err("prepare refused by the test controller".to_owned())
+        }
     }
 
     fn open_general_settings(
@@ -2500,7 +2510,15 @@ mod tests {
         // Space on "再起動して更新" takes the normal restart path.
         cx.update(|window, app| window.focus(&restart, app));
         cx.simulate_keystrokes("space");
-        assert!(view.read_with(cx, |view, _| view.restart_in_progress));
+        // The preparation finishes asynchronously, so assert the recorded call
+        // rather than the transient in-progress flag.
+        cx.run_until_parked();
+        let prepares = controller
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "prepare:cand")
+            .count();
+        assert_eq!(prepares, 1, "Space starts exactly one restart preparation");
     }
 
     #[gpui::test]
