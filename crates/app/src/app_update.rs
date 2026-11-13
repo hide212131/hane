@@ -1793,7 +1793,7 @@ impl Inner {
     }
 
     fn snapshot(&self) -> AppUpdateSnapshot {
-        let mut state = self.lock();
+        let state = self.lock();
         let mut snapshot = AppUpdateSnapshot::idle(self.config.current_version.clone());
         snapshot.restoring = state.restoring;
         snapshot.restart_supported = self.restart_supported();
