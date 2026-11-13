@@ -276,7 +276,12 @@ impl ConnectionPreparation {
                 self.success = None;
                 self.failure = None;
             }
-            PreparationTrigger::Applied => self.failure = None,
+            // An Applied trigger is allowed to continue a preparation after a
+            // material settings change, but it must not by itself lift probe
+            // failure suppression. `next_step` compares the current probe key
+            // with the failed key and naturally retries only when a probe
+            // condition changed.
+            PreparationTrigger::Applied => {}
             PreparationTrigger::OpenSettings => {}
         }
         if trigger == PreparationTrigger::LoginCompleted
@@ -459,6 +464,14 @@ mod tests {
             Step::Skip,
             "only the active ChatGPT connection is prepared"
         );
+        prep.finish_run();
+        assert_eq!(
+            prep.request(PreparationTrigger::Applied),
+            Admission::Started,
+            "opening Custom settings arms later ChatGPT saves"
+        );
+        assert_eq!(prep.begin(), Some(PreparationTrigger::Applied));
+        assert_eq!(prep.next_step(&chatgpt, now), Step::ReadAccount);
     }
 
     #[test]
@@ -523,6 +536,19 @@ mod tests {
             failed.next_step(&facts(context, ModelsFact::Failed, None), now),
             Step::Stop(PreparationFailure::ModelListFailed),
             "a failed catalog read is reported, not re-sent"
+        );
+
+        let mut account_only = ConnectionPreparation::default();
+        account_only.request(PreparationTrigger::OpenSettings);
+        account_only.begin();
+        account_only.finish_run();
+        account_only.record_login_reconciliation(context, false);
+        account_only.request(PreparationTrigger::LoginCompleted);
+        account_only.begin();
+        assert_eq!(
+            account_only.next_step(&facts(context, ModelsFact::Loaded(&models), None), now),
+            Step::ReadModels,
+            "a login that only reconciled account/read must fetch models"
         );
     }
 
@@ -594,6 +620,27 @@ mod tests {
     }
 
     #[test]
+    fn a_not_committed_model_save_can_be_retried() {
+        let now = Instant::now();
+        let context = context(ActiveConnection::ChatGpt);
+        let models = [model("gpt-a", true)];
+        let mut prep = started(PreparationTrigger::Retry);
+        read_everything(&mut prep, context);
+
+        assert_eq!(
+            prep.next_step(&facts(context, ModelsFact::Loaded(&models), None), now),
+            Step::SaveModel("gpt-a".to_owned())
+        );
+        // The failed I/O save did not call record_model_saved, so the explicit
+        // retry reaches the same save stage instead of being treated as a
+        // completed save or looping into a probe.
+        assert_eq!(
+            prep.next_step(&facts(context, ModelsFact::Loaded(&models), None), now),
+            Step::SaveModel("gpt-a".to_owned())
+        );
+    }
+
+    #[test]
     fn changed_context_rejects_old_stage_results() {
         let now = Instant::now();
         let old = context(ActiveConnection::ChatGpt);
@@ -660,6 +707,16 @@ mod tests {
         let mut prep = started(PreparationTrigger::OpenSettings);
         read_everything(&mut prep, context);
         prep.record_probe(key.clone(), ProbeOutcome::Failed, now);
+        prep.finish_run();
+
+        prep.request(PreparationTrigger::Applied);
+        prep.begin();
+        read_everything(&mut prep, context);
+        assert_eq!(
+            prep.next_step(&same_facts, now),
+            Step::Stop(PreparationFailure::ProbeFailed),
+            "an unchanged Applied save must not retry a failed probe"
+        );
         prep.finish_run();
 
         prep.request(PreparationTrigger::OpenSettings);

@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -257,6 +257,10 @@ pub struct AiServiceHandle {
 struct SharedServiceState {
     snapshot: Mutex<AiSnapshot>,
     busy: Mutex<Option<(OperationId, ServiceBusyReason)>>,
+    /// A settings-open trigger received while another non-preparation
+    /// operation owns the busy gate. The worker consumes this once the gate is
+    /// released, so the trigger is not lost at admission.
+    deferred_open_settings: AtomicBool,
     next_operation_id: AtomicU64,
     subscribers: Mutex<Vec<SyncSender<()>>>,
     available: Mutex<bool>,
@@ -524,8 +528,21 @@ impl AiServiceHandle {
         {
             return Err(AdmissionError::Unavailable);
         }
+        let preparation_running = matches!(
+            self.shared.snapshot.lock().unwrap().preparation,
+            PreparationStatus::Running(_)
+        );
         let mut busy = self.shared.busy.lock().unwrap();
         if busy.is_some() {
+            if is_open_settings {
+                let preparation_busy = matches!(*busy, Some((_, ServiceBusyReason::Preparing)))
+                    || preparation_running;
+                if !preparation_busy {
+                    self.shared
+                        .deferred_open_settings
+                        .store(true, Ordering::Release);
+                }
+            }
             return Err(AdmissionError::Busy);
         }
         let id = OperationId(
@@ -656,6 +673,7 @@ impl AiService {
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot::default()),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -861,6 +879,15 @@ fn service_worker(
         // A trigger that arrived while another operation held the gate (a
         // login that just completed, an applied save) runs as soon as the
         // gate is free. At most one is kept pending.
+        if !shutdown
+            && state.attempt.is_none()
+            && shared.busy.lock().unwrap().is_none()
+            && shared
+                .deferred_open_settings
+                .swap(false, Ordering::AcqRel)
+        {
+            state.prep.request(PreparationTrigger::OpenSettings);
+        }
         if !shutdown && state.attempt.is_none() && state.prep.has_pending() {
             state.network = network_cell.lock().unwrap().clone();
             run_preparation(
@@ -917,6 +944,11 @@ fn handle_command(
         WorkerCommand::Action(
             command @ (AiCommand::OpenSettings | AiCommand::PrepareConnection),
         ) => {
+            if command == AiCommand::PrepareConnection {
+                shared
+                    .deferred_open_settings
+                    .store(false, Ordering::Release);
+            }
             publish_busy(shared, queued.id, ServiceBusyReason::Recovering);
             // `OpenSettings` is the existing recovery entry point users
             // already reach (the settings view's own recover action), so it
@@ -959,7 +991,6 @@ fn handle_command(
                         };
                     });
                     if command == AiCommand::PrepareConnection
-                        && chatgpt_active(settings)
                         && state.prep.request(PreparationTrigger::OpenSettings)
                             != crate::connection_preparation::Admission::Ignored
                     {
@@ -1583,7 +1614,7 @@ fn preparation_ready(snapshot: &AiSnapshot) -> bool {
         && !snapshot.runtime_isolated
         && matches!(
             snapshot.persistence,
-            PersistenceState::Clean | PersistenceState::Saved
+            PersistenceState::Clean | PersistenceState::NotCommitted | PersistenceState::Saved
         )
 }
 
@@ -1595,7 +1626,7 @@ fn stage_context(state: &WorkerState, settings: &AiSettings) -> StageContext {
             .runtime
             .as_ref()
             .map_or(0, |runtime| runtime.snapshot().generation),
-        network_revision: state.network.revision,
+        network_revision: state.network.latest.load(Ordering::Acquire),
     }
 }
 
@@ -3588,6 +3619,13 @@ fn start_login(
                 snapshot.account = account;
                 snapshot.account_refresh_failed = false;
             });
+            if chatgpt_active(settings) {
+                let context = stage_context(state, settings);
+                // This early-return path only reconciles account/read. Do not
+                // mark the model catalog as read; preparation must fetch it.
+                state.prep.record_login_reconciliation(context, false);
+                state.prep.request(PreparationTrigger::LoginCompleted);
+            }
             finish(
                 shared,
                 id,
@@ -4259,6 +4297,7 @@ mod tests {
         Arc::new(SharedServiceState {
             snapshot: Mutex::new(snapshot),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4414,6 +4453,39 @@ mod tests {
         assert!(config.network.is_some());
     }
 
+    #[test]
+    fn preparation_context_uses_the_latest_network_revision() {
+        let mut state = WorkerState {
+            runtime: None,
+            runtime_events: None,
+            owner_guard: None,
+            attempt: None,
+            early_login_events: VecDeque::new(),
+            early_login_bytes: 0,
+            deferred_runtime_events: VecDeque::new(),
+            runtime_binary: None,
+            runtime_binary_error: None,
+            network: NetworkSnapshot::default(),
+            prep: ConnectionPreparation::default(),
+        };
+        state.network.latest.store(3, Ordering::Release);
+
+        let context = stage_context(&state, &AiSettings::default());
+
+        assert_eq!(context.network_revision, 3);
+    }
+
+    #[test]
+    fn not_committed_persistence_can_retry_preparation_but_recovery_cannot() {
+        let mut snapshot = AiSnapshot::default();
+        snapshot.ownership = OwnershipState::Owned;
+        snapshot.persistence = PersistenceState::NotCommitted;
+        assert!(preparation_ready(&snapshot));
+
+        snapshot.recovery_required = true;
+        assert!(!preparation_ready(&snapshot));
+    }
+
     fn test_handle(snapshot: AiSnapshot) -> AiServiceHandle {
         let (command_tx, _command_rx) = mpsc::sync_channel(1);
         let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
@@ -4423,6 +4495,7 @@ mod tests {
             shared: Arc::new(SharedServiceState {
                 snapshot: Mutex::new(snapshot),
                 busy: Mutex::new(None),
+                deferred_open_settings: AtomicBool::new(false),
                 next_operation_id: AtomicU64::new(1),
                 subscribers: Mutex::new(Vec::new()),
                 available: Mutex::new(true),
@@ -4477,6 +4550,7 @@ mod tests {
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(AiSnapshot::default()),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4495,6 +4569,31 @@ mod tests {
     }
 
     #[test]
+    fn busy_open_settings_is_held_as_one_deferred_preparation_trigger() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot::default()),
+            busy: Mutex::new(Some((OperationId(1), ServiceBusyReason::Account))),
+            deferred_open_settings: AtomicBool::new(false),
+            next_operation_id: AtomicU64::new(2),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared: shared.clone(),
+        };
+
+        assert_eq!(
+            handle.try_submit(AiCommand::PrepareConnection),
+            Err(AdmissionError::Busy)
+        );
+        assert!(shared.deferred_open_settings.load(Ordering::Acquire));
+    }
+
+    #[test]
     fn isolated_probe_runtime_admits_only_explicit_stop_recovery() {
         let (command_tx, _command_rx) = mpsc::sync_channel(2);
         let (cancel_tx, _cancel_rx) = mpsc::sync_channel(1);
@@ -4506,6 +4605,7 @@ mod tests {
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(snapshot),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4539,6 +4639,7 @@ mod tests {
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(snapshot),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4564,6 +4665,7 @@ mod tests {
         let shared = Arc::new(SharedServiceState {
             snapshot: Mutex::new(snapshot),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4596,6 +4698,7 @@ mod tests {
                 ..AiSnapshot::default()
             }),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4675,6 +4778,7 @@ mod tests {
                 ..AiSnapshot::default()
             }),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4779,6 +4883,7 @@ mod tests {
                 ..AiSnapshot::default()
             }),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4838,6 +4943,7 @@ mod tests {
                 ..AiSnapshot::default()
             }),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),
@@ -4886,6 +4992,7 @@ mod tests {
                 ..AiSnapshot::default()
             }),
             busy: Mutex::new(None),
+            deferred_open_settings: AtomicBool::new(false),
             next_operation_id: AtomicU64::new(1),
             subscribers: Mutex::new(Vec::new()),
             available: Mutex::new(true),

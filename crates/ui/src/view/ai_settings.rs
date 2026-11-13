@@ -439,7 +439,11 @@ impl AiSettingsPage {
     fn apply_snapshot(&mut self, snapshot: AiSnapshot, cx: &App) {
         self.snapshot = snapshot;
         if let Some((operation, target)) = self.save_then_leave
-            && self.snapshot.busy.is_none()
+            && (self.snapshot.busy.is_none()
+                || matches!(
+                    self.snapshot.preparation,
+                    PreparationStatus::Running(_)
+                ))
             && self
                 .snapshot
                 .last_result
@@ -4368,6 +4372,26 @@ mod tests {
             !page.preparation_retry_visible(),
             "the install section owns a missing runtime"
         );
+    }
+
+    #[gpui::test]
+    fn save_then_leave_routes_before_connection_preparation_finishes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("document body\n", "Untitled", cx));
+        let mut snapshot = AiSnapshot::default();
+        snapshot.busy = Some((OperationId(8), ServiceBusyReason::Probe));
+        snapshot.preparation = PreparationStatus::Running(PreparationStage::Probing);
+        snapshot.last_result = Some((OperationId(7), SafeOperationResult::Succeeded));
+        snapshot.persistence = PersistenceState::Saved;
+
+        view.update(cx, |view, cx| {
+            view.ai_settings.save_then_leave = Some((OperationId(7), LeaveTarget::Close));
+            view.ai_settings.apply_snapshot(snapshot, cx);
+            assert_eq!(view.ai_settings.route_ready, Some(LeaveTarget::Close));
+            assert!(view.ai_settings.save_then_leave.is_none());
+        });
     }
 
     #[gpui::test]
