@@ -2500,7 +2500,7 @@ mod tests {
         run_queued(&restarted.queue);
         assert_eq!(restarted.phase(), AppUpdatePhase::Ready);
         assert_eq!(restarted.prompt(), None);
-        restarted.clock.advance(HOURS_MS);
+        restarted.clock.set_now(test_now() + 3_600);
         assert_eq!(restarted.prompt(), None);
     }
 
@@ -2516,13 +2516,13 @@ mod tests {
         assert_eq!(fixture.prompt(), None);
 
         // A re-validation that succeeds inside the snooze allows nothing.
-        fixture.clock.advance(HOURS_MS);
+        fixture.clock.set_now(test_now() + 3_600);
         assert!(fixture.service.inner.start_revalidate_ready());
         run_queued(&fixture.queue);
         assert_eq!(fixture.prompt(), None);
 
         // The snooze ends, but no re-validation has passed since.
-        fixture.clock.advance(6 * HOURS_MS);
+        fixture.clock.set_now(test_now() + 7 * 3_600);
         assert_eq!(fixture.prompt(), None);
 
         // The first re-validation that passes after the end allows it.
