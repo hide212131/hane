@@ -16,8 +16,9 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::time::Duration;
 
 use hane_ui::{AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, PreparedUpdate};
 use hane_update::archive::{ArchiveLimits, stage_archive};
@@ -35,6 +36,7 @@ use hane_update::version::{VersionRelation, parse_current_version};
 use hane_update::error::io_detail;
 use hane_update::{ErrorCode, UpdateError};
 
+use crate::auto_update::{self, History, Schedule};
 use crate::update_diagnostics::{Diagnostics, Identity, Redactor, short_id};
 use crate::update_restart::{self, HelperHandoff};
 
@@ -125,11 +127,25 @@ impl Offer {
     }
 }
 
+/// Who started a check or download. It is fixed when the operation starts and
+/// read again when it completes, so an automatic operation that a manual check
+/// joined is finished as a manual one.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Origin {
+    Manual,
+    Automatic,
+}
+
+/// How long to wait before trying again when an automatic attempt could not
+/// start (busy, restoring). Nothing is recorded for such a skip.
+const AUTO_RETRY_WAIT: Duration = Duration::from_secs(10);
+
 enum Stage {
     Idle,
     Checking {
         op: u64,
         cancel: CancelToken,
+        origin: Origin,
     },
     UpToDate,
     Available(Arc<Offer>),
@@ -139,6 +155,7 @@ enum Stage {
         cancel: CancelToken,
         received: Arc<AtomicU64>,
         verifying: bool,
+        origin: Origin,
     },
     Ready {
         offer: Arc<Offer>,
@@ -167,6 +184,17 @@ struct State {
     stage: Stage,
     restoring: bool,
     restore_started: bool,
+    /// The Ready candidate was just verified (downloaded, restored or
+    /// re-validated), so a prompt may be shown for it.
+    prompt_validated: bool,
+    /// A re-validation of the Ready candidate failed: no prompt for it.
+    prompt_withdrawn: bool,
+    /// A re-validation of the Ready candidate is running.
+    revalidating: bool,
+    /// The Ready candidate whose prompt has been shown and not yet dismissed.
+    /// Its same-version suppression is already saved, so it stays visible
+    /// without being hidden by that suppression.
+    prompt_shown: Option<String>,
 }
 
 /// Identity of one asynchronous operation. A result is applied only when the
@@ -224,6 +252,13 @@ struct Inner {
     diag: Diagnostics,
     /// Why the default runner could not start its thread, when it could not.
     spawn_error: Arc<Mutex<Option<String>>>,
+    /// The "auto update check" setting as the app applied it. Off until the
+    /// app turns it on, so a service never starts talking on its own.
+    auto_enabled: AtomicBool,
+    /// When the next automatic attempt is due.
+    schedule: Mutex<Schedule>,
+    /// Last automatic attempt and "後で" suppression, kept across restarts.
+    history: History,
 }
 
 fn new_owner_id() -> String {
@@ -379,6 +414,11 @@ impl AppUpdateService {
             },
             Redactor::from_environment(),
         );
+        let history = History::open(&config.updates_root, clock.now_unix());
+        let schedule = Schedule::new(
+            clock.monotonic_ms(),
+            auto_update::initial_delay_secs(history.last_attempt(), clock.now_unix()),
+        );
         Self {
             inner: Arc::new(Inner {
                 config,
@@ -390,6 +430,10 @@ impl AppUpdateService {
                     stage,
                     restoring: false,
                     restore_started: false,
+                    prompt_validated: false,
+                    prompt_withdrawn: false,
+                    revalidating: false,
+                    prompt_shown: None,
                 }),
                 restart: OnceLock::new(),
                 owner,
@@ -397,8 +441,18 @@ impl AppUpdateService {
                 candidate_lease: Mutex::new(None),
                 diag,
                 spawn_error,
+                auto_enabled: AtomicBool::new(false),
+                schedule: Mutex::new(schedule),
+                history,
             }),
         }
+    }
+
+    /// One step of the app-owned automatic update loop. Call it, then wait for
+    /// the returned time before calling it again. It starts nothing unless the
+    /// automatic check is enabled and due, and it never blocks.
+    pub fn automatic_tick(&self) -> Duration {
+        self.inner.automatic_tick()
     }
 
     /// Lets the service hand a Ready update to the helper. Called once at
@@ -597,10 +651,25 @@ impl Inner {
                     }
                     _ => false,
                 };
+                let automatic = matches!(
+                    &state.stage,
+                    Stage::Checking {
+                        origin: Origin::Automatic,
+                        ..
+                    } | Stage::Downloading {
+                        origin: Origin::Automatic,
+                        ..
+                    }
+                );
                 if running {
-                    state.stage = Stage::Failed {
-                        code: ErrorCode::Io,
-                        stage: "start",
+                    state.stage = if automatic {
+                        // Diagnostics only; the manual card shows nothing.
+                        Stage::Idle
+                    } else {
+                        Stage::Failed {
+                            code: ErrorCode::Io,
+                            stage: "start",
+                        }
                     };
                     self.diag.note(
                         "start",
@@ -625,19 +694,25 @@ impl Inner {
 
     // ------------------------------------------------------------ check
 
+    /// A user's check. It joins a running check; if that one was automatic it
+    /// becomes manual, so its result is shown as a manual one and does not
+    /// continue into an automatic download.
     fn start_check(self: &Arc<Self>) {
         let (op, cancel) = {
             let mut state = self.lock();
             if state.restoring {
                 return;
             }
-            match state.stage {
+            match &mut state.stage {
                 Stage::Idle | Stage::UpToDate | Stage::Available(_) | Stage::Failed { .. } => {}
-                // A running operation absorbs repeated clicks; a Ready update
+                Stage::Checking { origin, .. } => {
+                    *origin = Origin::Manual;
+                    return;
+                }
+                // A running download absorbs repeated clicks; a Ready update
                 // is never replaced by a newer check; an unavailable service
                 // has nothing to check.
-                Stage::Checking { .. }
-                | Stage::Downloading { .. }
+                Stage::Downloading { .. }
                 | Stage::Ready { .. }
                 | Stage::Discarding { .. }
                 | Stage::Unavailable { .. } => return,
@@ -648,41 +723,389 @@ impl Inner {
             state.stage = Stage::Checking {
                 op,
                 cancel: cancel.clone(),
+                origin: Origin::Manual,
             };
             (op, cancel)
         };
+        // An accepted manual check counts as the latest attempt, so an
+        // automatic one does not follow right behind it.
+        self.note_attempt();
         let inner = Arc::clone(self);
         self.dispatch(op, Box::new(move || inner.run_check(op, &cancel)));
     }
 
-    fn run_check(&self, op: u64, cancel: &CancelToken) {
-        let result = self.check_latest(cancel);
-        let mut state = self.lock();
-        let expected = Ticket {
-            install: self.config.install_id.clone(),
-            op,
-            candidate: None,
+    /// The check the schedule asks for. It starts only from a quiet state and
+    /// only for a build that can really update; anything else is a skip that
+    /// is not recorded as an attempt. Returns whether a check was started.
+    fn start_automatic_check(self: &Arc<Self>) -> bool {
+        if !self.config.policy.is_configured() || self.config.target.is_none() {
+            return false;
+        }
+        let (op, cancel) = {
+            let mut state = self.lock();
+            // The enabled flag is read under the state lock: a disable that
+            // arrives later cancels what this started.
+            if !self.auto_enabled() || state.restoring || !state.restore_started {
+                return false;
+            }
+            // A manual Available or a Ready update is never taken over.
+            if !matches!(
+                state.stage,
+                Stage::Idle | Stage::UpToDate | Stage::Failed { .. }
+            ) {
+                return false;
+            }
+            state.next_op += 1;
+            let op = state.next_op;
+            let cancel = CancelToken::new();
+            state.stage = Stage::Checking {
+                op,
+                cancel: cancel.clone(),
+                origin: Origin::Automatic,
+            };
+            (op, cancel)
         };
-        if state.ticket(&self.config.install_id) != Some(expected) {
-            // Cancelled or superseded while the request was in flight.
+        self.note_attempt();
+        let inner = Arc::clone(self);
+        self.dispatch(op, Box::new(move || inner.run_check(op, &cancel)));
+        true
+    }
+
+    fn run_check(self: &Arc<Self>, op: u64, cancel: &CancelToken) {
+        let result = self.check_latest(cancel);
+        let mut chain: Option<(u64, Arc<Offer>, CancelToken, Arc<AtomicU64>)> = None;
+        {
+            let mut state = self.lock();
+            let expected = Ticket {
+                install: self.config.install_id.clone(),
+                op,
+                candidate: None,
+            };
+            if state.ticket(&self.config.install_id) != Some(expected) {
+                // Cancelled or superseded while the request was in flight.
+                return;
+            }
+            let origin = match &state.stage {
+                Stage::Checking { origin, .. } => *origin,
+                _ => return,
+            };
+            state.stage = match (result, origin) {
+                (Ok(CheckOutcome::UpToDate), Origin::Manual) => Stage::UpToDate,
+                // An automatic result that finds nothing leaves no message.
+                (Ok(CheckOutcome::UpToDate), Origin::Automatic) => Stage::Idle,
+                (Ok(CheckOutcome::Available(offer)), Origin::Manual) => {
+                    Stage::Available(Arc::from(offer))
+                }
+                (Ok(CheckOutcome::Available(offer)), Origin::Automatic) => {
+                    let offer: Arc<Offer> = Arc::from(offer);
+                    if self.auto_enabled() && offer.candidate.is_applicable() {
+                        // Only the candidate this automatic check found is
+                        // downloaded, in the same step that accepted it.
+                        state.next_op += 1;
+                        let download_op = state.next_op;
+                        let download_cancel = CancelToken::new();
+                        let received = Arc::new(AtomicU64::new(0));
+                        chain = Some((
+                            download_op,
+                            Arc::clone(&offer),
+                            download_cancel.clone(),
+                            Arc::clone(&received),
+                        ));
+                        Stage::Downloading {
+                            op: download_op,
+                            offer,
+                            cancel: download_cancel,
+                            received,
+                            verifying: false,
+                            origin: Origin::Automatic,
+                        }
+                    } else {
+                        Stage::Available(offer)
+                    }
+                }
+                (Err(error), _) if error.code == ErrorCode::Cancelled => Stage::Idle,
+                (Err(error), Origin::Manual) => {
+                    // Only a live operation records, so a late result of a
+                    // cancelled or superseded check never reaches the diagnostics.
+                    self.diag
+                        .note("check", error.code.as_str(), &error.detail, None);
+                    Stage::Failed {
+                        code: error.code,
+                        stage: "check",
+                    }
+                }
+                (Err(error), Origin::Automatic) => {
+                    // Diagnostics only: no manual error text and no "latest".
+                    self.diag
+                        .note("auto_check", error.code.as_str(), &error.detail, None);
+                    Stage::Idle
+                }
+            };
+        }
+        self.diag.flush();
+        if let Some((download_op, offer, download_cancel, received)) = chain {
+            let inner = Arc::clone(self);
+            self.dispatch(
+                download_op,
+                Box::new(move || {
+                    inner.run_download(download_op, &offer, &download_cancel, &received);
+                }),
+            );
+        }
+    }
+
+    // -------------------------------------------------------- automatic
+
+    fn auto_enabled(&self) -> bool {
+        self.auto_enabled.load(Ordering::SeqCst)
+    }
+
+    /// Records an accepted attempt: the next automatic one is one interval
+    /// away and the time survives a restart. A failed write is only a
+    /// diagnostic; this run still waits.
+    fn note_attempt(&self) {
+        self.schedule
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .attempted(self.clock.monotonic_ms());
+        if let Err(error) = self.history.record_attempt(self.clock.now_unix()) {
+            self.diag
+                .record("auto_history", ErrorCode::Io.as_str(), &io_detail(&error), None);
+        }
+    }
+
+    /// Turns the automatic work on or off. Turning it off cancels only a
+    /// running automatic check or download; a manual one, a Ready update and
+    /// the files are left alone. Results that arrive later find no live ticket.
+    fn set_automatic(&self, enabled: bool) {
+        let was = self.auto_enabled.swap(enabled, Ordering::SeqCst);
+        if enabled {
+            if !was {
+                // Same deadline rule as at start; no immediate request.
+                *self
+                    .schedule
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Schedule::new(
+                    self.clock.monotonic_ms(),
+                    auto_update::initial_delay_secs(
+                        self.history.last_attempt(),
+                        self.clock.now_unix(),
+                    ),
+                );
+            }
             return;
         }
-        state.stage = match result {
-            Ok(CheckOutcome::UpToDate) => Stage::UpToDate,
-            Ok(CheckOutcome::Available(offer)) => Stage::Available(Arc::from(offer)),
-            Err(error) if error.code == ErrorCode::Cancelled => Stage::Idle,
-            Err(error) => {
-                // Only a live operation records, so a late result of a
-                // cancelled or superseded check never reaches the diagnostics.
-                self.diag
-                    .note("check", error.code.as_str(), &error.detail, None);
-                Stage::Failed {
-                    code: error.code,
-                    stage: "check",
+        let mut state = self.lock();
+        // The earlier validation and display do not carry over to a later
+        // re-enable: the prompt waits for a new periodic re-validation.
+        state.prompt_validated = false;
+        state.prompt_shown = None;
+        match &state.stage {
+            Stage::Checking {
+                cancel,
+                origin: Origin::Automatic,
+                ..
+            } => {
+                cancel.cancel();
+                state.stage = Stage::Idle;
+            }
+            Stage::Downloading {
+                cancel,
+                offer,
+                origin: Origin::Automatic,
+                ..
+            } => {
+                cancel.cancel();
+                let offer = Arc::clone(offer);
+                state.stage = Stage::Available(offer);
+            }
+            _ => {}
+        }
+    }
+
+    fn automatic_tick(self: &Arc<Self>) -> Duration {
+        if !self.auto_enabled() {
+            return auto_update::MAX_WAIT;
+        }
+        let now_ms = self.clock.monotonic_ms();
+        let (due, wait) = {
+            let schedule = self.schedule.lock().unwrap_or_else(PoisonError::into_inner);
+            (schedule.is_due(now_ms), schedule.wait(now_ms))
+        };
+        if !due {
+            return wait;
+        }
+        let ready = matches!(self.lock().stage, Stage::Ready { .. });
+        let started = if ready {
+            // A held Ready update is never replaced by a newer check: it is
+            // only re-validated, which decides whether it may be offered again.
+            let started = self.start_revalidate_ready();
+            if started {
+                self.note_attempt();
+            }
+            started
+        } else {
+            self.start_automatic_check()
+        };
+        if started {
+            auto_update::MAX_WAIT
+        } else {
+            AUTO_RETRY_WAIT
+        }
+    }
+
+    /// The key a "後で" is recorded under: target and version, not the
+    /// candidate id, so a re-issued catalog of the same version stays hidden.
+    fn prompt_key(&self, offer: &Offer) -> String {
+        let target = self.config.target.map_or("unknown", Target::triple);
+        format!("{target}/{}", offer.candidate.version())
+    }
+
+    fn snooze_prompt(&self, candidate_id: &str) {
+        let mut state = self.lock();
+        let key = match &state.stage {
+            Stage::Ready { offer, .. } if offer.id().as_str() == candidate_id => {
+                self.prompt_key(offer)
+            }
+            _ => return,
+        };
+        // Offered again only after the suppression has ended and a later
+        // re-validation passes.
+        state.prompt_validated = false;
+        state.prompt_shown = None;
+        drop(state);
+        let until = self.clock.now_unix().saturating_add(auto_update::SNOOZE_SECS);
+        if let Err(error) = self.history.snooze(&key, until) {
+            self.diag
+                .record("auto_history", ErrorCode::Io.as_str(), &io_detail(&error), None);
+        }
+    }
+
+    /// Marks the Ready candidate as just verified. A same-version suppression
+    /// that is still running keeps it hidden: only a re-validation that
+    /// succeeds after the suppression ended allows the prompt again. A prompt
+    /// that is on screen stays allowed.
+    fn mark_prompt_validated(&self, state: &mut State, offer: &Offer) {
+        state.prompt_withdrawn = false;
+        let shown = state.prompt_shown.as_deref() == Some(offer.id().as_str());
+        state.prompt_validated = shown
+            || !self
+                .history
+                .snoozed(&self.prompt_key(offer), self.clock.now_unix());
+    }
+
+    /// The Ready candidate the prompt may be shown for now, if any. It has no
+    /// side effect: nothing is saved and nothing counts as shown until the UI
+    /// confirms the band was drawn ([`Inner::confirm_prompt_shown`]).
+    fn prompt_candidate(&self, state: &State) -> Option<String> {
+        let Stage::Ready { offer, .. } = &state.stage else {
+            return None;
+        };
+        let offer = Arc::clone(offer);
+        let id = offer.id().as_str().to_owned();
+        if !self.auto_enabled()
+            || state.restoring
+            || state.revalidating
+            || state.prompt_withdrawn
+            || !self.restart_supported()
+        {
+            return None;
+        }
+        if state.prompt_shown.as_deref() == Some(id.as_str()) {
+            return Some(id);
+        }
+        let key = self.prompt_key(&offer);
+        if !state.prompt_validated || self.history.snoozed(&key, self.clock.now_unix()) {
+            return None;
+        }
+        Some(id)
+    }
+
+    /// The UI drew the prompt band for `candidate_id`. The first time, the
+    /// candidate counts as shown and its suppression (now + 6 hours) is saved
+    /// once, so closing the app without "後で" does not prompt again right
+    /// after the restart. The prompt itself stays visible afterwards.
+    fn confirm_prompt_shown(&self, candidate_id: &str) {
+        let mut state = self.lock();
+        if state.prompt_shown.as_deref() == Some(candidate_id) {
+            return;
+        }
+        if self.prompt_candidate(&state).as_deref() != Some(candidate_id) {
+            return;
+        }
+        let key = match &state.stage {
+            Stage::Ready { offer, .. } => self.prompt_key(offer),
+            _ => return,
+        };
+        state.prompt_shown = Some(candidate_id.to_owned());
+        drop(state);
+        let until = self.clock.now_unix().saturating_add(auto_update::SNOOZE_SECS);
+        if let Err(error) = self.history.snooze(&key, until) {
+            self.diag
+                .note("auto_history", ErrorCode::Io.as_str(), &io_detail(&error), None);
+        }
+    }
+
+    /// Re-validates the held Ready candidate locally (no request) in the
+    /// background. Returns whether the work was started.
+    fn start_revalidate_ready(self: &Arc<Self>) -> bool {
+        let (id, dir) = {
+            let mut state = self.lock();
+            if state.restoring || state.revalidating {
+                return false;
+            }
+            let Stage::Ready { offer, dir } = &state.stage else {
+                return false;
+            };
+            let found = (offer.id().as_str().to_owned(), dir.clone());
+            state.revalidating = true;
+            found
+        };
+        let inner = Arc::clone(self);
+        if !(self.runner)(Box::new(move || inner.run_revalidate(&id, &dir))) {
+            let detail = self.spawn_failure_detail();
+            self.lock().revalidating = false;
+            self.diag
+                .record("start", ErrorCode::Io.as_str(), &detail, None);
+            return false;
+        }
+        true
+    }
+
+    fn run_revalidate(&self, id: &str, dir: &Path) {
+        let result = self.restore_candidate(dir);
+        {
+            let mut state = self.lock();
+            state.revalidating = false;
+            let still_ready = matches!(
+                &state.stage,
+                Stage::Ready { offer, .. } if offer.id().as_str() == id
+            );
+            if !still_ready {
+                return;
+            }
+            match result {
+                Ok(offer) if offer.id().as_str() == id => {
+                    self.mark_prompt_validated(&mut state, &offer);
+                }
+                Ok(_) => {
+                    state.prompt_withdrawn = true;
+                    state.prompt_shown = None;
+                    self.diag.note(
+                        "revalidate",
+                        ErrorCode::AssetMismatch.as_str(),
+                        "the prepared update changed",
+                        None,
+                    );
+                }
+                Err(error) => {
+                    state.prompt_withdrawn = true;
+                    state.prompt_shown = None;
+                    self.diag
+                        .note("revalidate", error.code.as_str(), &error.detail, None);
                 }
             }
-        };
-        drop(state);
+        }
         self.diag.flush();
     }
 
@@ -762,6 +1185,7 @@ impl Inner {
                 cancel: cancel.clone(),
                 received: Arc::clone(&received),
                 verifying: false,
+                origin: Origin::Manual,
             };
             (op, offer, cancel, received)
         };
@@ -793,15 +1217,35 @@ impl Inner {
             remove_dir_if_present(&work);
             return;
         }
+        // An automatic download that failed is a diagnostic only; the manual
+        // card never shows its error.
+        let automatic = matches!(
+            &state.stage,
+            Stage::Downloading {
+                origin: Origin::Automatic,
+                ..
+            }
+        );
+        let failed = |code: ErrorCode, stage: &'static str| {
+            if automatic {
+                Stage::Idle
+            } else {
+                Stage::Failed { code, stage }
+            }
+        };
         match outcome {
             Ok(()) => {
                 let target = self.candidates_dir().join(offer.id().as_str());
                 let moved = self.publish_candidate(offer.id().as_str(), &work, &target);
                 state.stage = match moved {
-                    Ok(()) => Stage::Ready {
-                        offer: Arc::clone(offer),
-                        dir: target,
-                    },
+                    Ok(()) => {
+                        state.prompt_shown = None;
+                        self.mark_prompt_validated(&mut state, offer);
+                        Stage::Ready {
+                            offer: Arc::clone(offer),
+                            dir: target,
+                        }
+                    }
                     Err(error) => {
                         remove_dir_if_present(&work);
                         self.diag.note(
@@ -810,10 +1254,7 @@ impl Inner {
                             &io_detail(&error),
                             Some(version.as_str()),
                         );
-                        Stage::Failed {
-                            code: ErrorCode::Io,
-                            stage: "publish",
-                        }
+                        failed(ErrorCode::Io, "publish")
                     }
                 };
             }
@@ -828,10 +1269,7 @@ impl Inner {
                         &error.detail,
                         Some(version.as_str()),
                     );
-                    Stage::Failed {
-                        code: error.code,
-                        stage: step,
-                    }
+                    failed(error.code, step)
                 };
             }
         }
@@ -951,18 +1389,26 @@ impl Inner {
     // ----------------------------------------------------------- cancel
 
     fn cancel_running(&self) {
-        let mut state = self.lock();
-        match &state.stage {
-            Stage::Checking { cancel, .. } => {
-                cancel.cancel();
-                state.stage = Stage::Idle;
+        let cancelled = {
+            let mut state = self.lock();
+            match &state.stage {
+                Stage::Checking { cancel, .. } => {
+                    cancel.cancel();
+                    state.stage = Stage::Idle;
+                    true
+                }
+                Stage::Downloading { cancel, offer, .. } => {
+                    cancel.cancel();
+                    let offer = Arc::clone(offer);
+                    state.stage = Stage::Available(offer);
+                    true
+                }
+                _ => false,
             }
-            Stage::Downloading { cancel, offer, .. } => {
-                cancel.cancel();
-                let offer = Arc::clone(offer);
-                state.stage = Stage::Available(offer);
-            }
-            _ => {}
+        };
+        if cancelled {
+            // A manual cancel is not resumed by an overdue automatic check.
+            self.note_attempt();
         }
     }
 
@@ -1012,6 +1458,9 @@ impl Inner {
             .and_then(|()| create_private_dir(&self.trash_dir()))
             .and_then(|()| fs::rename(dir, &trash));
         if moved.is_ok() {
+            // An explicit discard is not undone by an overdue automatic check:
+            // the next one is a full interval away.
+            self.note_attempt();
             // The candidate directory is out of the way; only now may another
             // process publish the same CandidateId.
             *self
@@ -1112,10 +1561,11 @@ impl Inner {
                 .candidate_lease
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(lease);
-            state.stage = Stage::Ready {
-                offer: Arc::new(offer),
-                dir,
-            };
+            // It was just verified from the files, so it may be offered.
+            let offer = Arc::new(offer);
+            state.prompt_shown = None;
+            self.mark_prompt_validated(&mut state, &offer);
+            state.stage = Stage::Ready { offer, dir };
         }
     }
 
@@ -1407,6 +1857,9 @@ impl Inner {
                 snapshot.error_stage = Some((*stage).to_owned());
             }
         }
+        if snapshot.phase == AppUpdatePhase::Ready {
+            snapshot.prompt_candidate_id = self.prompt_candidate(&state);
+        }
         snapshot
     }
 }
@@ -1446,6 +1899,18 @@ impl AppUpdateController for AppUpdateService {
 
     fn prepare_restart(&self, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
         self.inner.prepare_restart(candidate_id)
+    }
+
+    fn set_auto_check(&self, enabled: bool) {
+        self.inner.set_automatic(enabled);
+    }
+
+    fn prompt_shown(&self, candidate_id: &str) {
+        self.inner.confirm_prompt_shown(candidate_id);
+    }
+
+    fn snooze_prompt(&self, candidate_id: &str) {
+        self.inner.snooze_prompt(candidate_id);
     }
 }
 
@@ -1809,6 +2274,376 @@ mod tests {
         assert_eq!(fixture.requests(), 3);
     }
 
+    impl Fixture {
+        /// Turns the automatic check on and finishes the local restore it
+        /// waits for. No request is made.
+        fn start_auto(&self) {
+            self.service.set_auto_check(true);
+            self.service.restore_local();
+            run_queued(&self.queue);
+        }
+
+        fn auto_tick_after(&self, ms: u64) {
+            self.clock.advance(ms);
+            self.service.automatic_tick();
+        }
+    }
+
+    const HOURS_MS: u64 = 3_600_000;
+
+    #[test]
+    fn automatic_check_downloads_only_its_own_offer() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        // Not due yet: nothing is contacted.
+        fixture.auto_tick_after(0);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.requests(), 0);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+        // Due: the automatic check finds the offer and downloads that one.
+        fixture.auto_tick_after(31_000);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Checking);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+        assert_eq!(fixture.requests(), 4);
+
+        // An Available offer from a manual check is never taken over.
+        let manual = fixture_with_manual_available();
+        manual.auto_tick_after(7 * HOURS_MS);
+        run_queued(&manual.queue);
+        assert_eq!(manual.phase(), AppUpdatePhase::Available);
+        assert_eq!(manual.requests(), 3);
+    }
+
+    fn fixture_with_manual_available() -> Fixture {
+        let manual = fixture("0.26.0", "0.27.0", 5);
+        manual.script_check();
+        manual.script_archive();
+        manual.start_auto();
+        manual.check_now();
+        assert_eq!(manual.phase(), AppUpdatePhase::Available);
+        manual
+    }
+
+    #[test]
+    fn manual_check_still_stops_at_available() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        fixture.check_now();
+        assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+        assert_eq!(fixture.requests(), 3);
+        // Only the user's download goes on.
+        fixture.service.download(&fixture.candidate_id());
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+        assert_eq!(fixture.requests(), 4);
+    }
+
+    #[test]
+    fn manual_join_stops_automatic_download_chaining() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        fixture.auto_tick_after(31_000);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Checking);
+        // The user presses the check while the automatic one runs.
+        fixture.service.check();
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+        assert_eq!(fixture.requests(), 3);
+    }
+
+    #[test]
+    fn automatic_failure_is_diagnostic_only() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        fixture.start_auto();
+        fixture.auto_tick_after(31_000);
+        run_queued(&fixture.queue);
+        let snapshot = fixture.service.snapshot();
+        assert_eq!(snapshot.phase, AppUpdatePhase::Idle);
+        assert_eq!(snapshot.error_code, None);
+        assert_eq!(snapshot.error_stage, None);
+        assert!(snapshot.diagnostics_available);
+        assert!(fixture.service.diagnostics_text().contains("stage=auto_check"));
+        // A failure waits for the next interval, not a quick retry.
+        let requests = fixture.requests();
+        fixture.auto_tick_after(HOURS_MS);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.requests(), requests);
+
+        // The same failure of a manual check is still shown to the user.
+        let manual = self::fixture("0.26.0", "0.27.0", 5);
+        manual
+            .transport
+            .push(&latest_release_url(), Scripted::status(404));
+        manual.check_now();
+        assert_eq!(manual.phase(), AppUpdatePhase::Failed);
+    }
+
+    #[test]
+    fn disable_drops_late_automatic_results() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        fixture.auto_tick_after(31_000);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Checking);
+        fixture.service.set_auto_check(false);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+        // The late result finds no live operation and goes no further.
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+        // Nothing starts while disabled, and a manual check still works.
+        fixture.auto_tick_after(7 * HOURS_MS);
+        assert!(fixture.queue.lock().unwrap().is_empty());
+        fixture.script_check();
+        fixture.check_now();
+        assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+    }
+
+    #[test]
+    fn ready_revalidation_failure_removes_prompt_eligibility() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        let requests = fixture.requests();
+        let id = fixture.candidate_id();
+        fixture.service.set_auto_check(true);
+        fs::remove_file(
+            fixture
+                .updates_root()
+                .join("candidates")
+                .join(&id)
+                .join("archive.zip"),
+        )
+        .unwrap();
+        fixture.auto_tick_after(7 * HOURS_MS);
+        run_queued(&fixture.queue);
+        // The held candidate is kept, no newer release is looked for, and the
+        // prompt is withdrawn.
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+        assert_eq!(fixture.requests(), requests);
+        assert!(fixture.service.inner.lock().prompt_withdrawn);
+        assert_eq!(fixture.service.snapshot().prompt_candidate_id, None);
+    }
+
+    impl Fixture {
+        /// Lets the service offer a restart (the prompt needs it).
+        fn wire_restart(&self) {
+            self.service.enable_restart(RestartWiring {
+                placement: hane_update::platform::Placement {
+                    target: Target::WindowsX64,
+                    install_root: self.dir.path().join("missing"),
+                    coordination_parent: self.dir.path().to_path_buf(),
+                    install_id: install_id(),
+                },
+                exe: self.dir.path().join("missing").join("hane"),
+                state_root: self.dir.path().join("state"),
+            });
+        }
+
+        /// A new service over the same files, as after an application restart.
+        fn restarted(self) -> Fixture {
+            let Fixture {
+                dir,
+                transport,
+                clock,
+                queue,
+                service,
+                release,
+                tag,
+            } = self;
+            // The old service holds the candidate lease until it is dropped.
+            drop(service);
+            let service = AppUpdateService::with_runner(
+                config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+                transport.clone(),
+                clock.clone(),
+                manual_runner(&queue),
+            );
+            Fixture {
+                dir,
+                transport,
+                clock,
+                queue,
+                service,
+                release,
+                tag,
+            }
+        }
+
+        fn prompt(&self) -> Option<String> {
+            self.service.snapshot().prompt_candidate_id
+        }
+    }
+
+    #[test]
+    fn prompt_is_hidden_while_the_ready_candidate_is_revalidated() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+
+        fixture.auto_tick_after(7 * HOURS_MS);
+        assert!(fixture.service.inner.lock().revalidating);
+        assert_eq!(fixture.prompt(), None);
+        // The re-validation passes: the prompt that was on screen returns.
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+
+        // A failed re-validation withdraws it as before.
+        fs::remove_file(
+            fixture
+                .updates_root()
+                .join("candidates")
+                .join(&id)
+                .join("archive.zip"),
+        )
+        .unwrap();
+        fixture.auto_tick_after(7 * HOURS_MS);
+        assert_eq!(fixture.prompt(), None);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), None);
+    }
+
+    #[test]
+    fn first_display_saves_the_suppression_and_survives_a_restart() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        // Allowed, then actually drawn by the UI; it stays shown without "後で".
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        fixture.service.prompt_shown(&id);
+        assert_eq!(fixture.prompt(), Some(id));
+
+        // The application is closed without pressing "後で" and started again.
+        let restarted = fixture.restarted();
+        restarted.wire_restart();
+        restarted.service.set_auto_check(true);
+        restarted.service.restore_local();
+        run_queued(&restarted.queue);
+        assert_eq!(restarted.phase(), AppUpdatePhase::Ready);
+        assert_eq!(restarted.prompt(), None);
+        restarted.clock.set_now(test_now() + 3_600);
+        assert_eq!(restarted.prompt(), None);
+    }
+
+    #[test]
+    fn snapshot_alone_neither_shows_nor_suppresses_the_prompt() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        // Polling snapshots (as the settings screen does) saves nothing.
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        assert_eq!(fixture.prompt(), Some(id));
+        assert_eq!(fixture.service.inner.lock().prompt_shown, None);
+
+        // Without the UI confirming a display, a restart is not suppressed.
+        let restarted = fixture.restarted();
+        restarted.wire_restart();
+        restarted.service.set_auto_check(true);
+        restarted.service.restore_local();
+        run_queued(&restarted.queue);
+        assert_eq!(restarted.phase(), AppUpdatePhase::Ready);
+        assert!(restarted.prompt().is_some());
+    }
+
+    #[test]
+    fn reenabling_requires_a_new_revalidation_before_the_prompt() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        fixture.service.prompt_shown(&id);
+
+        fixture.service.set_auto_check(false);
+        fixture.service.set_auto_check(true);
+        assert_eq!(fixture.prompt(), None);
+        assert!(!fixture.service.inner.lock().prompt_validated);
+        assert_eq!(fixture.service.inner.lock().prompt_shown, None);
+
+        // A new periodic re-validation that succeeds allows it again.
+        fixture.clock.set_now(test_now() + 7 * 3_600);
+        assert!(fixture.service.inner.start_revalidate_ready());
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), Some(id));
+    }
+
+    #[test]
+    fn a_revalidation_during_the_snooze_does_not_allow_the_prompt_after_it_ends() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        fixture.service.snooze_prompt(&id);
+        assert_eq!(fixture.prompt(), None);
+
+        // A re-validation that succeeds inside the snooze allows nothing.
+        fixture.clock.set_now(test_now() + 3_600);
+        assert!(fixture.service.inner.start_revalidate_ready());
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), None);
+
+        // The snooze ends, but no re-validation has passed since.
+        fixture.clock.set_now(test_now() + 7 * 3_600);
+        assert_eq!(fixture.prompt(), None);
+
+        // The first re-validation that passes after the end allows it.
+        assert!(fixture.service.inner.start_revalidate_ready());
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), Some(id));
+    }
+
+    #[test]
+    fn unconfigured_trust_never_starts_automatic_network() {
+        let dir = TempDir::new("app-update-auto-unconfigured");
+        let transport = Arc::new(ScriptedTransport::new());
+        let clock = Arc::new(FixedClock::new(test_now()));
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let service = AppUpdateService::with_runner(
+            config(&dir, "0.26.0", TrustPolicy::production(), Some(Target::WindowsX64)),
+            transport.clone(),
+            clock.clone(),
+            manual_runner(&queue),
+        );
+        service.set_auto_check(true);
+        service.restore_local();
+        clock.advance(7 * HOURS_MS);
+        service.automatic_tick();
+        run_queued(&queue);
+        assert!(transport.requests().is_empty());
+        assert!(queue.lock().unwrap().is_empty());
+        assert_eq!(service.snapshot().phase, AppUpdatePhase::Unavailable);
+    }
+
+    #[test]
+    fn a_service_without_the_setting_never_checks_on_its_own() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.service.restore_local();
+        run_queued(&fixture.queue);
+        fixture.auto_tick_after(7 * HOURS_MS);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.requests(), 0);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+    }
+
     #[test]
     fn a_cancelled_check_cannot_be_overwritten_by_its_late_result() {
         let fixture = fixture("0.26.0", "0.27.0", 5);
@@ -2081,6 +2916,34 @@ mod tests {
         assert!(candidates.read_dir().unwrap().next().is_none());
         let trash = fixture.service.inner.trash_dir();
         assert!(!trash.exists() || trash.read_dir().unwrap().next().is_none());
+    }
+
+    #[test]
+    fn discard_waits_for_the_next_interval_before_checking_again() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        fixture.auto_tick_after(31_000);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+
+        // The check is long overdue when the user discards the Ready update.
+        fixture.clock.advance(7 * HOURS_MS);
+        fixture.service.discard_ready();
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+
+        // Neither a check nor a re-download starts until a full interval passed.
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.auto_tick_after(0);
+        assert!(fixture.queue.lock().unwrap().is_empty());
+        assert_eq!(fixture.phase(), AppUpdatePhase::Idle);
+        fixture.auto_tick_after(auto_update::CHECK_INTERVAL_SECS as u64 * 1000 - 1);
+        assert!(fixture.queue.lock().unwrap().is_empty());
+        fixture.auto_tick_after(1);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Checking);
     }
 
     #[test]

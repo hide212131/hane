@@ -590,6 +590,9 @@ impl EditorView {
                         .child(div().h(px(bottom_space))),
                 )
                 .children(editor_scrollbar)
+                // Drawn last so it overlays the top of the body; it adds no
+                // layout row, so document coordinates are unchanged.
+                .children(self.update_prompt_element(cx))
                 .a11y_document(a11y_frame, cx.entity().downgrade()),
         );
         let editor_column_width =
