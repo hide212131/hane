@@ -896,6 +896,10 @@ impl Inner {
             return;
         }
         let mut state = self.lock();
+        // The earlier validation and display do not carry over to a later
+        // re-enable: the prompt waits for a new periodic re-validation.
+        state.prompt_validated = false;
+        state.prompt_shown = None;
         match &state.stage {
             Stage::Checking {
                 cancel,
@@ -990,11 +994,10 @@ impl Inner {
                 .snoozed(&self.prompt_key(offer), self.clock.now_unix());
     }
 
-    /// The Ready candidate the prompt may be shown for now, if any. The first
-    /// time a candidate is let through, its suppression (now + 6 hours) is
-    /// saved once, so closing the app without "後で" does not prompt again
-    /// right after the restart. The prompt itself stays visible.
-    fn prompt_candidate(&self, state: &mut State) -> Option<String> {
+    /// The Ready candidate the prompt may be shown for now, if any. It has no
+    /// side effect: nothing is saved and nothing counts as shown until the UI
+    /// confirms the band was drawn ([`Inner::confirm_prompt_shown`]).
+    fn prompt_candidate(&self, state: &State) -> Option<String> {
         let Stage::Ready { offer, .. } = &state.stage else {
             return None;
         };
@@ -1012,19 +1015,35 @@ impl Inner {
             return Some(id);
         }
         let key = self.prompt_key(&offer);
-        let now = self.clock.now_unix();
-        if !state.prompt_validated || self.history.snoozed(&key, now) {
+        if !state.prompt_validated || self.history.snoozed(&key, self.clock.now_unix()) {
             return None;
         }
-        state.prompt_shown = Some(id.clone());
-        if let Err(error) = self
-            .history
-            .snooze(&key, now.saturating_add(auto_update::SNOOZE_SECS))
-        {
+        Some(id)
+    }
+
+    /// The UI drew the prompt band for `candidate_id`. The first time, the
+    /// candidate counts as shown and its suppression (now + 6 hours) is saved
+    /// once, so closing the app without "後で" does not prompt again right
+    /// after the restart. The prompt itself stays visible afterwards.
+    fn confirm_prompt_shown(&self, candidate_id: &str) {
+        let mut state = self.lock();
+        if state.prompt_shown.as_deref() == Some(candidate_id) {
+            return;
+        }
+        if self.prompt_candidate(&state).as_deref() != Some(candidate_id) {
+            return;
+        }
+        let key = match &state.stage {
+            Stage::Ready { offer, .. } => self.prompt_key(offer),
+            _ => return,
+        };
+        state.prompt_shown = Some(candidate_id.to_owned());
+        drop(state);
+        let until = self.clock.now_unix().saturating_add(auto_update::SNOOZE_SECS);
+        if let Err(error) = self.history.snooze(&key, until) {
             self.diag
                 .note("auto_history", ErrorCode::Io.as_str(), &io_detail(&error), None);
         }
-        Some(id)
     }
 
     /// Re-validates the held Ready candidate locally (no request) in the
@@ -1828,7 +1847,7 @@ impl Inner {
             }
         }
         if snapshot.phase == AppUpdatePhase::Ready {
-            snapshot.prompt_candidate_id = self.prompt_candidate(&mut state);
+            snapshot.prompt_candidate_id = self.prompt_candidate(&state);
         }
         snapshot
     }
@@ -1873,6 +1892,10 @@ impl AppUpdateController for AppUpdateService {
 
     fn set_auto_check(&self, enabled: bool) {
         self.inner.set_automatic(enabled);
+    }
+
+    fn prompt_shown(&self, candidate_id: &str) {
+        self.inner.confirm_prompt_shown(candidate_id);
     }
 
     fn snooze_prompt(&self, candidate_id: &str) {
@@ -2488,8 +2511,9 @@ mod tests {
         fixture.wire_restart();
         fixture.service.set_auto_check(true);
         let id = fixture.candidate_id();
-        // Shown, and it stays shown without "後で".
+        // Allowed, then actually drawn by the UI; it stays shown without "後で".
         assert_eq!(fixture.prompt(), Some(id.clone()));
+        fixture.service.prompt_shown(&id);
         assert_eq!(fixture.prompt(), Some(id));
 
         // The application is closed without pressing "後で" and started again.
@@ -2502,6 +2526,51 @@ mod tests {
         assert_eq!(restarted.prompt(), None);
         restarted.clock.set_now(test_now() + 3_600);
         assert_eq!(restarted.prompt(), None);
+    }
+
+    #[test]
+    fn snapshot_alone_neither_shows_nor_suppresses_the_prompt() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        // Polling snapshots (as the settings screen does) saves nothing.
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        assert_eq!(fixture.prompt(), Some(id));
+        assert_eq!(fixture.service.inner.lock().prompt_shown, None);
+
+        // Without the UI confirming a display, a restart is not suppressed.
+        let restarted = fixture.restarted();
+        restarted.wire_restart();
+        restarted.service.set_auto_check(true);
+        restarted.service.restore_local();
+        run_queued(&restarted.queue);
+        assert_eq!(restarted.phase(), AppUpdatePhase::Ready);
+        assert!(restarted.prompt().is_some());
+    }
+
+    #[test]
+    fn reenabling_requires_a_new_revalidation_before_the_prompt() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        fixture.service.prompt_shown(&id);
+
+        fixture.service.set_auto_check(false);
+        fixture.service.set_auto_check(true);
+        assert_eq!(fixture.prompt(), None);
+        assert!(!fixture.service.inner.lock().prompt_validated);
+        assert_eq!(fixture.service.inner.lock().prompt_shown, None);
+
+        // A new periodic re-validation that succeeds allows it again.
+        fixture.clock.set_now(test_now() + 7 * 3_600);
+        assert!(fixture.service.inner.start_revalidate_ready());
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), Some(id));
     }
 
     #[test]

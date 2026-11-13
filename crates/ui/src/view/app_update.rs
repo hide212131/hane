@@ -144,6 +144,12 @@ pub trait AppUpdateController: Send + Sync {
     fn set_auto_check(&self, enabled: bool) {
         let _ = enabled;
     }
+    /// The restart prompt band for `candidate_id` was actually drawn. Only now
+    /// may the service count it as shown and save the first-display
+    /// suppression; `snapshot` alone never does. Idempotent.
+    fn prompt_shown(&self, candidate_id: &str) {
+        let _ = candidate_id;
+    }
     /// "後で": hides the restart prompt for `candidate_id` and suppresses it
     /// again for the same version for a while. The Ready update is kept.
     fn snooze_prompt(&self, candidate_id: &str) {
@@ -1013,6 +1019,7 @@ impl EditorView {
         }
         let controller = self.app_update.as_ref()?;
         let model = prompt_model(&controller.snapshot())?;
+        controller.prompt_shown(&model.candidate_id);
         let border = rgb(self.theme.sidebar_active_background);
         let restart_id = model.candidate_id.clone();
         let later_id = model.candidate_id;
@@ -2325,6 +2332,12 @@ mod tests {
         }
         fn diagnostics_text(&self) -> Option<String> {
             self.diagnostics.clone()
+        }
+        fn prompt_shown(&self, candidate_id: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("shown:{candidate_id}"));
         }
         fn snooze_prompt(&self, candidate_id: &str) {
             self.calls
