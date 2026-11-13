@@ -1163,6 +1163,48 @@ mod tests {
         ))
     }
 
+    // Issue #716: a checkbox toggled while reading is saved through the
+    // ordinary Save path without leaving reading mode.
+    #[gpui::test]
+    fn reading_task_toggle_can_be_saved_without_switching_modes(cx: &mut gpui::TestAppContext) {
+        let root = rename_test_root("reading-task-save");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("Tasks.md");
+        std::fs::write(&path, "- [ ] a\n- [x] b\n").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.set_editor_mode(EditorMode::Reading, window, cx));
+            });
+        });
+        view.update(cx, |view, cx| {
+            let marker = crate::view::task_checkbox::TaskCheckboxTarget {
+                session: view.sessions.active_id(),
+                revision: view.editor().document().revision(),
+                marker_range: SourceRange::new(2, 5),
+                checked: false,
+            };
+            assert!(view.toggle_task_checkbox(marker, cx));
+            assert!(view.sessions.active().is_dirty());
+            view.save_or_prompt(cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.sessions.active().is_dirty());
+            assert_eq!(view.editor_mode(), EditorMode::Reading);
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "- [x] a\n- [x] b\n");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // Issue #607: the H1 title rename takes the save slot, so the external
     // open guard must be protected once it starts, even if the last frame
     // published a clean state.

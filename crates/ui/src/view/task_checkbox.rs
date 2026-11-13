@@ -56,6 +56,15 @@ impl EditorView {
         })
     }
 
+    /// Whether a checkbox may be toggled now (Issue #716). Reading mode keeps
+    /// every other body change refused (`body_editable`), but a checkbox press
+    /// is allowed there; a body composition blocks it in both modes. Listed
+    /// modes only, so a future mode is not allowed by accident.
+    pub(super) fn task_checkbox_toggle_allowed(&self) -> bool {
+        matches!(self.editor_mode(), EditorMode::Editing | EditorMode::Reading)
+            && self.editor().ime().is_none()
+    }
+
     /// Handles an unmodified left press on a row. Returns true when the press
     /// was a checkbox toggle, in which case the caller must stop: the press
     /// neither moves the caret nor starts a selection drag, so the matching
@@ -70,8 +79,7 @@ impl EditorView {
     ) -> bool {
         if event.button != MouseButton::Left
             || !is_unmodified_click(&event.modifiers)
-            || !self.body_editable()
-            || self.editor().ime().is_some()
+            || !self.task_checkbox_toggle_allowed()
         {
             return false;
         }
@@ -93,7 +101,7 @@ impl EditorView {
         target: TaskCheckboxTarget,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.body_editable() || self.editor().ime().is_some() {
+        if !self.task_checkbox_toggle_allowed() {
             return false;
         }
         if self.sessions.active_id() != target.session
@@ -147,6 +155,7 @@ impl EditorView {
             Err(error) => self.report_error("task toggle", error),
         }
         self.after_input(cx);
+        self.suppress_document_find_reveal_after_task_toggle();
         self.scroll_y = scroll_y;
         self.pending_caret_visibility_after_layout = caret_check_pending;
         true
@@ -271,24 +280,245 @@ mod tests {
     }
 
     #[gpui::test]
-    fn reading_mode_and_composition_never_toggle(cx: &mut gpui::TestAppContext) {
+    fn composition_blocks_task_toggle_in_both_modes(cx: &mut gpui::TestAppContext) {
         let source = "- [ ] A\n";
         let view = new_view(cx, source);
         view.update(cx, |view, cx| {
-            let marker = target(view, (2, 5), false);
-            view.editor_mode = EditorMode::Reading;
-            assert!(!view.toggle_task_checkbox(marker, cx));
-            assert_eq!(text(view), source);
-            view.editor_mode = EditorMode::Editing;
-
             view.editor_mut()
                 .replace_and_mark_text(None, "あ", Some(1..1))
                 .unwrap();
             let composing = text(view);
+            let selection = view.editor().selection();
             let marker = target(view, (2, 5), false);
-            assert!(view.editor().ime().is_some());
-            assert!(!view.toggle_task_checkbox(marker, cx));
-            assert_eq!(text(view), composing);
+            for mode in [EditorMode::Editing, EditorMode::Reading] {
+                view.editor_mode = mode;
+                assert!(view.editor().ime().is_some());
+                assert!(!view.task_checkbox_toggle_allowed(), "{mode:?}");
+                assert!(!view.toggle_task_checkbox(marker, cx), "{mode:?}");
+                assert_eq!(text(view), composing, "{mode:?}");
+                assert_eq!(view.editor().selection(), selection, "{mode:?}");
+                assert!(view.editor().ime().is_some(), "{mode:?}: the marked text is kept");
+            }
+        });
+    }
+
+    fn settle(cx: &mut gpui::VisualTestContext) {
+        cx.run_until_parked();
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(200));
+        cx.run_until_parked();
+    }
+
+    fn set_mode(view: &TestView, cx: &mut gpui::VisualTestContext, mode: EditorMode) {
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.set_editor_mode(mode, window, cx));
+            });
+        });
+        settle(cx);
+    }
+
+    fn dirty(view: &TestView, cx: &mut gpui::VisualTestContext) -> bool {
+        view.read_with(cx, |view, _| view.sessions.active().is_dirty())
+    }
+
+    /// A real press on the drawn glyph while reading toggles exactly once, in
+    /// both directions, and marks the document dirty; neither the release nor
+    /// a redraw toggles it again.
+    #[gpui::test]
+    fn reading_press_toggles_once_and_marks_dirty(cx: &mut gpui::TestAppContext) {
+        let source = "- [ ] a\n- [x] b\n\ntail\n";
+        let (view, cx) = open_window(cx, source, source.len() - 1);
+        set_mode(&view, cx, EditorMode::Reading);
+        assert!(!dirty(&view, cx));
+        let revision = view.read_with(cx, |view, _| view.editor().document().revision());
+
+        let row = cx.debug_bounds("row-0-0").expect("the first row is painted");
+        let (glyph_x, _) = drawn_checkbox_x(&view, cx, 0);
+        click(cx, glyph_x, row.center().y);
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [x] a\n- [x] b\n\ntail\n");
+            assert_ne!(view.editor().document().revision(), revision);
+            assert!(view.sessions.active().is_dirty());
+            assert_eq!(view.editor_mode(), EditorMode::Reading);
+            assert!(!view.text_selection_drag);
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [x] a\n- [x] b\n\ntail\n", "no second toggle");
+        });
+
+        let row = cx.debug_bounds("row-1-1").expect("the second row is painted");
+        let (glyph_x, _) = drawn_checkbox_x(&view, cx, 1);
+        click(cx, glyph_x, row.center().y);
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(text(view), "- [x] a\n- [ ] b\n\ntail\n");
+        });
+    }
+
+    /// The exception covers the checkbox only: every other body change stays
+    /// refused after a toggle.
+    #[gpui::test]
+    fn reading_toggle_keeps_general_body_edits_blocked(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("- [ ] A\n", "Untitled", cx));
+        set_mode(&view, cx, EditorMode::Reading);
+        view.update(cx, |view, cx| {
+            let marker = target(view, (2, 5), false);
+            assert!(view.toggle_task_checkbox(marker, cx));
+        });
+        let toggled = view.read_with(cx, |view, _| {
+            assert!(!view.body_editable());
+            assert!(!view.body_input_capture_enabled());
+            (text(view), view.editor().document().revision())
+        });
+        assert_eq!(toggled.0, "- [x] A\n");
+        view.update(cx, |view, cx| {
+            view.insert_text("x", cx);
+            view.insert_newline(cx);
+            view.dispatch(EditorCommand::Insert("y"), cx);
+            view.dispatch(EditorCommand::Backspace, cx);
+            view.dispatch(EditorCommand::Delete, cx);
+            view.dispatch(EditorCommand::Undo, cx);
+            view.dispatch(EditorCommand::Redo, cx);
+            for intent in [
+                ListEditIntent::Enter,
+                ListEditIntent::ShiftEnter,
+                ListEditIntent::Backspace,
+                ListEditIntent::Indent,
+                ListEditIntent::Outdent,
+            ] {
+                assert!(view.apply_list_edit_intent(intent, cx), "{intent:?}");
+            }
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!((text(view), view.editor().document().revision()), toggled);
+        });
+    }
+
+    /// Reading cannot Undo, but after returning to editing the toggle is one
+    /// Undo unit that restores even a capital `[X]`, and Redo reapplies it.
+    #[gpui::test]
+    fn reading_toggle_is_undoable_after_returning_to_editing(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("- [X] big\n", "Untitled", cx));
+        set_mode(&view, cx, EditorMode::Reading);
+        view.update(cx, |view, cx| {
+            let marker = target(view, (2, 5), true);
+            assert!(view.toggle_task_checkbox(marker, cx));
+            assert_eq!(text(view), "- [ ] big\n");
+            view.dispatch(EditorCommand::Undo, cx);
+            assert_eq!(text(view), "- [ ] big\n", "reading never undoes");
+        });
+        set_mode(&view, cx, EditorMode::Editing);
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(9)))
+                .unwrap();
+            view.insert_text("!", cx);
+            assert_eq!(text(view), "- [ ] big!\n");
+            view.dispatch(EditorCommand::Undo, cx);
+            assert_eq!(text(view), "- [ ] big\n", "the typing is its own unit");
+            view.dispatch(EditorCommand::Undo, cx);
+            assert_eq!(text(view), "- [X] big\n", "the original capital is restored");
+            view.dispatch(EditorCommand::Redo, cx);
+            assert_eq!(text(view), "- [ ] big\n");
+        });
+    }
+
+    #[gpui::test]
+    fn reading_toggle_preserves_directional_selection(cx: &mut gpui::TestAppContext) {
+        let source = "- [ ] A\n- [x] B\n\npara\n";
+        let view = new_view(cx, source);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            for (anchor, active) in [(0, 0), (3, 12), (12, 3), (4, 4), (0, 22), (20, 1)] {
+                let selection = Selection {
+                    anchor: SourceOffset(anchor),
+                    active: SourceOffset(active),
+                };
+                view.editor_mut().set_selection(selection).unwrap();
+                let marker = target(view, (2, 5), false);
+                assert!(view.toggle_task_checkbox(marker, cx), "{anchor}..{active}");
+                assert_eq!(text(view), "- [x] A\n- [x] B\n\npara\n");
+                assert_eq!(view.editor().selection(), selection, "{anchor}..{active}");
+                let marker = target(view, (2, 5), true);
+                assert!(view.toggle_task_checkbox(marker, cx));
+                assert_eq!(text(view), source);
+                assert_eq!(view.editor().selection(), selection, "{anchor}..{active}");
+            }
+        });
+    }
+
+    /// Pressing a far-away box must neither scroll the viewport nor ask for
+    /// the (hidden) caret to be shown, immediately or after layout and parse.
+    #[gpui::test]
+    fn reading_press_preserves_viewport_after_layout_and_parse(cx: &mut gpui::TestAppContext) {
+        let mut source = String::new();
+        for n in 0..40 {
+            source.push_str(&format!("line {n:02}\n\n"));
+        }
+        source.push_str("- [ ] a\n\ntail\n");
+        let task_line = 80;
+        let (view, cx) = open_window(cx, Box::leak(source.into_boxed_str()), 0);
+        set_mode(&view, cx, EditorMode::Reading);
+        let target_y = view.read_with(cx, |view, _| {
+            (view.heights.total_height() - view.viewport_height).max(0.0)
+        });
+        view.update(cx, |view, cx| view.finish_scroll_only(target_y, cx));
+        settle(cx);
+        let scroll = view.read_with(cx, |view, _| view.scroll_y);
+        assert!(scroll > 0.0, "the caret at the top is off screen");
+
+        let row = cx
+            .debug_bounds(&format!("row-{task_line}-0"))
+            .expect("the task row is painted");
+        let (glyph_x, _) = drawn_checkbox_x(&view, cx, task_line);
+        click(cx, glyph_x, row.center().y);
+        let check = |view: &TestView, cx: &mut gpui::VisualTestContext, label: &str| {
+            view.read_with(cx, |view, _| {
+                assert!(text(view).contains("- [x] a\n"), "{label}");
+                assert_eq!(view.scroll_y, scroll, "{label}: the viewport stays");
+                assert!(view.caret_geometry().is_none(), "{label}: no caret");
+            });
+        };
+        check(&view, cx, "right after the press");
+        settle(cx);
+        check(&view, cx, "after layout and parse");
+        settle(cx);
+        check(&view, cx, "after the background parse");
+    }
+
+    #[gpui::test]
+    fn reading_task_targets_are_revalidated(cx: &mut gpui::TestAppContext) {
+        let source = "- [ ] A\n- B [ ] c\n[ ] plain\n- [x] D\n";
+        let view = new_view(cx, source);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            let revision_before = view.editor().document().revision();
+            for (marker, checked) in [
+                ((2, 5), true),
+                ((3, 6), false),
+                ((13, 16), false),
+                ((18, 21), false),
+                ((2, 6), false),
+            ] {
+                let forged = target(view, marker, checked);
+                assert!(!view.toggle_task_checkbox(forged, cx), "{marker:?}");
+                assert_eq!(text(view), source);
+            }
+            let mut other_session = target(view, (2, 5), false);
+            other_session.session = SessionId(view.sessions.active_id().0 + 1000);
+            assert!(!view.toggle_task_checkbox(other_session, cx));
+            assert_eq!(view.editor().document().revision(), revision_before);
+
+            // A target from before an applied toggle never applies again.
+            let stale = target(view, (2, 5), false);
+            let fresh = target(view, (2, 5), false);
+            assert!(view.toggle_task_checkbox(fresh, cx));
+            let toggled = text(view);
+            assert!(!view.toggle_task_checkbox(stale, cx));
+            assert_eq!(text(view), toggled);
         });
     }
 
