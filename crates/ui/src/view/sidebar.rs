@@ -410,49 +410,6 @@ impl EditorView {
         let work_folder = self.work_folder.as_ref()?;
         let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
-        let row_icon = |path: &'static str, color: u32| {
-            gpui::svg()
-                .path(path)
-                .flex_none()
-                .size_4()
-                .text_color(rgb(color))
-        };
-        // The leading slot of a row: normally the folder/file icon, sized so
-        // file and folder names start at the same x position. For folders,
-        // hovering the icon swaps it for the expand/collapse chevron in
-        // place, rather than reserving a separate chevron column up front.
-        let entry_icon =
-            |icon_path: &'static str, disclosure_path: Option<&'static str>, color: u32| {
-                let icon_slot = div().relative().flex_none().size_4();
-                match disclosure_path {
-                    None => icon_slot.child(row_icon(icon_path, color)),
-                    Some(disclosure_path) => icon_slot
-                        .group("work-folder-row-icon")
-                        .child(
-                            div()
-                                .group_hover("work-folder-row-icon", |style| style.invisible())
-                                .child(row_icon(icon_path, color)),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .invisible()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .group_hover("work-folder-row-icon", |style| style.visible())
-                                .child(
-                                    gpui::svg()
-                                        .path(disclosure_path)
-                                        .flex_none()
-                                        .w(px(12.0))
-                                        .h(px(12.0))
-                                        .text_color(rgb(color)),
-                                ),
-                        ),
-                }
-            };
         let toolbar_button = |id: &'static str, icon_path: &'static str| {
             div()
                 .id(id)
@@ -2248,6 +2205,54 @@ fn display_file_name(file_name: &str) -> &str {
         &file_name[..stem_len]
     } else {
         file_name
+    }
+}
+
+fn row_icon(path: &'static str, color: u32) -> gpui::Svg {
+    gpui::svg()
+        .path(path)
+        .flex_none()
+        .size_4()
+        .text_color(rgb(color))
+}
+
+/// The leading slot of a row: normally the folder/file icon, sized so
+/// file and folder names start at the same x position. For folders,
+/// hovering the icon swaps it for the expand/collapse chevron in
+/// place, rather than reserving a separate chevron column up front.
+fn entry_icon(
+    icon_path: &'static str,
+    disclosure_path: Option<&'static str>,
+    color: u32,
+) -> gpui::Div {
+    let icon_slot = div().relative().flex_none().size_4();
+    match disclosure_path {
+        None => icon_slot.child(row_icon(icon_path, color)),
+        Some(disclosure_path) => icon_slot
+            .group("work-folder-row-icon")
+            .child(
+                div()
+                    .group_hover("work-folder-row-icon", |style| style.invisible())
+                    .child(row_icon(icon_path, color)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .invisible()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .group_hover("work-folder-row-icon", |style| style.visible())
+                    .child(
+                        gpui::svg()
+                            .path(disclosure_path)
+                            .flex_none()
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .text_color(rgb(color)),
+                    ),
+            ),
     }
 }
 
