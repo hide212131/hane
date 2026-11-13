@@ -1,5 +1,6 @@
 //! Reading mode (Issue #547): the body keeps its current Markdown rendering
-//! but cannot be changed, and no caret, selection, composition or find match
+//! but cannot be changed (apart from toggling a task checkbox, see
+//! `task_checkbox_toggle_allowed`), and no caret, selection, composition or find match
 //! opens Markdown markers. The mode is one window-wide value owned by
 //! `EditorView`; sessions, editors and settings never see it.
 
@@ -691,8 +692,11 @@ mod tests {
         assert_eq!(view.read_with(cx, |view, _| view.editor_mode()), EditorMode::Editing);
     }
 
+    /// General body changes (typing, deletion, list editing, Undo / Redo) stay
+    /// refused while reading; movement and selection work. The one exception,
+    /// toggling a task checkbox (Issue #716), is covered in `task_checkbox`.
     #[gpui::test]
-    fn reading_refuses_every_body_change_but_allows_movement(cx: &mut gpui::TestAppContext) {
+    fn reading_refuses_general_body_changes_but_allows_movement(cx: &mut gpui::TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("hello\n", "Untitled", cx));
         view.update(cx, |view, cx| view.insert_text("a", cx));
         assert!(toggle(&view, cx));

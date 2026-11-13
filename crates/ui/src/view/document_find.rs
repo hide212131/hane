@@ -586,6 +586,19 @@ impl EditorView {
         self.restart_document_find(cx, true, true);
     }
 
+    /// Called right after `after_input` for a task checkbox toggle (Issue
+    /// #716). The rescan and the match list still update for the new text, but
+    /// the scan that is about to land must not pick a current match and so
+    /// must not scroll to one: the press only changes a checkbox, never the
+    /// reader's position. An explicit Next/Previous or a query change moves
+    /// as usual afterwards.
+    pub(super) fn suppress_document_find_reveal_after_task_toggle(&mut self) {
+        if self.document_find.open {
+            self.document_find.reposition_on_next_result = false;
+        }
+        self.pending_find_visibility_after_layout = false;
+    }
+
     /// A paste whose original clipboard text contains CR/LF was refused by the
     /// search field. The field value is unchanged, so no `Change` event will
     /// follow; invalidate in-flight and prepared work here instead.
@@ -2418,6 +2431,93 @@ mod tests {
                 view.scroll_y
             );
             assert_eq!(view.editor().document().full_text(), text);
+        });
+    }
+
+    /// A checkbox toggle rescans the find bar's matches for the new text but
+    /// never scrolls to a match; Next / Previous still move afterwards.
+    #[gpui::test]
+    fn task_toggle_rescans_find_without_revealing_a_match(cx: &mut gpui::TestAppContext) {
+        use crate::view::task_checkbox::TaskCheckboxTarget;
+
+        cx.update(crate::actions::register_key_bindings);
+        let mut text = String::from("- [ ] a\n\n");
+        for n in 0..70 {
+            text.push_str(&format!("line {n:02}\n\n"));
+        }
+        text.push_str("- [x] far\n");
+        let (view, cx) = {
+            let text = text.clone();
+            cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx))
+        };
+        cx.simulate_resize(gpui::size(px(960.0), px(400.0)));
+        cx.run_until_parked();
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            // The debounce re-checks `elapsed()` on the real clock after the
+            // virtual timer fires, so let real time pass before advancing the
+            // virtual clock (same pattern as the coalescing tests above).
+            std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + std::time::Duration::from_millis(50));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(400));
+            cx.run_until_parked();
+        };
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_document_find(window, cx));
+        });
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.document_find.query_text = "[x]".to_owned();
+            view.restart_document_find(cx, false, true);
+        });
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.matches.len(), 1);
+            assert!(view.scroll_y > 0.0, "the far match was revealed");
+        });
+
+        for (mode, checked, expected_matches) in [
+            (EditorMode::Editing, false, 2),
+            (EditorMode::Reading, true, 1),
+        ] {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    assert!(view.set_editor_mode(mode, window, cx));
+                });
+            });
+            settle(cx);
+            view.update(cx, |view, cx| view.finish_scroll_only(0.0, cx));
+            settle(cx);
+            let scroll = view.read_with(cx, |view, _| view.scroll_y);
+            view.update(cx, |view, cx| {
+                // A stale visibility request must not survive the toggle.
+                view.pending_find_visibility_after_layout = true;
+                let marker = TaskCheckboxTarget {
+                    session: view.sessions.active_id(),
+                    revision: view.editor().document().revision(),
+                    marker_range: SourceRange::new(2, 5),
+                    checked,
+                };
+                assert!(view.toggle_task_checkbox(marker, cx), "{mode:?}");
+                assert!(!view.pending_find_visibility_after_layout, "{mode:?}");
+            });
+            settle(cx);
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.document_find.result, DocumentFindResult::Ready, "{mode:?}");
+                assert_eq!(view.document_find.matches.len(), expected_matches, "{mode:?}");
+                assert_eq!(view.document_find.current, None, "{mode:?}");
+                assert_eq!(view.scroll_y, scroll, "{mode:?}: the toggle must not scroll");
+                assert!(!view.pending_find_visibility_after_layout, "{mode:?}");
+            });
+        }
+
+        // After the Reading toggle only the far match remains; an explicit
+        // Next moves to it as before.
+        view.update(cx, |view, cx| view.document_find_next(cx));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.document_find.current, Some(0));
+            assert!(view.scroll_y > 0.0, "an explicit Next still scrolls");
         });
     }
 

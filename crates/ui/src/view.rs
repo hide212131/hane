@@ -7834,6 +7834,48 @@ mod tests {
         assert_ne!(undone.content_generation, before.content_generation);
     }
 
+    /// Issue #716: a checkbox toggle while reading advances the revision, so a
+    /// link request taken before it is refused even before the next frame; a
+    /// request from the new frame still opens its link.
+    #[gpui::test]
+    fn reading_task_toggle_invalidates_old_a11y_link_requests(cx: &mut gpui::TestAppContext) {
+        const URL: &str = "https://example.com/a";
+        let text = "- [ ] task\n\nsee https://example.com/a end\n";
+        let (view, cx, _) = open_view_for_mouse_tests(cx, text, false);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let before = a11y_frame_of(&view, cx);
+        assert_eq!(before.links.len(), 1);
+        let old_request = a11y_request_for(&before, 0);
+
+        let toggled = view.update(cx, |view, cx| {
+            let marker = task_checkbox::TaskCheckboxTarget {
+                session: view.sessions.active_id(),
+                revision: view.editor().document().revision(),
+                marker_range: SourceRange::new(2, 5),
+                checked: false,
+            };
+            view.toggle_task_checkbox(marker, cx)
+        });
+        assert!(toggled);
+        let state_after_toggle = a11y_editor_state(&view, cx);
+        assert!(!view.update(cx, |view, cx| view.activate_a11y_link(&old_request, cx)));
+        assert!(cx.opened_url().is_none());
+        assert_eq!(a11y_editor_state(&view, cx), state_after_toggle);
+
+        cx.run_until_parked();
+        let after = a11y_frame_of(&view, cx);
+        assert_ne!(after.content_generation, before.content_generation);
+        assert_eq!(after.links.len(), 1);
+        assert!(view.update(cx, |view, cx| {
+            view.activate_a11y_link(&a11y_request_for(&after, 0), cx)
+        }));
+        assert_eq!(cx.opened_url().as_deref(), Some(URL));
+    }
+
     /// Issue #704: a click on a published link opens its destination without
     /// moving the caret or touching the document and its history, and works
     /// the same in editing and reading mode without any modifier.
