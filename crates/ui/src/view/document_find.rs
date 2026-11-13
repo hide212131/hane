@@ -2454,6 +2454,10 @@ mod tests {
         cx.run_until_parked();
         let settle = |cx: &mut gpui::VisualTestContext| {
             cx.run_until_parked();
+            // The debounce re-checks `elapsed()` on the real clock after the
+            // virtual timer fires, so let real time pass before advancing the
+            // virtual clock (same pattern as the coalescing tests above).
+            std::thread::sleep(DOCUMENT_FIND_DEBOUNCE + std::time::Duration::from_millis(50));
             cx.executor()
                 .advance_clock(std::time::Duration::from_millis(400));
             cx.run_until_parked();
