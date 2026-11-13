@@ -970,9 +970,42 @@ impl EditorView {
         cx.notify();
     }
 
+    /// One button of the restart prompt. It is a tab stop with its own focus
+    /// handle, and Enter / Space run the same action as a click.
+    fn update_prompt_button(
+        cx: &mut Context<Self>,
+        border: gpui::Rgba,
+        id: &'static str,
+        label: &'static str,
+        focus: &gpui::FocusHandle,
+        activate: impl Fn(&mut Self, &mut Context<Self>) + Clone + 'static,
+    ) -> gpui::Stateful<gpui::Div> {
+        let on_key = activate.clone();
+        div()
+            .id(id)
+            .debug_selector(|| id.to_owned())
+            .track_focus(focus)
+            .tab_stop(true)
+            .cursor_pointer()
+            .px(px(10.0))
+            .py(px(4.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(border)
+            .child(label)
+            .on_key_down(cx.listener(move |view, event: &gpui::KeyDownEvent, _window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                    cx.stop_propagation();
+                    on_key(view, cx);
+                }
+            }))
+            .on_click(cx.listener(move |view, _, _, cx| activate(view, cx)))
+    }
+
     /// The restart prompt band drawn over the top of the document area. It is
-    /// an overlay, so no document coordinate changes, and it owns no focus
-    /// handle, so showing or clicking it never moves the editor focus. Hidden
+    /// an overlay, so no document coordinate changes. Its buttons are tab stops
+    /// but are never focused automatically, so showing the prompt does not move
+    /// the editor focus. Hidden
     /// while the settings screen is open (the card has the same actions).
     pub(super) fn update_prompt_element(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if self.settings_open {
@@ -981,31 +1014,29 @@ impl EditorView {
         let controller = self.app_update.as_ref()?;
         let model = prompt_model(&controller.snapshot())?;
         let border = rgb(self.theme.sidebar_active_background);
-        let make_button = |id: &'static str, label: &'static str| {
-            div()
-                .id(id)
-                .debug_selector(|| id.to_owned())
-                .cursor_pointer()
-                .px(px(10.0))
-                .py(px(4.0))
-                .rounded_sm()
-                .border_1()
-                .border_color(border)
-                .child(label)
-        };
         let restart_id = model.candidate_id.clone();
         let later_id = model.candidate_id;
         let restart_button = (!self.restart_in_progress).then(|| {
-            make_button("app-update-prompt-restart", "再起動して更新").on_click(cx.listener(
-                move |view, _, _, cx| {
+            Self::update_prompt_button(
+                cx,
+                border,
+                "app-update-prompt-restart",
+                "再起動して更新",
+                &self.app_update_restart_focus,
+                move |view, cx| {
                     view.restart_message = None;
                     view.start_update_restart(Some(&restart_id), cx);
                 },
-            ))
+            )
         });
-        let later_button = make_button("app-update-prompt-later", "後で").on_click(cx.listener(
-            move |view, _, _, cx| view.dismiss_update_prompt(&later_id, cx),
-        ));
+        let later_button = Self::update_prompt_button(
+            cx,
+            border,
+            "app-update-prompt-later",
+            "後で",
+            &self.app_update_later_focus,
+            move |view, cx| view.dismiss_update_prompt(&later_id, cx),
+        );
         let notice = self.restart_message.clone().map(|message| {
             div()
                 .id("app-update-prompt-message")
@@ -2295,6 +2326,12 @@ mod tests {
         fn diagnostics_text(&self) -> Option<String> {
             self.diagnostics.clone()
         }
+        fn snooze_prompt(&self, candidate_id: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("snooze:{candidate_id}"));
+        }
     }
 
     fn open_general_settings(
@@ -2418,6 +2455,52 @@ mod tests {
             "showing the prompt starts nothing: {:?}",
             controller.calls()
         );
+    }
+
+    #[gpui::test]
+    fn prompt_buttons_are_keyboard_operable_like_a_click(cx: &mut gpui::TestAppContext) {
+        let controller = FakeController::new(promptable(AppUpdatePhase::Ready));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let (restart, later) = view.read_with(cx, |view, _| {
+            (
+                view.app_update_restart_focus.clone(),
+                view.app_update_later_focus.clone(),
+            )
+        });
+        // Showing the prompt moves no focus.
+        assert!(cx.update(|window, _| !restart.is_focused(window) && !later.is_focused(window)));
+
+        // Both keys on "後で" do what the click does.
+        cx.update(|window, app| window.focus(&later, app));
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("space");
+        assert_eq!(
+            controller.calls(),
+            vec!["snooze:cand".to_owned(), "snooze:cand".to_owned()]
+        );
+        let clicked = cx
+            .debug_bounds("app-update-prompt-later")
+            .expect("the later button is rendered");
+        cx.simulate_click(clicked.center(), gpui::Modifiers::none());
+        assert_eq!(
+            controller
+                .calls()
+                .iter()
+                .filter(|call| call.as_str() == "snooze:cand")
+                .count(),
+            3
+        );
+
+        // Space on "再起動して更新" takes the normal restart path.
+        cx.update(|window, app| window.focus(&restart, app));
+        cx.simulate_keystrokes("space");
+        assert!(view.read_with(cx, |view, _| view.restart_in_progress));
     }
 
     #[gpui::test]

@@ -146,6 +146,8 @@ impl EditorView {
             ai_selection:ai_selection::AiSelectionState::default(),
             app_update: None,
             app_update_polling: false,
+            app_update_restart_focus: cx.focus_handle(),
+            app_update_later_focus: cx.focus_handle(),
             restart_freeze: false,
             external_open_generation: 0,
             external_open_inbox: None,

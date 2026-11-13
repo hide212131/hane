@@ -829,6 +829,10 @@ pub struct EditorView {
     app_update: Option<Arc<dyn AppUpdateController>>,
     /// A card refresh loop is running while the update service is busy.
     app_update_polling: bool,
+    /// Keyboard focus targets of the restart prompt buttons. They are only
+    /// tracked by the buttons; showing the prompt never focuses them.
+    app_update_restart_focus: gpui::FocusHandle,
+    app_update_later_focus: gpui::FocusHandle,
     /// Held only for the synchronous restart check; while set, the shared
     /// external-open entrance answers `Busy`.
     restart_freeze: bool,

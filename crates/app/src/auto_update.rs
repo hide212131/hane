@@ -87,6 +87,10 @@ struct Record {
     /// suppression.
     prompt_key: Option<String>,
     prompt_not_before_unix: Option<i64>,
+    /// Set when the file could not be trusted: no prompt until this time. It is
+    /// part of the record so a rewrite of a healthy file keeps it across
+    /// restarts.
+    hold_until_unix: Option<i64>,
 }
 
 fn parse_record(bytes: &[u8]) -> Option<Record> {
@@ -102,6 +106,7 @@ fn parse_record(bytes: &[u8]) -> Option<Record> {
             "prompt_not_before_unix" => {
                 record.prompt_not_before_unix = Some(value.parse().ok()?);
             }
+            "hold_until_unix" => record.hold_until_unix = Some(value.parse().ok()?),
             _ => {}
         }
     }
@@ -118,14 +123,17 @@ fn render_record(record: &Record) -> String {
         let _ = writeln!(text, "prompt_key={key}");
         let _ = writeln!(text, "prompt_not_before_unix={until}");
     }
+    if let Some(hold) = record.hold_until_unix {
+        let _ = writeln!(text, "hold_until_unix={hold}");
+    }
     text
 }
 
 struct HistoryState {
+    /// `record.hold_until_unix` is set when the file existed but could not be
+    /// trusted: no prompt until then, so a broken history cannot make every
+    /// start prompt again. It is written with the next save.
     record: Record,
-    /// Set when the file existed but could not be trusted: no prompt until this
-    /// time, so a broken history cannot make every start prompt again.
-    hold_until: Option<i64>,
 }
 
 /// The persisted last attempt and prompt suppression of one install.
@@ -140,17 +148,18 @@ impl History {
     /// for one interval from `now`.
     pub(crate) fn open(updates_root: &Path, now: i64) -> Self {
         let path = updates_root.join(HISTORY_FILE);
-        let (record, hold_until) = match read_limited(&path, HISTORY_LIMIT) {
-            Ok(None) => (Record::default(), None),
-            Ok(Some(bytes)) => match parse_record(&bytes) {
-                Some(record) => (record, None),
-                None => (Record::default(), Some(now.saturating_add(SNOOZE_SECS))),
-            },
-            Err(_) => (Record::default(), Some(now.saturating_add(SNOOZE_SECS))),
+        let held = || Record {
+            hold_until_unix: Some(now.saturating_add(SNOOZE_SECS)),
+            ..Record::default()
+        };
+        let record = match read_limited(&path, HISTORY_LIMIT) {
+            Ok(None) => Record::default(),
+            Ok(Some(bytes)) => parse_record(&bytes).unwrap_or_else(held),
+            Err(_) => held(),
         };
         Self {
             path,
-            state: Mutex::new(HistoryState { record, hold_until }),
+            state: Mutex::new(HistoryState { record }),
         }
     }
 
@@ -181,7 +190,13 @@ impl History {
     /// True while a prompt for `key` must not be shown at `now`.
     pub(crate) fn snoozed(&self, key: &str, now: i64) -> bool {
         let state = self.lock();
-        if state.hold_until.is_some_and(|until| until > now) {
+        // Like a snooze time, a hold further away than one interval is an
+        // anomaly and does not hide the prompt.
+        if state
+            .record
+            .hold_until_unix
+            .is_some_and(|until| until > now && until - now <= SNOOZE_SECS)
+        {
             return true;
         }
         match (&state.record.prompt_key, state.record.prompt_not_before_unix) {
@@ -351,6 +366,23 @@ mod tests {
         assert!(!history.snoozed(KEY, now + SNOOZE_SECS));
         // The first check still follows the normal start delay.
         assert_eq!(history.last_attempt(), None);
+    }
+
+    #[test]
+    fn broken_history_hold_survives_a_rewrite_and_restart() {
+        let dir = TempDir::new("auto-update-hold");
+        let now = test_now();
+        std::fs::write(dir.path().join(HISTORY_FILE), b"not a history").unwrap();
+        let history = History::open(dir.path(), now);
+        // A normal write repairs the file; the hold must go with it.
+        history.record_attempt(now + 10).unwrap();
+
+        let reopened = History::open(dir.path(), now + 60);
+        assert_eq!(reopened.last_attempt(), Some(now + 10));
+        assert!(reopened.snoozed(KEY, now + 60));
+        assert!(reopened.snoozed(KEY, now + SNOOZE_SECS - 1));
+        // It is the original hold (from the first start), not a new one.
+        assert!(!reopened.snoozed(KEY, now + SNOOZE_SECS));
     }
 
     #[test]

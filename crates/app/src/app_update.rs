@@ -191,6 +191,10 @@ struct State {
     prompt_withdrawn: bool,
     /// A re-validation of the Ready candidate is running.
     revalidating: bool,
+    /// The Ready candidate whose prompt has been shown and not yet dismissed.
+    /// Its same-version suppression is already saved, so it stays visible
+    /// without being hidden by that suppression.
+    prompt_shown: Option<String>,
 }
 
 /// Identity of one asynchronous operation. A result is applied only when the
@@ -429,6 +433,7 @@ impl AppUpdateService {
                     prompt_validated: false,
                     prompt_withdrawn: false,
                     revalidating: false,
+                    prompt_shown: None,
                 }),
                 restart: OnceLock::new(),
                 owner,
@@ -960,8 +965,10 @@ impl Inner {
             }
             _ => return,
         };
-        // Offered again only after the next re-validation passes.
+        // Offered again only after the suppression has ended and a later
+        // re-validation passes.
         state.prompt_validated = false;
+        state.prompt_shown = None;
         drop(state);
         let until = self.clock.now_unix().saturating_add(auto_update::SNOOZE_SECS);
         if let Err(error) = self.history.snooze(&key, until) {
@@ -970,20 +977,54 @@ impl Inner {
         }
     }
 
-    /// The Ready candidate the prompt may be shown for now, if any.
-    fn prompt_candidate(&self, state: &State) -> Option<String> {
+    /// Marks the Ready candidate as just verified. A same-version suppression
+    /// that is still running keeps it hidden: only a re-validation that
+    /// succeeds after the suppression ended allows the prompt again. A prompt
+    /// that is on screen stays allowed.
+    fn mark_prompt_validated(&self, state: &mut State, offer: &Offer) {
+        state.prompt_withdrawn = false;
+        let shown = state.prompt_shown.as_deref() == Some(offer.id().as_str());
+        state.prompt_validated = shown
+            || !self
+                .history
+                .snoozed(&self.prompt_key(offer), self.clock.now_unix());
+    }
+
+    /// The Ready candidate the prompt may be shown for now, if any. The first
+    /// time a candidate is let through, its suppression (now + 6 hours) is
+    /// saved once, so closing the app without "後で" does not prompt again
+    /// right after the restart. The prompt itself stays visible.
+    fn prompt_candidate(&self, state: &mut State) -> Option<String> {
         let Stage::Ready { offer, .. } = &state.stage else {
             return None;
         };
-        let allowed = self.auto_enabled()
-            && !state.restoring
-            && state.prompt_validated
-            && !state.prompt_withdrawn
-            && self.restart_supported()
-            && !self
-                .history
-                .snoozed(&self.prompt_key(offer), self.clock.now_unix());
-        allowed.then(|| offer.id().as_str().to_owned())
+        let offer = Arc::clone(offer);
+        let id = offer.id().as_str().to_owned();
+        if !self.auto_enabled()
+            || state.restoring
+            || state.revalidating
+            || state.prompt_withdrawn
+            || !self.restart_supported()
+        {
+            return None;
+        }
+        if state.prompt_shown.as_deref() == Some(id.as_str()) {
+            return Some(id);
+        }
+        let key = self.prompt_key(&offer);
+        let now = self.clock.now_unix();
+        if !state.prompt_validated || self.history.snoozed(&key, now) {
+            return None;
+        }
+        state.prompt_shown = Some(id.clone());
+        if let Err(error) = self
+            .history
+            .snooze(&key, now.saturating_add(auto_update::SNOOZE_SECS))
+        {
+            self.diag
+                .note("auto_history", ErrorCode::Io.as_str(), &io_detail(&error), None);
+        }
+        Some(id)
     }
 
     /// Re-validates the held Ready candidate locally (no request) in the
@@ -1026,11 +1067,11 @@ impl Inner {
             }
             match result {
                 Ok(offer) if offer.id().as_str() == id => {
-                    state.prompt_validated = true;
-                    state.prompt_withdrawn = false;
+                    self.mark_prompt_validated(&mut state, &offer);
                 }
                 Ok(_) => {
                     state.prompt_withdrawn = true;
+                    state.prompt_shown = None;
                     self.diag.note(
                         "revalidate",
                         ErrorCode::AssetMismatch.as_str(),
@@ -1040,6 +1081,7 @@ impl Inner {
                 }
                 Err(error) => {
                     state.prompt_withdrawn = true;
+                    state.prompt_shown = None;
                     self.diag
                         .note("revalidate", error.code.as_str(), &error.detail, None);
                 }
@@ -1178,8 +1220,8 @@ impl Inner {
                 let moved = self.publish_candidate(offer.id().as_str(), &work, &target);
                 state.stage = match moved {
                     Ok(()) => {
-                        state.prompt_validated = true;
-                        state.prompt_withdrawn = false;
+                        state.prompt_shown = None;
+                        self.mark_prompt_validated(&mut state, offer);
                         Stage::Ready {
                             offer: Arc::clone(offer),
                             dir: target,
@@ -1490,12 +1532,10 @@ impl Inner {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = Some(lease);
             // It was just verified from the files, so it may be offered.
-            state.prompt_validated = true;
-            state.prompt_withdrawn = false;
-            state.stage = Stage::Ready {
-                offer: Arc::new(offer),
-                dir,
-            };
+            let offer = Arc::new(offer);
+            state.prompt_shown = None;
+            self.mark_prompt_validated(&mut state, &offer);
+            state.stage = Stage::Ready { offer, dir };
         }
     }
 
@@ -1734,7 +1774,7 @@ impl Inner {
     }
 
     fn snapshot(&self) -> AppUpdateSnapshot {
-        let state = self.lock();
+        let mut state = self.lock();
         let mut snapshot = AppUpdateSnapshot::idle(self.config.current_version.clone());
         snapshot.restoring = state.restoring;
         snapshot.restart_supported = self.restart_supported();
@@ -1769,7 +1809,6 @@ impl Inner {
             Stage::Ready { offer, .. } => {
                 snapshot.phase = AppUpdatePhase::Ready;
                 describe(&mut snapshot, offer);
-                snapshot.prompt_candidate_id = self.prompt_candidate(&state);
             }
             // The removal runs in the background; the UI keeps polling until
             // the service returns to Idle (or Ready after a failure).
@@ -1787,6 +1826,9 @@ impl Inner {
                 snapshot.error_code = Some(code.as_str().to_owned());
                 snapshot.error_stage = Some((*stage).to_owned());
             }
+        }
+        if snapshot.phase == AppUpdatePhase::Ready {
+            snapshot.prompt_candidate_id = self.prompt_candidate(&mut state);
         }
         snapshot
     }
@@ -2356,6 +2398,137 @@ mod tests {
         assert_eq!(fixture.requests(), requests);
         assert!(fixture.service.inner.lock().prompt_withdrawn);
         assert_eq!(fixture.service.snapshot().prompt_candidate_id, None);
+    }
+
+    impl Fixture {
+        /// Lets the service offer a restart (the prompt needs it).
+        fn wire_restart(&self) {
+            self.service.enable_restart(RestartWiring {
+                placement: hane_update::platform::Placement {
+                    target: Target::WindowsX64,
+                    install_root: self.dir.path().join("missing"),
+                    coordination_parent: self.dir.path().to_path_buf(),
+                    install_id: install_id(),
+                },
+                exe: self.dir.path().join("missing").join("hane"),
+                state_root: self.dir.path().join("state"),
+            });
+        }
+
+        /// A new service over the same files, as after an application restart.
+        fn restarted(self) -> Fixture {
+            let Fixture {
+                dir,
+                transport,
+                clock,
+                queue,
+                service,
+                release,
+                tag,
+            } = self;
+            // The old service holds the candidate lease until it is dropped.
+            drop(service);
+            let service = AppUpdateService::with_runner(
+                config(&dir, "0.26.0", test_policy(), Some(Target::WindowsX64)),
+                transport.clone(),
+                clock.clone(),
+                manual_runner(&queue),
+            );
+            Fixture {
+                dir,
+                transport,
+                clock,
+                queue,
+                service,
+                release,
+                tag,
+            }
+        }
+
+        fn prompt(&self) -> Option<String> {
+            self.service.snapshot().prompt_candidate_id
+        }
+    }
+
+    #[test]
+    fn prompt_is_hidden_while_the_ready_candidate_is_revalidated() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+
+        fixture.auto_tick_after(7 * HOURS_MS);
+        assert!(fixture.service.inner.lock().revalidating);
+        assert_eq!(fixture.prompt(), None);
+        // The re-validation passes: the prompt that was on screen returns.
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+
+        // A failed re-validation withdraws it as before.
+        fs::remove_file(
+            fixture
+                .updates_root()
+                .join("candidates")
+                .join(&id)
+                .join("archive.zip"),
+        )
+        .unwrap();
+        fixture.auto_tick_after(7 * HOURS_MS);
+        assert_eq!(fixture.prompt(), None);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), None);
+    }
+
+    #[test]
+    fn first_display_saves_the_suppression_and_survives_a_restart() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        // Shown, and it stays shown without "後で".
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        assert_eq!(fixture.prompt(), Some(id));
+
+        // The application is closed without pressing "後で" and started again.
+        let restarted = fixture.restarted();
+        restarted.wire_restart();
+        restarted.service.set_auto_check(true);
+        restarted.service.restore_local();
+        run_queued(&restarted.queue);
+        assert_eq!(restarted.phase(), AppUpdatePhase::Ready);
+        assert_eq!(restarted.prompt(), None);
+        restarted.clock.advance(HOURS_MS);
+        assert_eq!(restarted.prompt(), None);
+    }
+
+    #[test]
+    fn a_revalidation_during_the_snooze_does_not_allow_the_prompt_after_it_ends() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.prepare_ready();
+        fixture.wire_restart();
+        fixture.service.set_auto_check(true);
+        let id = fixture.candidate_id();
+        assert_eq!(fixture.prompt(), Some(id.clone()));
+        fixture.service.snooze_prompt(&id);
+        assert_eq!(fixture.prompt(), None);
+
+        // A re-validation that succeeds inside the snooze allows nothing.
+        fixture.clock.advance(HOURS_MS);
+        assert!(fixture.service.inner.start_revalidate_ready());
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), None);
+
+        // The snooze ends, but no re-validation has passed since.
+        fixture.clock.advance(6 * HOURS_MS);
+        assert_eq!(fixture.prompt(), None);
+
+        // The first re-validation that passes after the end allows it.
+        assert!(fixture.service.inner.start_revalidate_ready());
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.prompt(), Some(id));
     }
 
     #[test]
