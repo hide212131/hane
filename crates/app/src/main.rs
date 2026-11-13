@@ -29,6 +29,7 @@ mod finder_open;
 mod finder_service;
 
 mod app_update;
+mod auto_update;
 mod https_transport;
 mod limited_start;
 mod network_state;
@@ -210,7 +211,8 @@ struct AppOwnedUpdateService(#[allow(dead_code, reason = "owns the service for t
 impl Global for AppOwnedUpdateService {}
 
 /// Builds the app-owned update service. Construction reads no network, ZIP or
-/// update state; the service communicates only after an explicit button press.
+/// update state. The service communicates after an explicit button press, or
+/// from the automatic loop (`open_editor`) once the stored setting allows it.
 /// `None` (no card) when the install location or state root cannot be named.
 fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
     let state = FileStateStore::from_environment().ok()?;
@@ -307,6 +309,12 @@ fn start_update_service() -> Option<Arc<app_update::AppUpdateService>> {
         // the card reports the reason instead of fetching an archive first.
         Err(error) => service.block_placement(&error, &exe),
     }
+    // The stored setting decides whether the app checks on its own. Turning
+    // it on here only arms the schedule; the loop started with the window
+    // makes the first contact no earlier than 30 seconds later, and an
+    // unconfigured or unsupported build never contacts anything.
+    let settings = hane_session::SettingsRepository::load(&state);
+    service.set_auto_check(settings.auto_update_check);
     Some(service)
 }
 
@@ -915,6 +923,7 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         state: network_state(),
     });
     let ai_lifecycle: Arc<dyn AiLifecycle> = ai_owner;
+    let auto_update_service = update_service.clone();
     let update_controller: Option<Arc<dyn AppUpdateController>> = update_service.map(|service| {
         // The service belongs to the application, not to a window.
         cx.set_global(AppOwnedUpdateService(Arc::clone(&service)));
@@ -949,6 +958,7 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                     view.attach_ai_service(ai_service_handle.clone(), cx);
                     view.attach_ai_lifecycle(Some(ai_lifecycle.clone()));
                     view.attach_app_update(update_controller.clone());
+                    view.start_app_update_observer(cx);
                     view.attach_network_applier(Some(network_applier.clone()));
                     #[cfg(target_os = "macos")]
                     view.attach_external_open_inbox(Some(finder_requests.clone()));
@@ -966,6 +976,18 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             },
         )
         .expect("open Hane window");
+    if let Some(service) = auto_update_service {
+        // One loop for the whole app, not one per window. It only asks the
+        // service whether an automatic step is due, and sleeps for the time
+        // the service names (never longer than a minute).
+        cx.spawn(async move |cx| {
+            loop {
+                let wait = service.automatic_tick();
+                cx.background_executor().timer(wait).await;
+            }
+        })
+        .detach();
+    }
     if let Some(plan) = restore {
         // The saved files of the previous version, through the ordinary open
         // path and in order (the active file last, so it is the one shown).

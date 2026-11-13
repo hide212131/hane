@@ -63,6 +63,10 @@ pub struct AppUpdateSnapshot {
     /// policy is configured and the install is at a supported placement. Only
     /// then is "再起動して更新" offered; `false` keeps the card fail-closed.
     pub restart_supported: bool,
+    /// The Ready candidate the restart prompt may be shown for right now: the
+    /// automatic path prepared it, it was re-validated, and "後で" has not
+    /// suppressed it. `None` means no prompt, whatever the phase is.
+    pub prompt_candidate_id: Option<String>,
 }
 
 impl AppUpdateSnapshot {
@@ -79,6 +83,7 @@ impl AppUpdateSnapshot {
             diagnostics_available: false,
             restoring: false,
             restart_supported: false,
+            prompt_candidate_id: None,
         }
     }
 
@@ -132,6 +137,17 @@ pub trait AppUpdateController: Send + Sync {
     fn prepare_restart(&self, candidate_id: &str) -> Result<Box<dyn PreparedUpdate>, String> {
         let _ = candidate_id;
         Err("この環境では更新を適用できません".to_owned())
+    }
+    /// Applies the already stored "auto update check" setting to the
+    /// background checks: `false` cancels only the automatic work. The caller
+    /// saves the setting first and calls this only after that succeeded.
+    fn set_auto_check(&self, enabled: bool) {
+        let _ = enabled;
+    }
+    /// "後で": hides the restart prompt for `candidate_id` and suppresses it
+    /// again for the same version for a while. The Ready update is kept.
+    fn snooze_prompt(&self, candidate_id: &str) {
+        let _ = candidate_id;
     }
 }
 
@@ -406,6 +422,34 @@ pub(crate) fn card_model(snapshot: &AppUpdateSnapshot) -> CardModel {
         }
     }
     model
+}
+
+/// What the restart prompt band shows for one snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PromptModel {
+    pub candidate_id: String,
+    pub message: String,
+}
+
+/// The prompt exists only for a Ready update that can really be applied, is not
+/// being restored, and that the service currently allows to be shown. A
+/// snapshot without a candidate id or version never prompts.
+pub(crate) fn prompt_model(snapshot: &AppUpdateSnapshot) -> Option<PromptModel> {
+    if snapshot.phase != AppUpdatePhase::Ready
+        || !snapshot.restart_supported
+        || snapshot.restoring
+    {
+        return None;
+    }
+    let candidate_id = snapshot.candidate_id.as_ref()?;
+    let version = snapshot.candidate_version.as_ref()?;
+    if snapshot.prompt_candidate_id.as_ref() != Some(candidate_id) {
+        return None;
+    }
+    Some(PromptModel {
+        candidate_id: candidate_id.clone(),
+        message: format!("新しいバージョン {version} があります。再起動して更新しますか？"),
+    })
 }
 
 /// Why the app cannot be restarted for an update right now. Reporting a
@@ -759,6 +803,38 @@ impl EditorView {
         self.app_update = controller;
     }
 
+    /// Starts the window's observer of the update service: it re-validates a
+    /// prepared update locally once (no request) and then redraws the view when
+    /// the service state changes, so the restart prompt appears without the
+    /// settings screen being open. Called once per window.
+    pub fn start_app_update_observer(&mut self, cx: &mut Context<Self>) {
+        let Some(controller) = self.app_update.clone() else {
+            return;
+        };
+        controller.restore_local();
+        cx.spawn(async move |view, cx| {
+            let mut last: Option<AppUpdateSnapshot> = None;
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                let alive = view.update(cx, |view, cx| {
+                    let Some(controller) = view.app_update.as_ref() else {
+                        return false;
+                    };
+                    let current = controller.snapshot();
+                    if last.as_ref() != Some(&current) {
+                        last = Some(current);
+                        cx.notify();
+                    }
+                    true
+                });
+                if !matches!(alive, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Re-validates a prepared update from an earlier run (local files only)
     /// and keeps the card refreshing while that runs.
     pub(super) fn restore_app_update_local(&mut self, cx: &mut Context<Self>) {
@@ -815,7 +891,7 @@ impl EditorView {
             CardAction::Download(candidate) => controller.download(&candidate),
             CardAction::Cancel => controller.cancel(),
             CardAction::Restart => {
-                self.start_update_restart(cx);
+                self.start_update_restart(None, cx);
                 return;
             }
             CardAction::DiscardReady => controller.discard_ready(),
@@ -858,6 +934,121 @@ impl EditorView {
         cx.notify();
     }
 
+    /// Applies and stores the "自動で更新を確認する" setting. The background
+    /// checks are told only after the save succeeded; a failed save leaves the
+    /// previous value in place and says so on the card.
+    pub(super) fn set_auto_update_check(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.settings.auto_update_check == enabled {
+            return;
+        }
+        let previous = self.settings.auto_update_check;
+        self.settings.auto_update_check = enabled;
+        match self.stores.settings().store(&self.settings) {
+            Ok(()) => {
+                self.settings_store_error = None;
+                self.restart_message = None;
+                if let Some(controller) = self.app_update.as_ref() {
+                    controller.set_auto_check(enabled);
+                }
+            }
+            Err(error) => {
+                self.settings.auto_update_check = previous;
+                self.restart_message = Some(format!(
+                    "自動で更新を確認する設定を保存できませんでした: {error}"
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    /// "後で": hides the prompt and keeps the Ready update.
+    fn dismiss_update_prompt(&mut self, candidate: &str, cx: &mut Context<Self>) {
+        self.restart_message = None;
+        if let Some(controller) = self.app_update.as_ref() {
+            controller.snooze_prompt(candidate);
+        }
+        cx.notify();
+    }
+
+    /// The restart prompt band drawn over the top of the document area. It is
+    /// an overlay, so no document coordinate changes, and it owns no focus
+    /// handle, so showing or clicking it never moves the editor focus. Hidden
+    /// while the settings screen is open (the card has the same actions).
+    pub(super) fn update_prompt_element(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        if self.settings_open {
+            return None;
+        }
+        let controller = self.app_update.as_ref()?;
+        let model = prompt_model(&controller.snapshot())?;
+        let border = rgb(self.theme.sidebar_active_background);
+        let make_button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(|| id.to_owned())
+                .cursor_pointer()
+                .px(px(10.0))
+                .py(px(4.0))
+                .rounded_sm()
+                .border_1()
+                .border_color(border)
+                .child(label)
+        };
+        let restart_id = model.candidate_id.clone();
+        let later_id = model.candidate_id;
+        let restart_button = (!self.restart_in_progress).then(|| {
+            make_button("app-update-prompt-restart", "再起動して更新").on_click(cx.listener(
+                move |view, _, _, cx| {
+                    view.restart_message = None;
+                    view.start_update_restart(Some(&restart_id), cx);
+                },
+            ))
+        });
+        let later_button = make_button("app-update-prompt-later", "後で").on_click(cx.listener(
+            move |view, _, _, cx| view.dismiss_update_prompt(&later_id, cx),
+        ));
+        let notice = self.restart_message.clone().map(|message| {
+            div()
+                .id("app-update-prompt-message")
+                .text_color(rgb(self.theme.quote_foreground))
+                .child(message)
+        });
+        Some(
+            div()
+                .id("app-update-prompt")
+                .debug_selector(|| "app-update-prompt".to_owned())
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .occlude()
+                // The editor body listens for presses; a press on the band is
+                // not a click into the document.
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .px(px(16.0))
+                .py(px(8.0))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap_3()
+                .bg(rgb(self.theme.code_background))
+                .border_b_1()
+                .border_color(border)
+                .text_color(rgb(self.theme.foreground))
+                .child(div().child(model.message))
+                .children(notice)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .children(restart_button)
+                        .child(later_button),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// The "アプリの更新" card of the general settings page. `None` when no
     /// update service is attached (tests, unsupported builds).
     pub(super) fn app_update_card(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -897,6 +1088,13 @@ impl EditorView {
                         }),
                 )
         });
+        let auto_view = cx.entity();
+        let auto_toggle = Checkbox::new("settings-app-update-auto")
+            .checked(self.settings.auto_update_check)
+            .label("自動で更新を確認する")
+            .on_click(move |checked, _window, app| {
+                auto_view.update(app, |view, cx| view.set_auto_update_check(*checked, cx));
+            });
         let card = div()
             .id("settings-app-update-card")
             .debug_selector(|| "settings-app-update-card".to_owned())
@@ -948,6 +1146,13 @@ impl EditorView {
                     .gap_2()
                     .children(buttons)
                     .children(diagnostics_button),
+            )
+            .child(auto_toggle)
+            .child(
+                div()
+                    .id("settings-app-update-auto-description")
+                    .text_color(rgb(self.theme.quote_foreground))
+                    .child("起動後と6時間ごとに確認し、更新をダウンロードします。適用前に確認します。"),
             );
         Some(
             div()
@@ -1223,7 +1428,10 @@ impl EditorView {
     /// "再起動して更新". Every blocker is checked first; the helper is then
     /// prepared in the background and the exit is decided only when it has
     /// answered `Prepared`.
-    fn start_update_restart(&mut self, cx: &mut Context<Self>) {
+    ///
+    /// `expected` is the candidate a button was rendered for; when the service
+    /// has moved on to another one, nothing starts.
+    fn start_update_restart(&mut self, expected: Option<&str>, cx: &mut Context<Self>) {
         if self.restart_in_progress {
             return;
         }
@@ -1231,6 +1439,11 @@ impl EditorView {
             return;
         };
         let snapshot = controller.snapshot();
+        if let Some(expected) = expected
+            && snapshot.candidate_id.as_deref() != Some(expected)
+        {
+            return;
+        }
         let (AppUpdatePhase::Ready, true, Some(candidate)) = (
             snapshot.phase,
             snapshot.restart_supported,
@@ -2107,6 +2320,102 @@ mod tests {
         assert!(
             controller.calls().iter().all(|call| call == "restore"),
             "only local work may happen without a button press: {:?}",
+            controller.calls()
+        );
+    }
+
+    fn promptable(phase: AppUpdatePhase) -> AppUpdateSnapshot {
+        AppUpdateSnapshot {
+            restart_supported: true,
+            prompt_candidate_id: Some("cand".to_owned()),
+            ..snapshot(phase)
+        }
+    }
+
+    #[test]
+    fn prompt_requires_ready_and_restart_support() {
+        let model = prompt_model(&promptable(AppUpdatePhase::Ready)).expect("a prompt");
+        assert_eq!(model.candidate_id, "cand");
+        assert!(model.message.contains("0.27.0"));
+        assert!(model.message.contains("再起動して更新しますか"));
+
+        for phase in [
+            AppUpdatePhase::Idle,
+            AppUpdatePhase::Checking,
+            AppUpdatePhase::UpToDate,
+            AppUpdatePhase::Available,
+            AppUpdatePhase::Downloading,
+            AppUpdatePhase::Verifying,
+            AppUpdatePhase::Discarding,
+            AppUpdatePhase::Failed,
+            AppUpdatePhase::Unavailable,
+        ] {
+            assert_eq!(prompt_model(&promptable(phase)), None, "{phase:?}");
+        }
+        let unsupported = AppUpdateSnapshot {
+            restart_supported: false,
+            ..promptable(AppUpdatePhase::Ready)
+        };
+        assert_eq!(prompt_model(&unsupported), None);
+        let restoring = AppUpdateSnapshot {
+            restoring: true,
+            ..promptable(AppUpdatePhase::Ready)
+        };
+        assert_eq!(prompt_model(&restoring), None);
+        // The service has not allowed a prompt (suppressed, withdrawn, ...).
+        let held = AppUpdateSnapshot {
+            prompt_candidate_id: None,
+            ..promptable(AppUpdatePhase::Ready)
+        };
+        assert_eq!(prompt_model(&held), None);
+        let other = AppUpdateSnapshot {
+            prompt_candidate_id: Some("other".to_owned()),
+            ..promptable(AppUpdatePhase::Ready)
+        };
+        assert_eq!(prompt_model(&other), None);
+        let no_version = AppUpdateSnapshot {
+            candidate_version: None,
+            ..promptable(AppUpdatePhase::Ready)
+        };
+        assert_eq!(prompt_model(&no_version), None);
+    }
+
+    #[gpui::test]
+    fn stale_prompt_cannot_restart_another_candidate(cx: &mut gpui::TestAppContext) {
+        let controller = FakeController::new(promptable(AppUpdatePhase::Ready));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, _| view.attach_app_update(Some(attached)));
+        view.update(cx, |view, cx| view.start_update_restart(Some("older"), cx));
+        let (in_progress, message) =
+            view.read_with(cx, |view, _| (view.restart_in_progress, view.restart_message.clone()));
+        assert!(!in_progress, "a stale button must not start a restart");
+        assert_eq!(message, None);
+
+        view.update(cx, |view, cx| view.start_update_restart(Some("cand"), cx));
+        assert!(
+            view.read_with(cx, |view, _| view.restart_in_progress),
+            "the button of the current candidate goes through the normal restart path"
+        );
+    }
+
+    #[gpui::test]
+    fn prompt_does_not_take_editor_focus(cx: &mut gpui::TestAppContext) {
+        let controller = FakeController::new(promptable(AppUpdatePhase::Ready));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let handle = view.read_with(cx, |view, _| view.focus_handle.clone());
+        cx.update(|window, app| window.focus(&handle, app));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            view.attach_app_update(Some(attached));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("app-update-prompt").is_some());
+        assert!(cx.update(|window, _| handle.is_focused(window)));
+        assert!(
+            controller.calls().is_empty(),
+            "showing the prompt starts nothing: {:?}",
             controller.calls()
         );
     }
