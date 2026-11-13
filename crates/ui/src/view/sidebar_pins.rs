@@ -615,7 +615,7 @@ impl EditorView {
             .group_hover(PIN_ROW_GROUP, |style| style.visible())
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
         let Some(relative) = relative else {
-            return slot;
+            return Self::keyed_pin_slot_for_test(id, slot);
         };
         let button = Button::new(id)
             .ghost()
@@ -641,7 +641,27 @@ impl EditorView {
             .debug_selector(move || format!("sidebar-pin-toggle-row:{}:{}", id.0, id.1))
             .size_full()
             .child(button);
-        slot.child(button)
+        Self::keyed_pin_slot_for_test(id, slot.child(button))
+    }
+
+    /// Test-only measurement hook: the slot already carries the shared
+    /// `sidebar-pin-toggle` selector (one per element), so key it per row from
+    /// a same-sized wrapper. The slot is `invisible()` at rest but still
+    /// registers its bounds, and so does this always-painted wrapper. In
+    /// non-test builds this returns the slot unchanged.
+    #[cfg(test)]
+    fn keyed_pin_slot_for_test(id: (&'static str, usize), slot: gpui::Div) -> gpui::Div {
+        div()
+            .debug_selector(move || format!("sidebar-pin-toggle-slot:{}:{}", id.0, id.1))
+            .w(px(PIN_SLOT_SIZE))
+            .h(px(PIN_SLOT_SIZE))
+            .flex_none()
+            .child(slot)
+    }
+
+    #[cfg(not(test))]
+    fn keyed_pin_slot_for_test(_id: (&'static str, usize), slot: gpui::Div) -> gpui::Div {
+        slot
     }
 
     /// The heading and one row per pin, for the separate area or, when the

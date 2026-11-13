@@ -73,12 +73,12 @@ use hane_presentation::{
     table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use hane_session::{
-    CalendarDate, CloseDecision, DateBadgeRange, DocumentSession, DraftId, DraftStore, FileEvent,
+    CalendarDate, CloseDecision, DocumentSession, DraftId, DraftStore, FileEvent,
     FileEventOutcome, FileService, LoadedFile, OpenDecision, OpenPolicy, OsDraftStore,
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, ThemePreference, TitleSyncAction, UnsavedChanges, WorkFolder,
-    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, date_badge_range, decide_title_sync,
+    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, decide_title_sync,
     extract_h1_title, format_relative_date_label, local_today, run_create_new_job,
     run_save_job, split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };

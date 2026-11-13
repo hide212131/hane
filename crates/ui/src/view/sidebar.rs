@@ -410,49 +410,6 @@ impl EditorView {
         let work_folder = self.work_folder.as_ref()?;
         let active_id = self.sessions.active_id();
         let active_path = self.sessions.active().path();
-        let row_icon = |path: &'static str, color: u32| {
-            gpui::svg()
-                .path(path)
-                .flex_none()
-                .size_4()
-                .text_color(rgb(color))
-        };
-        // The leading slot of a row: normally the folder/file icon, sized so
-        // file and folder names start at the same x position. For folders,
-        // hovering the icon swaps it for the expand/collapse chevron in
-        // place, rather than reserving a separate chevron column up front.
-        let entry_icon =
-            |icon_path: &'static str, disclosure_path: Option<&'static str>, color: u32| {
-                let icon_slot = div().relative().flex_none().size_4();
-                match disclosure_path {
-                    None => icon_slot.child(row_icon(icon_path, color)),
-                    Some(disclosure_path) => icon_slot
-                        .group("work-folder-row-icon")
-                        .child(
-                            div()
-                                .group_hover("work-folder-row-icon", |style| style.invisible())
-                                .child(row_icon(icon_path, color)),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .invisible()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .group_hover("work-folder-row-icon", |style| style.visible())
-                                .child(
-                                    gpui::svg()
-                                        .path(disclosure_path)
-                                        .flex_none()
-                                        .w(px(12.0))
-                                        .h(px(12.0))
-                                        .text_color(rgb(color)),
-                                ),
-                        ),
-                }
-            };
         let toolbar_button = |id: &'static str, icon_path: &'static str| {
             div()
                 .id(id)
@@ -650,7 +607,7 @@ impl EditorView {
             .into_iter()
             .enumerate()
             .map(|(index, row)| {
-                let left_padding = px(SIDEBAR_ROW_HORIZONTAL_PADDING + 12.0 * row.depth as f32);
+                let file_indent = px(12.0 * row.depth as f32);
                 match row.node {
                     WorkFolderNode::File(entry) => {
                         let is_active = self.sidebar_focus == SidebarFocus::ActiveSession
@@ -660,14 +617,21 @@ impl EditorView {
                             .inline_rename
                             .as_ref()
                             .is_some_and(|rename| rename.from == path);
-                        let name = if is_renaming {
-                            self.inline_rename_label(cx)
+                        let content = if is_renaming {
+                            file_row_content(
+                                index,
+                                file_indent,
+                                &self.theme,
+                                self.inline_rename_label(cx),
+                                None,
+                            )
                         } else {
                             file_name_label(
+                                index,
                                 entry.file_name(),
+                                file_indent,
                                 today,
                                 &self.theme,
-                                DateBadgePosition::Right,
                             )
                         };
                         let menu_path = path.clone();
@@ -697,8 +661,7 @@ impl EditorView {
                             )
                             .debug_selector(|| "sidebar-file".to_owned())
                             .h(px(SIDEBAR_ROW_HEIGHT))
-                            .pl(left_padding)
-                            .pr(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
+                            .px(px(SIDEBAR_ROW_HORIZONTAL_PADDING))
                             .flex()
                             .flex_row()
                             .items_center()
@@ -707,23 +670,7 @@ impl EditorView {
                             .when(is_active, |element| {
                                 element.bg(rgb(self.theme.sidebar_active_background))
                             })
-                            .child(
-                                div()
-                                    .h_full()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .overflow_hidden()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(entry_icon(
-                                        icons::ICON_FILE,
-                                        None,
-                                        self.theme.sidebar_foreground,
-                                    ))
-                                    .child(name),
-                            )
+                            .child(content)
                             .child(pin_slot)
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                                 window.focus(&view.focus_handle, cx);
@@ -2243,26 +2190,6 @@ fn work_folder_root_display_name(root: &Path) -> String {
     )
 }
 
-/// Where the date badge renders relative to the rest of a file-row label's
-/// text. Both sides render through the same [`file_name_label`] call; only
-/// `Right` is wired to the one current call site today, with `Left` kept
-/// selectable for a future settings screen that lets the user choose.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DateBadgePosition {
-    /// Reserved for a future settings toggle; exercised today by
-    /// [`badge_renders_before_remainder`]'s unit tests.
-    #[allow(dead_code)]
-    Left,
-    Right,
-}
-
-/// Whether the date badge should render before the remainder text for a
-/// given [`DateBadgePosition`]: pure so both orderings are unit-testable
-/// without a GPUI context.
-fn badge_renders_before_remainder(position: DateBadgePosition) -> bool {
-    matches!(position, DateBadgePosition::Left)
-}
-
 /// The file name as shown in a sidebar row: a trailing `.md` extension
 /// (ASCII case-insensitive, matching what the work folder accepts) is
 /// omitted. Display only — the real file name and path are untouched. A name
@@ -2281,75 +2208,160 @@ fn display_file_name(file_name: &str) -> &str {
     }
 }
 
-/// The sidebar's file-row label: the file name (minus a trailing `.md`) unchanged, unless it embeds
-/// a recognized date (`YYYY-MM-DD` or `YYYYMMDD`), in which case that date
-/// renders as its own small badge (`本日`, `17日(木)`, `10/3(土)`,
-/// `2025/10/3(金)`, …) instead of raw digits, positioned per
-/// `badge_position` relative to the rest of the name joined back into one
-/// natural, readable string — while the surrounding text stays exactly what
-/// the file system reports — the real file name, path, and work-folder sort
-/// key never change.
-fn file_name_label(
-    file_name: &str,
-    today: CalendarDate,
-    theme: &Theme,
-    badge_position: DateBadgePosition,
+fn row_icon(path: &'static str, color: u32) -> gpui::Svg {
+    gpui::svg()
+        .path(path)
+        .flex_none()
+        .size_4()
+        .text_color(rgb(color))
+}
+
+/// The leading slot of a row: normally the folder/file icon, sized so
+/// file and folder names start at the same x position. For folders,
+/// hovering the icon swaps it for the expand/collapse chevron in
+/// place, rather than reserving a separate chevron column up front.
+fn entry_icon(
+    icon_path: &'static str,
+    disclosure_path: Option<&'static str>,
+    color: u32,
 ) -> gpui::Div {
-    // Lets this label shrink below its content width inside the sidebar's
-    // fixed-width row instead of pushing the (flex_none) date badge past the
-    // visible edge; `min_w` defaults to the content size otherwise.
-    let row = div()
+    let icon_slot = div().relative().flex_none().size_4();
+    match disclosure_path {
+        None => icon_slot.child(row_icon(icon_path, color)),
+        Some(disclosure_path) => icon_slot
+            .group("work-folder-row-icon")
+            .child(
+                div()
+                    .group_hover("work-folder-row-icon", |style| style.invisible())
+                    .child(row_icon(icon_path, color)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .invisible()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .group_hover("work-folder-row-icon", |style| style.visible())
+                    .child(
+                        gpui::svg()
+                            .path(disclosure_path)
+                            .flex_none()
+                            .w(px(12.0))
+                            .h(px(12.0))
+                            .text_color(rgb(color)),
+                    ),
+            ),
+    }
+}
+
+/// The content region of a file row: the indented icon and name on the left
+/// (the shrinkable name area) and, when given, the date text on the right.
+/// The date sits outside the indented content, so a deep indent or a long
+/// name shrinks the name area first and the date keeps its right edge, which
+/// is the left edge of the row's pin slot. `row_index` only keys the test
+/// selectors of the per-row bounds.
+fn file_row_content(
+    row_index: usize,
+    indent: gpui::Pixels,
+    theme: &Theme,
+    name: gpui::Div,
+    date: Option<gpui::Div>,
+) -> gpui::Div {
+    // The padding must not sit on the shrinkable name area: padding is a
+    // minimum width, so a deep indent would keep it wide and push the date
+    // and the pin slot off the right edge. The name area only clips; the
+    // indent lives on the inner content.
+    let name_area = div()
+        .h_full()
+        .flex_1()
+        .min_w(px(0.0))
+        .overflow_hidden()
+        .flex()
+        .flex_row()
+        .debug_selector(move || format!("sidebar-file-name-area:{row_index}"))
+        .child(
+            div()
+                .h_full()
+                .flex_1()
+                .min_w(px(0.0))
+                .pl(indent)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_1()
+                .child(entry_icon(icons::ICON_FILE, None, theme.sidebar_foreground))
+                .child(name),
+        );
+    div()
+        .h_full()
+        .flex_1()
+        .min_w(px(0.0))
         .flex()
         .flex_row()
         .items_center()
         .gap_1()
-        .min_w(px(0.0));
+        .debug_selector(move || format!("sidebar-file-content:{row_index}"))
+        .child(name_area)
+        .children(date)
+}
+
+/// The sidebar's file-row label: the file name (minus a trailing `.md`)
+/// unchanged, unless it embeds a recognized date (`YYYY-MM-DD` or `YYYYMMDD`),
+/// in which case that date renders as small right-aligned text (`本日`,
+/// `17日(木)`, `10/3(土)`, `2025/10/3(金)`, …) instead of raw digits, while
+/// the rest of the name is joined back into one natural, readable string —
+/// the real file name, path, and work-folder sort key never change.
+fn file_name_label(
+    row_index: usize,
+    file_name: &str,
+    indent: gpui::Pixels,
+    today: CalendarDate,
+    theme: &Theme,
+) -> gpui::Div {
     let file_name = display_file_name(file_name);
+    let name_text = |text: String| div().flex_1().min_w(px(0.0)).truncate().child(text);
     let Some(badge) = split_file_name_for_badge(file_name) else {
-        return row.child(file_name.to_owned());
+        let name = name_text(file_name.to_owned());
+        return file_row_content(row_index, indent, theme, name, None);
     };
-    let remainder = badge.remainder();
-    let chip = date_badge_chip(badge.date, today, theme);
-    let remainder_child =
-        (!remainder.is_empty()).then(|| div().flex_1().min_w(px(0.0)).truncate().child(remainder));
-    if badge_renders_before_remainder(badge_position) {
-        row.child(chip).children(remainder_child)
+    // A date-only name keeps an empty name text so the flexible left side
+    // still fills the row and the date stays on the right.
+    let name = name_text(badge.remainder().to_owned());
+    let date = date_badge_text(row_index, badge.date, today, theme);
+    file_row_content(row_index, indent, theme, name, Some(date))
+}
+
+/// Opacity of the date text: the file name's own foreground for today, and
+/// a quieter 70% of it for every other date (future dates included).
+const DATE_BADGE_OTHER_ALPHA: f32 = 0.7;
+
+fn date_badge_text_alpha(date: CalendarDate, today: CalendarDate) -> f32 {
+    if date == today {
+        1.0
     } else {
-        row.children(remainder_child).child(chip)
+        DATE_BADGE_OTHER_ALPHA
     }
 }
 
-const DATE_BADGE_TODAY_BACKGROUND: u32 = 0x44779e;
-const DATE_BADGE_THIS_WEEK_BACKGROUND: u32 = 0x356d94;
-const DATE_BADGE_THIS_MONTH_BACKGROUND: u32 = 0x2e6287;
-const DATE_BADGE_THIS_YEAR_BACKGROUND: u32 = 0x285878;
-const DATE_BADGE_OTHER_BACKGROUND: u32 = 0x214c68;
-const DATE_BADGE_FOREGROUND: u32 = 0xf7fbff;
-
-fn date_badge_background(date: CalendarDate, today: CalendarDate) -> u32 {
-    match date_badge_range(date, today) {
-        DateBadgeRange::Today => DATE_BADGE_TODAY_BACKGROUND,
-        DateBadgeRange::ThisWeek => DATE_BADGE_THIS_WEEK_BACKGROUND,
-        DateBadgeRange::ThisMonth => DATE_BADGE_THIS_MONTH_BACKGROUND,
-        DateBadgeRange::ThisYear => DATE_BADGE_THIS_YEAR_BACKGROUND,
-        DateBadgeRange::Other => DATE_BADGE_OTHER_BACKGROUND,
-    }
-}
-
-/// A small rounded chip for one badge-worthy date. Its background follows
-/// Hane's feather blues: today is the brightest tier, then the same week,
-/// month, year, and finally all other dates become progressively darker. The
-/// luminance steps are intentionally wider than the original palette so the
-/// order remains legible on a small sidebar chip while the light foreground
-/// still has sufficient contrast on every tier.
-fn date_badge_chip(date: CalendarDate, today: CalendarDate, _theme: &Theme) -> gpui::Div {
+/// One badge-worthy date as plain, background-less 10px text. Only the text
+/// colour is dimmed (not the whole element), so the sidebar foreground keeps
+/// its contrast on both the normal and the active row background.
+fn date_badge_text(
+    row_index: usize,
+    date: CalendarDate,
+    today: CalendarDate,
+    theme: &Theme,
+) -> gpui::Div {
     div()
         .flex_none()
-        .px(px(4.0))
-        .rounded_sm()
-        .bg(rgb(date_badge_background(date, today)))
-        .text_color(rgb(DATE_BADGE_FOREGROUND))
+        .whitespace_nowrap()
+        .text_color(
+            rgb(theme.sidebar_foreground).opacity(date_badge_text_alpha(date, today)),
+        )
         .text_size(px(10.0))
+        .debug_selector(move || format!("sidebar-file-date:{row_index}"))
         .child(format_relative_date_label(date, today))
 }
 
@@ -2596,9 +2608,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn relative_luminance(color: u32) -> f32 {
-        fn linear_channel(channel: u32) -> f32 {
-            let srgb = ((channel & 0xff) as f32) / 255.0;
+    fn relative_luminance(rgb_channels: [f32; 3]) -> f32 {
+        fn linear_channel(srgb: f32) -> f32 {
             if srgb <= 0.04045 {
                 srgb / 12.92
             } else {
@@ -2606,50 +2617,423 @@ mod tests {
             }
         }
 
-        0.2126 * linear_channel(color >> 16)
-            + 0.7152 * linear_channel(color >> 8)
-            + 0.0722 * linear_channel(color)
+        0.2126 * linear_channel(rgb_channels[0])
+            + 0.7152 * linear_channel(rgb_channels[1])
+            + 0.0722 * linear_channel(rgb_channels[2])
+    }
+
+    fn channels(color: u32) -> [f32; 3] {
+        [
+            ((color >> 16) & 0xff) as f32 / 255.0,
+            ((color >> 8) & 0xff) as f32 / 255.0,
+            (color & 0xff) as f32 / 255.0,
+        ]
+    }
+
+    /// The text colour as painted: `foreground` at `alpha` blended over
+    /// `background` per sRGB channel.
+    fn composite_over(foreground: u32, background: u32, alpha: f32) -> [f32; 3] {
+        let foreground = channels(foreground);
+        let background = channels(background);
+        [0, 1, 2].map(|i| foreground[i] * alpha + background[i] * (1.0 - alpha))
     }
 
     #[test]
-    fn date_badge_palette_has_visible_steps_and_readable_light_text() {
-        let backgrounds = [
-            DATE_BADGE_TODAY_BACKGROUND,
-            DATE_BADGE_THIS_WEEK_BACKGROUND,
-            DATE_BADGE_THIS_MONTH_BACKGROUND,
-            DATE_BADGE_THIS_YEAR_BACKGROUND,
-            DATE_BADGE_OTHER_BACKGROUND,
+    fn date_badge_text_uses_full_opacity_only_for_today() {
+        let today = CalendarDate::new(2026, 9, 20).unwrap();
+        assert_eq!(date_badge_text_alpha(today, today), 1.0);
+        for other in [
+            CalendarDate::new(2026, 9, 19).unwrap(),
+            CalendarDate::new(2026, 9, 14).unwrap(),
+            CalendarDate::new(2026, 1, 1).unwrap(),
+            CalendarDate::new(2025, 9, 20).unwrap(),
+            // Future dates are "not today" as well.
+            CalendarDate::new(2026, 9, 21).unwrap(),
+            CalendarDate::new(2027, 9, 20).unwrap(),
+        ] {
+            assert_eq!(date_badge_text_alpha(other, today), 0.7, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn date_badge_text_contrast_is_readable_on_both_sidebar_backgrounds() {
+        let today = CalendarDate::new(2026, 9, 20).unwrap();
+        let other = CalendarDate::new(2026, 9, 19).unwrap();
+        for (theme_name, theme) in [
+            ("light", crate::theme::DEFAULT_THEME),
+            ("dark", crate::theme::DARK_THEME),
+        ] {
+            for (row, background) in [
+                ("normal", theme.sidebar_background),
+                ("active", theme.sidebar_active_background),
+            ] {
+                for date in [today, other] {
+                    let text = composite_over(
+                        theme.sidebar_foreground,
+                        background,
+                        date_badge_text_alpha(date, today),
+                    );
+                    let text_luminance = relative_luminance(text);
+                    let background_luminance = relative_luminance(channels(background));
+                    let (lighter, darker) = if text_luminance > background_luminance {
+                        (text_luminance, background_luminance)
+                    } else {
+                        (background_luminance, text_luminance)
+                    };
+                    let contrast = (lighter + 0.05) / (darker + 0.05);
+                    assert!(
+                        contrast >= 4.5,
+                        "{theme_name} {row} row, {date:?}: contrast {contrast:.2} is too low"
+                    );
+                }
+            }
+        }
+    }
+
+    fn px_f32(value: gpui::Pixels) -> f32 {
+        f32::from(value)
+    }
+
+    /// A `&'static str` selector for one row's debug bounds (the keys the
+    /// render path registers per flatten index).
+    fn row_selector(prefix: &str, row_index: usize) -> &'static str {
+        Box::leak(format!("{prefix}:{row_index}").into_boxed_str())
+    }
+
+    fn pin_selector(row_index: usize) -> &'static str {
+        row_selector("sidebar-pin-toggle-slot:work-folder-pin-toggle", row_index)
+    }
+
+    fn today_file_name(suffix: &str) -> String {
+        let today = local_today();
+        format!(
+            "{:04}-{:02}-{:02}{suffix}.md",
+            today.year, today.month, today.day
+        )
+    }
+
+    fn date_test_root(name: &str) -> PathBuf {
+        let root =
+            std::env::temp_dir().join(format!("hane-date-text-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn date_sidebar_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        root: &Path,
+        expanded: &[PathBuf],
+        min_width: bool,
+    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+        let work_folder = OsWorkFolderScanner.scan(root).unwrap();
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(900.0)));
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.begin_pin_load(cx);
+            if min_width {
+                view.sidebar_width = SIDEBAR_MIN_WIDTH;
+            }
+            for folder in expanded {
+                view.expanded_folders.insert(folder.clone());
+            }
+            cx.notify();
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// The flatten index the render path uses to key a file row's selectors.
+    fn file_row_index(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        path: &Path,
+    ) -> usize {
+        view.read_with(cx, |view, _| {
+            let mut rows = Vec::new();
+            flatten_work_folder_tree(
+                view.work_folder.as_ref().unwrap().children(),
+                1,
+                &view.expanded_folders,
+                &mut rows,
+            );
+            rows.iter()
+                .position(|row| {
+                    matches!(row.node, WorkFolderNode::File(entry) if entry.path() == path)
+                })
+                .expect("the file row is visible")
+        })
+    }
+
+    fn date_bounds(
+        cx: &mut gpui::VisualTestContext,
+        row_index: usize,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        cx.debug_bounds(row_selector("sidebar-file-date", row_index))
+            .expect("the row renders its date text")
+    }
+
+    /// Asserts the date text's right edge is the left edge of the row's
+    /// (always reserved) pin slot, and that it is whole and inside its row.
+    fn assert_date_aligned_to_pin_slot(
+        cx: &mut gpui::VisualTestContext,
+        row_index: usize,
+        context: &str,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        let date = date_bounds(cx, row_index);
+        let pin = cx
+            .debug_bounds(pin_selector(row_index))
+            .expect("the row reserves a pin slot");
+        let content = cx
+            .debug_bounds(row_selector("sidebar-file-content", row_index))
+            .expect("the row renders its content region");
+        let name_area = cx
+            .debug_bounds(row_selector("sidebar-file-name-area", row_index))
+            .expect("the row renders its name area");
+        assert!(
+            (px_f32(date.right()) - px_f32(pin.left())).abs() <= 0.5,
+            "{context}: the date's right edge {date:?} meets the pin slot {pin:?}"
+        );
+        assert!(
+            (px_f32(date.right()) - px_f32(content.right())).abs() <= 0.5,
+            "{context}: the date's right edge {date:?} is the content right edge {content:?}"
+        );
+        assert!(
+            px_f32(date.left()) >= px_f32(content.left()) - 0.5 && date.size.width > px(0.0),
+            "{context}: the whole date {date:?} is inside the content {content:?}"
+        );
+        assert!(
+            px_f32(name_area.right()) <= px_f32(date.left()) + 0.5,
+            "{context}: the name area {name_area:?} does not cover the date {date:?}"
+        );
+        assert!(
+            date.size.height <= px(SIDEBAR_ROW_HEIGHT)
+                && px_f32(date.top()) >= px_f32(content.top()) - 0.5
+                && px_f32(date.bottom()) <= px_f32(content.bottom()) + 0.5,
+            "{context}: the date {date:?} fits the row height inside {content:?}"
+        );
+        date
+    }
+
+    #[gpui::test]
+    fn date_badge_text_aligns_to_the_content_right_edge(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("align");
+        let names = [
+            "2020-01-02_短い.md".to_owned(),
+            format!("2020-01-03_{}.md", "とても長い日本語のファイル名".repeat(4)),
+            today_file_name("_本日のメモ"),
         ];
-        let luminances: Vec<_> = backgrounds
-            .iter()
-            .map(|&background| relative_luminance(background))
-            .collect();
+        for name in &names {
+            std::fs::write(root.join(name), "x").unwrap();
+        }
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
 
-        for pair in luminances.windows(2) {
+        let mut right_edges = Vec::new();
+        for name in &names {
+            let index = file_row_index(&view, cx, &root.join(name));
+            let date = assert_date_aligned_to_pin_slot(cx, index, name);
+            right_edges.push(px_f32(date.right()));
+        }
+        for edge in &right_edges {
             assert!(
-                pair[0] > pair[1],
-                "date badge palette must darken in proximity order: {pair:?}"
-            );
-            assert!(
-                pair[0] - pair[1] >= 0.02,
-                "adjacent date badge colors are too close: {pair:?}"
+                (edge - right_edges[0]).abs() <= 0.5,
+                "every date shares one right edge: {right_edges:?}"
             );
         }
 
-        let foreground_luminance = relative_luminance(DATE_BADGE_FOREGROUND);
-        for (&background, &background_luminance) in backgrounds.iter().zip(&luminances) {
-            let contrast = (foreground_luminance + 0.05) / (background_luminance + 0.05);
-            assert!(
-                contrast >= 4.5,
-                "date badge foreground contrast is too low for {background:#08x}: {contrast:.2}"
-            );
-        }
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
-    #[test]
-    fn the_date_badge_renders_before_the_remainder_only_on_the_left() {
-        assert!(badge_renders_before_remainder(DateBadgePosition::Left));
-        assert!(!badge_renders_before_remainder(DateBadgePosition::Right));
+    #[gpui::test]
+    fn date_only_file_name_keeps_the_date_right_aligned(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("date-only");
+        let date_only = root.join("2020-01-02.md");
+        let named = root.join("2020-01-02_名前あり.md");
+        std::fs::write(&date_only, "x").unwrap();
+        std::fs::write(&named, "x").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+
+        let only_index = file_row_index(&view, cx, &date_only);
+        let named_index = file_row_index(&view, cx, &named);
+        let only = assert_date_aligned_to_pin_slot(cx, only_index, "date only");
+        let with_name = assert_date_aligned_to_pin_slot(cx, named_index, "with name");
+        assert!(
+            (px_f32(only.right()) - px_f32(with_name.right())).abs() <= 0.5,
+            "the date-only row aligns like a named row"
+        );
+        let name_area = cx
+            .debug_bounds(row_selector("sidebar-file-name-area", only_index))
+            .expect("the empty name area remains");
+        assert!(
+            name_area.size.width > px(0.0) && px_f32(name_area.left()) < px_f32(only.left()),
+            "the empty name area still fills the left side: {name_area:?}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn long_and_deep_file_names_do_not_clip_date_badge_text(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("deep-long");
+        let mut folder = root.clone();
+        let mut ancestors = Vec::new();
+        for level in 1..=12 {
+            folder = folder.join(format!("階層{level}"));
+            ancestors.push(folder.clone());
+        }
+        std::fs::create_dir_all(&folder).unwrap();
+        let deep = folder.join(format!(
+            "2020-01-02_{}.md",
+            "とても長い日本語のファイル名".repeat(4)
+        ));
+        let shallow = root.join("2020-01-02_浅い.md");
+        std::fs::write(&deep, "x").unwrap();
+        std::fs::write(&shallow, "x").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &ancestors, true);
+
+        let list = cx.debug_bounds("sidebar-list").expect("the sidebar list");
+        assert!(
+            list.right() <= px(SIDEBAR_MIN_WIDTH),
+            "the sidebar is at its minimum width: {list:?}"
+        );
+        let deep_index = file_row_index(&view, cx, &deep);
+        let shallow_index = file_row_index(&view, cx, &shallow);
+        let deep_date = assert_date_aligned_to_pin_slot(cx, deep_index, "deep and long");
+        let shallow_date = assert_date_aligned_to_pin_slot(cx, shallow_index, "shallow");
+        assert!(
+            px_f32(deep_date.right()) <= px_f32(list.right()),
+            "the deep row's date {deep_date:?} stays inside the viewport {list:?}"
+        );
+        assert!(
+            (px_f32(deep_date.size.width) - px_f32(shallow_date.size.width)).abs() <= 0.5,
+            "the deep row's date is not clipped: {deep_date:?} vs {shallow_date:?}"
+        );
+        assert!(
+            (px_f32(deep_date.right()) - px_f32(shallow_date.right())).abs() <= 0.5,
+            "depth does not move the date"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn pin_hover_does_not_move_date_badge_text(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("pin-hover");
+        let file = root.join("2020-01-02_ピン.md");
+        std::fs::write(&file, "x").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+        let index = file_row_index(&view, cx, &file);
+
+        // Away from the sidebar: the row is not hovered.
+        cx.simulate_mouse_move(gpui::point(px(900.0), px(10.0)), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let before = assert_date_aligned_to_pin_slot(cx, index, "not hovered");
+
+        let content = cx
+            .debug_bounds(row_selector("sidebar-file-content", index))
+            .expect("the row content");
+        cx.simulate_mouse_move(content.center(), None, gpui::Modifiers::none());
+        cx.run_until_parked();
+        let hovered = assert_date_aligned_to_pin_slot(cx, index, "hovered");
+        assert_eq!(before, hovered, "hovering the row does not move the date");
+
+        // Toggling the pin may shift rows vertically (the Pinned area), but
+        // never the date horizontally.
+        let pin = cx.debug_bounds(pin_selector(index)).expect("the pin button");
+        cx.simulate_click(pin.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let pinned = view.read_with(cx, |view, _| !view.sidebar_pins.entries.is_empty());
+        assert!(pinned, "the file is pinned");
+        let index = file_row_index(&view, cx, &file);
+        let after = assert_date_aligned_to_pin_slot(cx, index, "after pinning");
+        assert_eq!(px_f32(before.left()), px_f32(after.left()));
+        assert_eq!(px_f32(before.right()), px_f32(after.right()));
+        assert_eq!(px_f32(before.size.width), px_f32(after.size.width));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn inline_rename_hides_and_restores_date_badge_text(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("rename");
+        let cancelled = root.join("2020-01-02_取消.md");
+        std::fs::write(&cancelled, "x").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+
+        let index = file_row_index(&view, cx, &cancelled);
+        assert!(cx
+            .debug_bounds(row_selector("sidebar-file-date", index))
+            .is_some());
+        let point = date_bounds(cx, index).center();
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.inline_rename_active()));
+        assert!(
+            cx.debug_bounds(row_selector("sidebar-file-date", index))
+                .is_none(),
+            "renaming hides the date text"
+        );
+
+        // Cancel restores it.
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.inline_rename_active()));
+        assert_date_aligned_to_pin_slot(cx, index, "after cancel");
+
+        // Commit restores it on the renamed file's row.
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            assert!(view.replace_and_mark_inline_rename_text(
+                None,
+                "2020-01-02_確定",
+                Some(13..13),
+                cx,
+            ));
+        });
+        cx.simulate_keystrokes("enter");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.inline_rename_active()));
+        let renamed = root.join("2020-01-02_確定.md");
+        assert!(renamed.exists(), "the rename was committed");
+        let index = file_row_index(&view, cx, &renamed);
+        assert_date_aligned_to_pin_slot(cx, index, "after commit");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn clicking_date_badge_text_opens_its_file_row(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("click");
+        let file = root.join("2020-01-02_開く.md");
+        std::fs::write(&file, "# 開く\n").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+        let index = file_row_index(&view, cx, &file);
+
+        let point = date_bounds(cx, index).center();
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.loading_paths.is_empty()
+                    || view.sessions.active().path() == Some(file.as_path()),
+                "the click reached the file row and opened its file"
+            );
+            assert!(view.inline_rename.is_none(), "a single click does not rename");
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     /// Clicks a row's hover "new folder" / "new file" button through the real
