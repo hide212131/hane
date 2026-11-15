@@ -727,6 +727,108 @@ mod tests {
         }
     }
 
+    /// Issue #729: a closing fence long enough to wrap over several rows is
+    /// skipped as a whole by a shift move that spans it, not row by row.
+    #[gpui::test]
+    fn shift_down_and_up_skip_every_row_of_a_wrapped_spanned_fence(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long = "~".repeat(400);
+        let text = format!("before\n{long}\nabc\n{long}\nafter\n");
+        let (view, cx) = open_view(cx, &text);
+        let abc = text.find("abc").unwrap();
+        let after = text.find("after").unwrap();
+
+        // The selection spans the wrapped closing fence from below, so it is
+        // disclosed over several rows; shift-down lands past all of them.
+        set_selection(&view, cx, after + 2, abc);
+        press(cx, "shift-down");
+        let moved = selection(&view, cx);
+        assert_eq!(moved.anchor, SourceOffset(after + 2));
+        assert!(
+            (after..=after + 5).contains(&moved.active.0),
+            "shift-down landed inside the wrapped fence: {moved:?}"
+        );
+
+        // Symmetrically, shift-up from the code row crosses the wrapped
+        // opening fence and lands on the paragraph above it.
+        set_selection(&view, cx, 3, abc);
+        press(cx, "shift-up");
+        let moved = selection(&view, cx);
+        assert_eq!(moved.anchor, SourceOffset(3));
+        assert!(
+            moved.active.0 <= "before".len(),
+            "shift-up landed inside the wrapped fence: {moved:?}"
+        );
+        assert_eq!(self::text(&view, cx), text);
+    }
+
+    /// Issue #729: the distance of a skipped fence counts towards the page, so
+    /// a shift page move across a tall wrapped fence stops right after it
+    /// instead of running on for further rows.
+    #[gpui::test]
+    fn shift_page_down_counts_the_skipped_wrapped_fence_as_distance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long = "~".repeat(800);
+        let rows: String = (0..20).map(|index| format!("q{index}\n")).collect();
+        let text = format!("~~~\ncode\n{long}\n{rows}");
+        let (view, cx) = open_view(cx, &text);
+        let code = text.find("code").unwrap();
+        let first_row = text.find("q0\n").unwrap();
+        let anchor = text.find("q5\n").unwrap();
+
+        set_selection(&view, cx, anchor, code);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                // A page of four rows, far less than the wrapped fence.
+                view.viewport_height = view.line_height() * 5.0;
+                view.move_page(true, true, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        let moved = selection(&view, cx);
+        assert_eq!(moved.anchor, SourceOffset(anchor));
+        view.read_with(cx, |view, _| {
+            let document = view.editor().document();
+            assert_eq!(
+                document.line_for_offset(moved.active).unwrap(),
+                document.line_for_offset(SourceOffset(first_row)).unwrap(),
+                "the page move overshot the row after the fence: {moved:?}"
+            );
+        });
+    }
+
+    /// Issue #729: entering a code block from the paragraph next to it rests
+    /// on a visible code row, never on the hidden delimiter beside it.
+    #[gpui::test]
+    fn vertical_moves_into_a_code_block_from_adjacent_paragraphs_land_on_code_rows(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let text = "before\n```\nabc\nxyz\n```\nafter\n";
+        let (view, cx) = open_view(cx, text);
+        let after = text.find("after").unwrap();
+
+        set_selection(&view, cx, after, after);
+        press(cx, "up");
+        let landed = selection(&view, cx);
+        assert_eq!(landed.anchor, landed.active);
+        assert!(
+            (15..=18).contains(&landed.active.0),
+            "up from the paragraph below missed the last code row: {landed:?}"
+        );
+
+        set_selection(&view, cx, 0, 0);
+        press(cx, "down");
+        let landed = selection(&view, cx);
+        assert_eq!(landed.anchor, landed.active);
+        assert!(
+            (11..=14).contains(&landed.active.0),
+            "down from the paragraph above missed the first code row: {landed:?}"
+        );
+        assert_eq!(self::text(&view, cx), text);
+    }
+
     #[gpui::test]
     fn a_wheel_scroll_after_center_cursor_line_is_not_pulled_back(cx: &mut gpui::TestAppContext) {
         let (view, cx) = open_multi_line(cx);

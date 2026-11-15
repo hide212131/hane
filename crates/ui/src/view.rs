@@ -65,9 +65,9 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
-use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
+use hane_presentation::{ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
+    BlockKind, BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
     VisualBlock, VisualLine, block_height_with_disclosure, block_heights_with_disclosure,
     block_is_joinable, block_line_span, code_line_height, layout_block, parse_joined_span,
     table_delimiter_is_collapsed, trailing_blank_lines,
@@ -4120,13 +4120,91 @@ impl EditorView {
         shaper: &dyn LineShaper,
     ) -> Option<f32> {
         let caret = self.editor().selection().active;
-        let (block, layout) = self.layout_around(caret, shaper)?;
-        let from = layout.point_for_source(&block, caret, shaper);
-        let x = self
-            .editor()
-            .preferred_visual_x()
+        let (mut target, mut distance, x) =
+            self.resolve_vertical_step(caret, down, None, shaper)?;
+        // A fence disclosed only because the selection spans it is not a stop
+        // for a continuing shift move (Issue #729): the step carries on from it
+        // to the next row. Reaching the document edge there keeps the caret.
+        if extend {
+            // A wrapped fence spans several display rows, so keep resolving
+            // until the landing is no longer a crossed fence row. Each step
+            // must advance in the move direction, which bounds the loop.
+            while let Some(landed) = target {
+                if !self.is_crossed_fence(landed) {
+                    break;
+                }
+                let Some((next, step_distance, _)) =
+                    self.resolve_vertical_step(landed, down, Some(x), shaper)
+                else {
+                    break;
+                };
+                match next {
+                    None => {
+                        target = None;
+                        distance = Some(0.0);
+                    }
+                    Some(next_offset) => {
+                        let advanced = if down {
+                            next_offset > landed
+                        } else {
+                            next_offset < landed
+                        };
+                        if !advanced {
+                            break;
+                        }
+                        target = next;
+                        distance = distance.zip(step_distance).map(|(sum, step)| sum + step);
+                    }
+                }
+            }
+        }
+        // No neighbor means the caret is on the first or last row of the
+        // document: staying put is the move.
+        if let Some(target) = target
+            && let Err(error) = self.editor_mut().move_vertical_to(target, extend, x)
+        {
+            self.report_error("vertical move", error);
+        }
+        // An unmeasurable step counts as one line so a page still terminates.
+        Some(distance.unwrap_or_else(|| self.line_height()))
+    }
+
+    /// Resolves one vertical step from `caret` against the layout: the target
+    /// (`None` at the document edge), the distance travelled, and the x aimed
+    /// at. `x_hint` overrides the remembered x. `None` when the caret's block
+    /// cannot be laid out.
+    fn resolve_vertical_step(
+        &self,
+        caret: SourceOffset,
+        down: bool,
+        x_hint: Option<f32>,
+        shaper: &dyn LineShaper,
+    ) -> Option<(Option<SourceOffset>, Option<f32>, f32)> {
+        let (mut block, mut layout) = self.layout_around(caret, shaper)?;
+        let mut from = layout.point_for_source(&block, caret, shaper);
+        let x = x_hint
+            .or_else(|| self.editor().preferred_visual_x())
             .or_else(|| from.map(|point| point.x))?;
-        let (target, distance) = match layout.vertical_target(&block, caret, down, x, shaper) {
+        let mut vertical = layout.vertical_target(&block, caret, down, x, shaper);
+        // The caret's neighbor lines may all be hidden rows (an inactive fence
+        // delimiter). The block can then still hold a visible row beyond them,
+        // so widen the presented window before treating this as the block edge.
+        let mut margin = 1;
+        while vertical == VerticalMove::PastEdge
+            && margin < 9
+            && self.window_leaves_block_lines(caret, margin, down)
+        {
+            margin = if margin == 1 { 3 } else { 9 };
+            let Some((wide_block, wide_layout)) = self.layout_around_widened(caret, shaper, margin)
+            else {
+                break;
+            };
+            block = wide_block;
+            layout = wide_layout;
+            from = layout.point_for_source(&block, caret, shaper);
+            vertical = layout.vertical_target(&block, caret, down, x, shaper);
+        }
+        let (target, distance) = match vertical {
             VerticalMove::To(offset) => {
                 let distance = from
                     .zip(layout.point_for_source(&block, offset, shaper))
@@ -4148,15 +4226,70 @@ impl EditorView {
             },
             VerticalMove::Unknown => return None,
         };
-        // No neighbor means the caret is on the first or last row of the
-        // document: staying put is the move.
-        if let Some(target) = target
-            && let Err(error) = self.editor_mut().move_vertical_to(target, extend, x)
-        {
-            self.report_error("vertical move", error);
-        }
-        // An unmeasurable step counts as one line so a page still terminates.
-        Some(distance.unwrap_or_else(|| self.line_height()))
+        Some((target, distance, x))
+    }
+
+    /// Whether `offset` sits on a fence row the selection merely spans: a row
+    /// the presentation collapses when nothing is disclosed, that neither end
+    /// of the selection (the caret included) rests on.
+    fn is_crossed_fence(&self, offset: SourceOffset) -> bool {
+        let selection = self.editor().selection();
+        let document = self.editor().document();
+        let Some(line) = document.line_for_offset(offset).ok().map(|line| line.0 as u64) else {
+            return false;
+        };
+        let on_end = [selection.anchor, selection.active]
+            .into_iter()
+            .any(|end| document.line_for_offset(end).ok().map(|l| l.0 as u64) == Some(line));
+        !on_end && self.collapses_when_inactive(offset, line)
+    }
+
+    /// Whether the presentation collapses document line `line_id`, in the block
+    /// holding `offset`, to a zero-height row when no disclosure is active —
+    /// the formal signal of an inactive fence delimiter. The block is presented
+    /// under the reading policy, which discloses nothing, so no source text is
+    /// inspected here.
+    fn collapses_when_inactive(&self, offset: SourceOffset, line_id: u64) -> bool {
+        let Some(indexed) = self.block_at_offset(offset) else {
+            return false;
+        };
+        let line = line_id as usize;
+        let window = line..line + 1;
+        let joined = self.current_joined_parse(&indexed);
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(&indexed));
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(&indexed));
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed));
+        presented_block_with_diagram(
+            BlockPresentationRequest {
+                editor: self.editor(),
+                block: &indexed,
+                visible: &window,
+                joined,
+                list_projection,
+                fence_height_projection,
+                table_projection,
+                forced_disclosure: None,
+                line_height: self.line_height(),
+                disclosure_policy: DisclosurePolicy::Reading,
+            },
+            None,
+        )
+        .is_some_and(|visual| {
+            visual
+                .lines
+                .iter()
+                .any(|row| {
+                    row.line_id == line_id
+                        && row.kind == BlockKind::CodeBlock
+                        && row.height() <= 0.0
+                })
+        })
     }
 
     /// Moves the caret about one viewport up or down (Issue #494).
@@ -4315,10 +4448,41 @@ impl EditorView {
         offset: SourceOffset,
         shaper: &dyn LineShaper,
     ) -> Option<(VisualBlock, BlockLayout)> {
+        self.layout_around_widened(offset, shaper, 1)
+    }
+
+    /// True when a window of `margin` lines around the caret stops short of the
+    /// caret block's own first (`!down`) or last (`down`) line.
+    fn window_leaves_block_lines(&self, offset: SourceOffset, margin: usize, down: bool) -> bool {
+        let Some(indexed) = self.block_at_offset(offset) else {
+            return false;
+        };
+        let Some(span) = block_line_span(self.editor().document(), &indexed) else {
+            return false;
+        };
+        let Ok(line) = self.editor().document().line_for_offset(offset) else {
+            return false;
+        };
+        if down {
+            line.0 + margin + 1 < span.end
+        } else {
+            line.0.saturating_sub(margin) > span.start
+        }
+    }
+
+    /// [`Self::layout_around`] with `margin` lines presented on each side of
+    /// the caret line instead of one, for a vertical step whose neighbor lines
+    /// are all hidden rows.
+    fn layout_around_widened(
+        &self,
+        offset: SourceOffset,
+        shaper: &dyn LineShaper,
+        margin: usize,
+    ) -> Option<(VisualBlock, BlockLayout)> {
         let indexed = self.block_at_offset(offset)?;
         let line = self.editor().document().line_for_offset(offset).ok()?.0;
-        let mut window_start = line.saturating_sub(1);
-        let mut window_end = line + 2;
+        let mut window_start = line.saturating_sub(margin);
+        let mut window_end = line + margin + 1;
         if let Some(table) = self
             .current_index()
             .and_then(|index| index.table_projection(&indexed))
@@ -4418,33 +4582,62 @@ impl EditorView {
         shaper: &dyn LineShaper,
     ) -> Option<(SourceOffset, f32)> {
         let policy = self.disclosure_policy();
-        let (indexed, window) =
-            neighbor_block_window(self.editor(), self.current_index(), block, down, policy)?;
-        let joined = self.current_joined_parse(&indexed);
-        let list_projection = self
-            .current_index()
-            .and_then(|index| index.list_projection(&indexed));
-        let table_projection = self
-            .current_index()
-            .and_then(|index| index.table_projection(&indexed));
-        // A neighbor that is a rendered diagram is stepped onto through the same
-        // rows it is drawn with, not through its source lines.
-        let diagram = self.diagram_plan_for(&indexed);
-        target_in_neighbor(
-            self.editor(),
-            &indexed,
-            window,
-            down,
-            x,
-            self.content_width,
-            shaper,
-            joined,
-            list_projection,
-            table_projection,
-            diagram.as_ref(),
-            self.line_height(),
-            policy,
-        )
+        let mut boundary = block.source_range;
+        loop {
+            let (indexed, window) = neighbor_block_window_from(
+                self.editor(),
+                self.current_index(),
+                boundary,
+                down,
+                policy,
+            )?;
+            let joined = self.current_joined_parse(&indexed);
+            let list_projection = self
+                .current_index()
+                .and_then(|index| index.list_projection(&indexed));
+            let fence_height_projection = self
+                .current_index()
+                .and_then(|index| index.fence_height_projection(&indexed));
+            let table_projection = self
+                .current_index()
+                .and_then(|index| index.table_projection(&indexed));
+            // A neighbor that is a rendered diagram is stepped onto through the
+            // same rows it is drawn with, not through its source lines.
+            let diagram = self.diagram_plan_for(&indexed);
+            match resolve_neighbor_target(
+                self.editor(),
+                &indexed,
+                window,
+                down,
+                x,
+                self.content_width,
+                shaper,
+                joined,
+                list_projection,
+                fence_height_projection,
+                table_projection,
+                diagram.as_ref(),
+                self.line_height(),
+                policy,
+            ) {
+                NeighborTarget::Found(target) => return Some(target),
+                NeighborTarget::Failed => return None,
+                // A block with nothing but hidden rows (an empty fence) has no
+                // row to rest on: keep going into the block beyond it.
+                NeighborTarget::NoVisibleRow => {
+                    let next = indexed.source_range;
+                    let progressed = if down {
+                        next.end > boundary.end
+                    } else {
+                        next.start < boundary.start
+                    };
+                    if !progressed {
+                        return None;
+                    }
+                    boundary = next;
+                }
+            }
+        }
     }
 
     /// Block boundaries around one source offset: the formal index when it
@@ -5158,6 +5351,7 @@ impl EditorView {
 /// the resolved block's own id before presenting it, instead of the resolve
 /// and the presentation being fused into one call that never gets a chance to
 /// supply one.
+#[cfg(test)]
 fn neighbor_block_window(
     editor: &Editor,
     index: Option<&BlockIndex>,
@@ -5165,12 +5359,24 @@ fn neighbor_block_window(
     down: bool,
     policy: DisclosurePolicy,
 ) -> Option<(IndexedBlock, Range<usize>)> {
+    neighbor_block_window_from(editor, index, block.source_range, down, policy)
+}
+
+/// [`neighbor_block_window`] for a block known only by its source range, so
+/// the search can continue from a neighbor that had no row to land on.
+fn neighbor_block_window_from(
+    editor: &Editor,
+    index: Option<&BlockIndex>,
+    boundary: SourceRange,
+    down: bool,
+    policy: DisclosurePolicy,
+) -> Option<(IndexedBlock, Range<usize>)> {
     let document = editor.document();
     let probe = if down {
-        let next = block.source_range.end;
+        let next = boundary.end;
         (next.0 < document.len_bytes().0).then_some(next)?
     } else {
-        SourceOffset(block.source_range.start.0.checked_sub(1)?)
+        SourceOffset(boundary.start.0.checked_sub(1)?)
     };
     let indexed = block_at_offset(index, document, probe)?;
     let span = block_line_span(document, &indexed)?;
@@ -5221,6 +5427,7 @@ fn neighbor_block_window(
 /// `presented_block` so a joinable neighbor beyond `JOIN_SYNC_LINE_BUDGET`
 /// resolves the same marker pairs vertical navigation's one-line window would
 /// otherwise never see the other half of.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn target_in_neighbor(
     editor: &Editor,
@@ -5232,45 +5439,120 @@ fn target_in_neighbor(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
     table_projection: Option<&TableProjection>,
     diagram: Option<&hane_presentation::DiagramPlan>,
     line_height: f32,
     disclosure_policy: DisclosurePolicy,
 ) -> Option<(SourceOffset, f32)> {
-    let visual = presented_block_with_diagram(
-        BlockPresentationRequest {
-            editor,
-            block: indexed,
-            visible: &window,
-            joined,
-            list_projection,
-            fence_height_projection: None,
-            table_projection,
-            // Vertical caret navigation onto a neighbor block, unrelated to the
-            // document-find bar's current match.
-            forced_disclosure: None,
-            line_height,
-            disclosure_policy,
-        },
+    match resolve_neighbor_target(
+        editor,
+        indexed,
+        window,
+        down,
+        x,
+        width,
+        shaper,
+        joined,
+        list_projection,
+        fence_height_projection,
+        table_projection,
         diagram,
-    )?;
-    let layout = layout_block(&visual, width, shaper);
-    let row = if down {
-        0
-    } else {
-        layout.lines.len().checked_sub(1)?
+        line_height,
+        disclosure_policy,
+    ) {
+        NeighborTarget::Found(target) => Some(target),
+        NeighborTarget::NoVisibleRow | NeighborTarget::Failed => None,
+    }
+}
+
+/// What stepping onto a neighbor block resolved to.
+enum NeighborTarget {
+    /// The caret target and its distance from the shared block edge.
+    Found((SourceOffset, f32)),
+    /// The block has rows, but every one is hidden (an empty fence): the caller
+    /// continues into the block beyond it.
+    NoVisibleRow,
+    /// The block could not be presented or the position not resolved.
+    Failed,
+}
+
+/// Presents and lays out the neighbor, widening the window past hidden rows
+/// (an inactive fence delimiter has no height and cannot hold the caret) until
+/// a visible row on the near side is found or the whole block is covered.
+#[allow(clippy::too_many_arguments)]
+fn resolve_neighbor_target(
+    editor: &Editor,
+    indexed: &IndexedBlock,
+    window: Range<usize>,
+    down: bool,
+    x: f32,
+    width: f32,
+    shaper: &dyn LineShaper,
+    joined: Option<&JoinedParse>,
+    list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
+    table_projection: Option<&TableProjection>,
+    diagram: Option<&hane_presentation::DiagramPlan>,
+    line_height: f32,
+    disclosure_policy: DisclosurePolicy,
+) -> NeighborTarget {
+    let Some(span) = block_line_span(editor.document(), indexed) else {
+        return NeighborTarget::Failed;
     };
-    let target = layout.source_at_x(&visual, row, x, shaper)?;
-    // Distance from the edge shared with the block the caret leaves to the
-    // target row, measured inside this one layout so a partial window's
-    // omitted-line offset cancels out.
-    let target_y = layout.point_for_source(&visual, target, shaper)?.y;
-    let from_edge = if down {
-        target_y
-    } else {
-        layout.height() - target_y
-    };
-    Some((target, from_edge))
+    let mut window = window;
+    loop {
+        let Some(visual) = presented_block_with_diagram(
+            BlockPresentationRequest {
+                editor,
+                block: indexed,
+                visible: &window,
+                joined,
+                list_projection,
+                fence_height_projection,
+                table_projection,
+                // Vertical caret navigation onto a neighbor block, unrelated to
+                // the document-find bar's current match.
+                forced_disclosure: None,
+                line_height,
+                disclosure_policy,
+            },
+            diagram,
+        ) else {
+            return NeighborTarget::Failed;
+        };
+        let layout = layout_block(&visual, width, shaper);
+        let row = if down {
+            layout.lines.iter().position(|row| row.height > 0.0)
+        } else {
+            layout.lines.iter().rposition(|row| row.height > 0.0)
+        };
+        if let Some(row) = row {
+            let Some(target) = layout.source_at_x(&visual, row, x, shaper) else {
+                return NeighborTarget::Failed;
+            };
+            // Distance from the edge shared with the block the caret leaves to
+            // the target row, measured inside this one layout so a partial
+            // window's omitted-line offset cancels out.
+            let Some(point) = layout.point_for_source(&visual, target, shaper) else {
+                return NeighborTarget::Failed;
+            };
+            let from_edge = if down {
+                point.y
+            } else {
+                layout.height() - point.y
+            };
+            return NeighborTarget::Found((target, from_edge));
+        }
+        if window.start <= span.start && window.end >= span.end {
+            return NeighborTarget::NoVisibleRow;
+        }
+        window = if down {
+            window.start..(window.end + 2).min(span.end)
+        } else {
+            window.start.saturating_sub(2).max(span.start)..window.end
+        };
+    }
 }
 
 /// Where a left click on a text row landed.
@@ -5364,6 +5646,7 @@ fn neighbor_row_target(
 ) -> Option<SourceOffset> {
     let (indexed, window) =
         neighbor_block_window(editor, index, block, down, DisclosurePolicy::Editing)?;
+    let fence_height_projection = index.and_then(|index| index.fence_height_projection(&indexed));
     target_in_neighbor(
         editor,
         &indexed,
@@ -5374,6 +5657,7 @@ fn neighbor_row_target(
         shaper,
         joined,
         None,
+        fence_height_projection,
         None,
         None,
         DEFAULT_LINE_HEIGHT,
@@ -12538,6 +12822,86 @@ mod tests {
             (0, x),
             "the caret lands on the first row of the next block, at the x it was aiming at"
         );
+    }
+
+    /// The ordinal of the block that starts at `start`.
+    fn ordinal_starting_at(index: &BlockIndex, start: usize) -> usize {
+        (0..)
+            .find(|ordinal| {
+                index
+                    .block(*ordinal)
+                    .is_some_and(|block| block.source_range.start.0 == start)
+            })
+            .expect("a block starts there")
+    }
+
+    #[test]
+    fn moving_up_into_a_fenced_block_skips_its_hidden_closing_fence() {
+        let source = "```\nabc\n```\nafter\n";
+        let editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let ordinal = ordinal_starting_at(&index, source.find("after").unwrap());
+        let (after, _) = laid_out(&editor, &index, ordinal, &shaper);
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &after,
+            false,
+            0.0,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("there is a block above");
+        assert_eq!(
+            target,
+            SourceOffset(4),
+            "the caret lands on the last code row, not the hidden fence"
+        );
+    }
+
+    #[test]
+    fn moving_down_into_a_fenced_block_skips_its_hidden_opening_fence() {
+        let source = "before\n\n```\nabc\n```\n";
+        let editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let (before, _) = laid_out(&editor, &index, 0, &shaper);
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &before,
+            true,
+            0.0,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("there is a block below");
+        assert_eq!(target, SourceOffset(source.find("abc").unwrap()));
+    }
+
+    #[test]
+    fn moving_up_into_a_tilde_fence_with_a_language_skips_the_closing_fence() {
+        let source = "~~~~rust\nlet a = 1;\n~~~~\nafter\n";
+        let editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let shaper = FixedAdvanceShaper::new(8.0);
+        let ordinal = ordinal_starting_at(&index, source.find("after").unwrap());
+        let (after, _) = laid_out(&editor, &index, ordinal, &shaper);
+        let target = neighbor_row_target(
+            &editor,
+            Some(&index),
+            &after,
+            false,
+            0.0,
+            TEST_WIDTH,
+            &shaper,
+            None,
+        )
+        .expect("there is a block above");
+        assert_eq!(target, SourceOffset(source.find("let").unwrap()));
     }
 
     #[test]
@@ -23355,6 +23719,72 @@ mod tests {
         });
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Issue #729: ↑ from the line right after a closing code fence used to
+    /// report a successful move to the hidden fence row and stay in place.
+    #[gpui::test]
+    fn real_up_and_down_keys_move_across_a_hidden_closing_fence(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "```\nabc\n```\n";
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(12)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let selection = |cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| view.editor().selection())
+        };
+
+        cx.simulate_keystrokes("up");
+        assert_eq!(selection(cx), Selection::caret(SourceOffset(4)));
+        cx.simulate_keystrokes("down");
+        assert_eq!(selection(cx), Selection::caret(SourceOffset(12)));
+
+        // Entering the fence with Left discloses it; ↑ and ↓ then work from it.
+        cx.simulate_keystrokes("left");
+        assert_eq!(selection(cx), Selection::caret(SourceOffset(11)));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("up");
+        let up = selection(cx);
+        assert_eq!(up.anchor, up.active);
+        assert!((4..8).contains(&up.active.0), "caret on the code row: {up:?}");
+        cx.simulate_keystrokes("down");
+        let down = selection(cx);
+        assert_eq!(down.anchor, down.active);
+        assert!(down.active.0 >= 8, "caret moved past the code row: {down:?}");
+
+        view.update(cx, |view, _| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(12)))
+                .unwrap();
+        });
+        cx.run_until_parked();
+        cx.simulate_keystrokes("shift-up");
+        assert_eq!(
+            selection(cx),
+            Selection {
+                anchor: SourceOffset(12),
+                active: SourceOffset(4),
+            }
+        );
+        cx.simulate_keystrokes("shift-down");
+        assert_eq!(
+            selection(cx),
+            Selection {
+                anchor: SourceOffset(12),
+                active: SourceOffset(12),
+            }
+        );
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), text);
+        });
     }
 
     #[gpui::test]

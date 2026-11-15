@@ -813,10 +813,18 @@ impl BlockLayout {
                 .source_at_xy(block, row, x, local_y, shaper)
                 .map_or(VerticalMove::Unknown, VerticalMove::To);
         }
-        let target = if down { row + 1 } else { row.wrapping_sub(1) };
-        if down && target >= self.lines.len() || !down && row == 0 {
+        // Rows with no height (an inactive fence delimiter) are not rows the
+        // caret can rest on: resolving one maps back to the neighboring
+        // visible text, which would report a successful move that goes
+        // nowhere. They stay in `lines` and are only passed over here.
+        let target = if down {
+            (row + 1..self.lines.len()).find(|&index| self.lines[index].height > 0.0)
+        } else {
+            (0..row).rev().find(|&index| self.lines[index].height > 0.0)
+        };
+        let Some(target) = target else {
             return VerticalMove::PastEdge;
-        }
+        };
         let target_y = self.lines[target].table_edge_y_for_x(x, down);
         self.source_at_xy(block, target, x, target_y, shaper)
             .map_or(VerticalMove::Unknown, VerticalMove::To)
