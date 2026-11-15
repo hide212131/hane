@@ -11772,6 +11772,72 @@ mod tests {
         });
     }
 
+    /// Issue #728: Enter left of a marker inserts a blank line above without a
+    /// duplicate marker, and a single undo / redo restores each step.
+    #[gpui::test]
+    fn source_first_list_editing_enter_at_marker_left_edge_with_undo_redo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(0)))
+                .unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "\n- abc");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(1)));
+
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(0)));
+            view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "\n- abc");
+        });
+    }
+
+    /// Issue #728: continuation-line Enter keeps the item, then typing
+    /// continues immediately without waiting for background parsing.
+    #[gpui::test]
+    fn source_first_list_editing_enter_on_continuation_then_type(cx: &mut gpui::TestAppContext) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc\n  def", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\n  def\n  ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(14)));
+
+            view.editor_mut().insert_text("ghi").unwrap();
+            view.after_input(cx);
+            assert_eq!(view.editor().document().full_text(), "- abc\n  def\n  ghi");
+
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\n  def");
+        });
+    }
+
+    /// Issue #728: an unindented left edge below an item leaves the list, and
+    /// CRLF documents keep CRLF for every inserted boundary.
+    #[gpui::test]
+    fn source_first_list_editing_enter_at_continuation_left_edge_crlf(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc\r\n", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(7)))
+                .unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
+
+            view.editor_mut().insert_text("def").unwrap();
+            view.after_input(cx);
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\ndef");
+        });
+    }
+
     #[gpui::test]
     fn source_first_list_editing_exits_list_after_empty_marker_backspace(
         cx: &mut gpui::TestAppContext,

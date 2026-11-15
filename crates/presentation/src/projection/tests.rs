@@ -2540,6 +2540,41 @@ fn list_continuation_and_inner_blank_lines_keep_their_owner() {
     }
 }
 
+/// Issue #728: documents produced by the list Enter rules (blank line above a
+/// marker, a blank-indented continuation line, an outer paragraph after the
+/// list) keep every source offset reachable and never move the caret into a
+/// duplicated marker column.
+#[test]
+fn list_enter_results_keep_source_offsets_and_caret_points_consistent() {
+    let shaper = testing::FixedAdvanceShaper::default();
+    for source in [
+        "\n- abc",
+        "\n10. abc",
+        "\n- [x] abc",
+        "- parent\n\n  - child",
+        "- abc\n  def\n  ",
+        "- abc\n  \n  def",
+        "- abc\n\ndef",
+        "- abc\r\n\r\ndef",
+    ] {
+        for formal in [false, true] {
+            let (visual, _) = present_container_block(source, formal, true, false);
+            let layout = layout_block(&visual, 400.0, &shaper);
+            for line in &visual.lines {
+                let start = line.source_range.start;
+                assert!(
+                    layout.row_for_source(start).is_some(),
+                    "row for {start:?} in {source:?} formal={formal}"
+                );
+                assert!(
+                    layout.point_for_source(&visual, start, &shaper).is_some(),
+                    "caret point for {start:?} in {source:?} formal={formal}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn quote_inner_blank_marker_line_keeps_its_quote_owner() {
     let (visual, content_end) = present_container_block("> a\n>\n> b\n\n", true, true, false);
