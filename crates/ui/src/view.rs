@@ -4198,6 +4198,10 @@ impl EditorView {
         shaper: &dyn LineShaper,
     ) -> VerticalMove {
         let selection = self.editor().selection();
+        let document = self.editor().document();
+        let line_of =
+            |at: SourceOffset| document.line_for_offset(at).ok().map(|line| line.0 as u64);
+        let ends = [line_of(selection.anchor), line_of(selection.active)];
         let mut vertical = vertical;
         // At most an opening and a closing fence can be crossed in one step.
         for _ in 0..2 {
@@ -4207,18 +4211,12 @@ impl EditorView {
             let crossed = layout
                 .row_for_source(offset)
                 .and_then(|row| layout.lines.get(row))
-                .is_some_and(|row| {
-                    let holds = |at: SourceOffset| {
-                        row.source_range.start <= at && at <= row.source_range.end
-                    };
+                .and_then(|row| block.lines.get(row.line))
+                .is_some_and(|line| {
                     block.kind == BlockKind::CodeBlock
-                        && block.lines.get(row.line).is_some_and(|line| {
-                            let text = line.visual_text.trim_start();
-                            line.disclosure.is_some()
-                                && (text.starts_with("```") || text.starts_with("~~~"))
-                        })
-                        && !holds(selection.anchor)
-                        && !holds(selection.active)
+                        && line.disclosure.is_some()
+                        && !ends.contains(&Some(line.line_id))
+                        && self.collapses_when_inactive(offset, line.line_id)
                 });
             if !crossed {
                 break;
@@ -4226,6 +4224,50 @@ impl EditorView {
             vertical = layout.vertical_target(block, offset, down, x, shaper);
         }
         vertical
+    }
+
+    /// Whether the presentation collapses document line `line_id`, in the block
+    /// holding `offset`, to a zero-height row when no disclosure is active —
+    /// the formal signal of an inactive fence delimiter. The block is presented
+    /// under the reading policy, which discloses nothing, so no source text is
+    /// inspected here.
+    fn collapses_when_inactive(&self, offset: SourceOffset, line_id: u64) -> bool {
+        let Some(indexed) = self.block_at_offset(offset) else {
+            return false;
+        };
+        let line = line_id as usize;
+        let window = line..line + 1;
+        let joined = self.current_joined_parse(&indexed);
+        let list_projection = self
+            .current_index()
+            .and_then(|index| index.list_projection(&indexed));
+        let fence_height_projection = self
+            .current_index()
+            .and_then(|index| index.fence_height_projection(&indexed));
+        let table_projection = self
+            .current_index()
+            .and_then(|index| index.table_projection(&indexed));
+        presented_block_with_diagram(
+            BlockPresentationRequest {
+                editor: self.editor(),
+                block: &indexed,
+                visible: &window,
+                joined,
+                list_projection,
+                fence_height_projection,
+                table_projection,
+                forced_disclosure: None,
+                line_height: self.line_height(),
+                disclosure_policy: DisclosurePolicy::Reading,
+            },
+            None,
+        )
+        .is_some_and(|visual| {
+            visual
+                .lines
+                .iter()
+                .any(|row| row.line_id == line_id && row.height() <= 0.0)
+        })
     }
 
     /// Moves the caret about one viewport up or down (Issue #494).
