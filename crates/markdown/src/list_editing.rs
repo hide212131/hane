@@ -108,9 +108,21 @@ pub struct ListEditItem {
 pub struct ListEditProjection {
     pub source_range: SourceRange,
     pub items: Vec<ListEditItem>,
+    /// Source ranges of the parser's code blocks (fenced and indented), so the
+    /// input path can tell code body lines from list continuation paragraphs
+    /// by block membership instead of by the line text.
+    pub code_block_ranges: Vec<SourceRange>,
 }
 
 impl ListEditProjection {
+    /// Whether the physical line `[line_start, line_end]` belongs to a code
+    /// block the parser recognized.
+    pub fn line_in_code_block(&self, line_start: usize, line_end: usize) -> bool {
+        self.code_block_ranges
+            .iter()
+            .any(|range| range.start.0 <= line_end && line_start < range.end.0)
+    }
+
     pub fn item_at(&self, offset: SourceOffset) -> Option<(usize, &ListEditItem)> {
         self.items
             .iter()
@@ -391,9 +403,17 @@ pub fn build_list_edit_projection(parsed: &MarkdownParse, source: &str) -> ListE
         items[index].parent_item = parent;
     }
 
+    let code_block_ranges = parsed
+        .tree
+        .iter()
+        .filter(|(_, node)| node.kind == NodeKind::CodeBlock)
+        .map(|(_, node)| node.source_range)
+        .collect();
+
     ListEditProjection {
         source_range: parsed.source_range,
         items,
+        code_block_ranges,
     }
 }
 
@@ -721,6 +741,12 @@ fn plan_positional_enter(
         return Some(ListEditPlanResult::NotApplicable);
     }
 
+    // Code block bodies (and their fences) are ordinary text, whatever the
+    // item that precedes them looks like.
+    if projection.line_in_code_block(ls, le) {
+        return None;
+    }
+
     let owner = continuation_owner(source, projection, ls)?;
     if owner.in_quote || !owner.is_parser_item {
         return None;
@@ -778,7 +804,7 @@ fn continuation_indent_required(source: &str, item: &ListEditItem) -> usize {
 }
 
 /// The item whose opening line precedes the physical line at `ls` with only
-/// non-fence, non-quote lines in between. Whitespace-only lines indented far
+/// non-quote lines and parser code blocks in between. Whitespace-only lines indented far
 /// enough to continue the item (such as the ones Enter itself produces) are
 /// crossed, but only while the parser still keeps the content after them
 /// inside the item: a non-blank line following such a blank must start inside
@@ -798,11 +824,12 @@ fn continuation_owner<'a>(
     while cursor > 0 {
         let content_end = cursor - line_terminator_before(source, cursor).len();
         let start = line_start(bytes, content_end);
-        if let Some(item) = projection
-            .items
-            .iter()
-            .find(|item| item.prefix_range.start.0 == start)
-        {
+        let in_code = projection.line_in_code_block(start, content_end);
+        // A marker-like line inside a code block is not an owner; only a
+        // parser-confirmed item can open at a line the code block overlaps.
+        if let Some(item) = projection.items.iter().find(|item| {
+            item.prefix_range.start.0 == start && (item.is_parser_item || !in_code)
+        }) {
             if !crossed_blank {
                 return Some(item);
             }
@@ -811,6 +838,13 @@ fn continuation_owner<'a>(
             return (inside_item && min_blank_columns >= required).then_some(item);
         }
         let text = &source[start..content_end];
+        if in_code {
+            // Lines of a closed code block do not end the item's body; the
+            // parser keeps what follows the closing fence in the same item.
+            nearest_content.get_or_insert(start);
+            cursor = start;
+            continue;
+        }
         let trimmed = text.trim_start_matches([' ', '\t']);
         if starts_interrupting_block(trimmed) {
             return None;
@@ -1285,6 +1319,34 @@ mod tests {
         assert!(not_applicable("- abc\n\n  def", 12, ListEditIntent::Enter));
         // Under-indented line is not a recognised continuation.
         assert!(not_applicable("- abc\n def", 10, ListEditIntent::Enter));
+    }
+
+    #[test]
+    fn enter_inside_fenced_code_body_is_ordinary_editing() {
+        let enter = ListEditIntent::Enter;
+        assert!(not_applicable("- ~~~\n  ab\n  ~~~", 7, enter));
+        assert!(not_applicable("- ```\n  ab\n  ```", 7, enter));
+        assert!(not_applicable("- abc\n  ~~~\n  code\n  ~~~", 14, enter));
+        assert!(not_applicable("- abc\n  ```\n  code\n  ```", 14, enter));
+    }
+
+    #[test]
+    fn enter_on_paragraph_after_closed_fence_keeps_the_item() {
+        let enter = ListEditIntent::Enter;
+        assert_edit(
+            "- abc\n  ~~~\n  code\n  ~~~\n  def",
+            30,
+            enter,
+            "- abc\n  ~~~\n  code\n  ~~~\n  def\n  ",
+            33,
+        );
+        assert_edit(
+            "- abc\n  ```\n  code\n  ```\n  def",
+            30,
+            enter,
+            "- abc\n  ```\n  code\n  ```\n  def\n  ",
+            33,
+        );
     }
 
     #[test]
