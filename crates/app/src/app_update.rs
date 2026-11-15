@@ -195,6 +195,10 @@ struct State {
     /// Its same-version suppression is already saved, so it stays visible
     /// without being hidden by that suppression.
     prompt_shown: Option<String>,
+    /// The `Available` candidate that an automatic download was fetching when
+    /// the automatic check was turned off. It keeps its automatic origin, so a
+    /// later periodic step may resume it; a manual candidate never has this.
+    auto_offer: Option<String>,
 }
 
 /// Identity of one asynchronous operation. A result is applied only when the
@@ -434,6 +438,7 @@ impl AppUpdateService {
                     prompt_withdrawn: false,
                     revalidating: false,
                     prompt_shown: None,
+                    auto_offer: None,
                 }),
                 restart: OnceLock::new(),
                 owner,
@@ -453,6 +458,12 @@ impl AppUpdateService {
     /// automatic check is enabled and due, and it never blocks.
     pub fn automatic_tick(&self) -> Duration {
         self.inner.automatic_tick()
+    }
+
+    /// Call once right after the main window has been created, before the
+    /// automatic loop starts: the first-check deadline counts from here.
+    pub fn arm_automatic_schedule(&self) {
+        self.inner.arm_schedule();
     }
 
     /// Lets the service hand a Ready update to the helper. Called once at
@@ -720,6 +731,7 @@ impl Inner {
             state.next_op += 1;
             let op = state.next_op;
             let cancel = CancelToken::new();
+            state.auto_offer = None;
             state.stage = Stage::Checking {
                 op,
                 cancel: cancel.clone(),
@@ -740,6 +752,48 @@ impl Inner {
     fn start_automatic_check(self: &Arc<Self>) -> bool {
         if !self.config.policy.is_configured() || self.config.target.is_none() {
             return false;
+        }
+        // A candidate whose automatic download was cancelled by turning the
+        // setting off is resumed instead of being treated as a manual one.
+        let resumed = {
+            let mut state = self.lock();
+            if !self.auto_enabled() || state.restoring || !state.restore_started {
+                return false;
+            }
+            let offer = match &state.stage {
+                Stage::Available(offer)
+                    if state.auto_offer.as_deref() == Some(offer.id().as_str())
+                        && offer.candidate.is_applicable() =>
+                {
+                    Some(Arc::clone(offer))
+                }
+                _ => None,
+            };
+            offer.map(|offer| {
+                state.next_op += 1;
+                let op = state.next_op;
+                let cancel = CancelToken::new();
+                let received = Arc::new(AtomicU64::new(0));
+                state.auto_offer = None;
+                state.stage = Stage::Downloading {
+                    op,
+                    offer: Arc::clone(&offer),
+                    cancel: cancel.clone(),
+                    received: Arc::clone(&received),
+                    verifying: false,
+                    origin: Origin::Automatic,
+                };
+                (op, offer, cancel, received)
+            })
+        };
+        if let Some((op, offer, cancel, received)) = resumed {
+            self.note_attempt();
+            let inner = Arc::clone(self);
+            self.dispatch(
+                op,
+                Box::new(move || inner.run_download(op, &offer, &cancel, &received)),
+            );
+            return true;
         }
         let (op, cancel) = {
             let mut state = self.lock();
@@ -789,6 +843,7 @@ impl Inner {
                 Stage::Checking { origin, .. } => *origin,
                 _ => return,
             };
+            state.auto_offer = None;
             state.stage = match (result, origin) {
                 (Ok(CheckOutcome::UpToDate), Origin::Manual) => Stage::UpToDate,
                 // An automatic result that finds nothing leaves no message.
@@ -874,6 +929,26 @@ impl Inner {
         }
     }
 
+    /// Restarts the first-contact deadline from now (the saved last attempt
+    /// still decides how much of the wait is left).
+    fn reset_schedule(&self) {
+        *self
+            .schedule
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Schedule::new(
+            self.clock.monotonic_ms(),
+            auto_update::initial_delay_secs(self.history.last_attempt(), self.clock.now_unix()),
+        );
+    }
+
+    /// Starts the first deadline after the main window exists, so a slow
+    /// document load never lets a request begin right after the window opens.
+    fn arm_schedule(&self) {
+        if self.auto_enabled() {
+            self.reset_schedule();
+        }
+    }
+
     /// Turns the automatic work on or off. Turning it off cancels only a
     /// running automatic check or download; a manual one, a Ready update and
     /// the files are left alone. Results that arrive later find no live ticket.
@@ -882,16 +957,7 @@ impl Inner {
         if enabled {
             if !was {
                 // Same deadline rule as at start; no immediate request.
-                *self
-                    .schedule
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Schedule::new(
-                    self.clock.monotonic_ms(),
-                    auto_update::initial_delay_secs(
-                        self.history.last_attempt(),
-                        self.clock.now_unix(),
-                    ),
-                );
+                self.reset_schedule();
             }
             return;
         }
@@ -917,6 +983,7 @@ impl Inner {
             } => {
                 cancel.cancel();
                 let offer = Arc::clone(offer);
+                state.auto_offer = Some(offer.id().as_str().to_owned());
                 state.stage = Stage::Available(offer);
             }
             _ => {}
@@ -1179,6 +1246,7 @@ impl Inner {
             let op = state.next_op;
             let cancel = CancelToken::new();
             let received = Arc::new(AtomicU64::new(0));
+            state.auto_offer = None;
             state.stage = Stage::Downloading {
                 op,
                 offer: Arc::clone(&offer),
@@ -2407,6 +2475,59 @@ mod tests {
         fixture.script_check();
         fixture.check_now();
         assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+    }
+
+    #[test]
+    fn cancelled_automatic_download_is_resumed_after_reenable() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        fixture.auto_tick_after(31_000);
+        // Only the check runs; the chained automatic download stays queued.
+        let tasks: Vec<Task> = std::mem::take(&mut *fixture.queue.lock().unwrap());
+        for task in tasks {
+            task();
+        }
+        assert_eq!(fixture.phase(), AppUpdatePhase::Downloading);
+        fixture.queue.lock().unwrap().clear();
+
+        fixture.service.set_auto_check(false);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Available);
+        fixture.service.set_auto_check(true);
+        fixture.auto_tick_after(7 * HOURS_MS);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Downloading);
+        run_queued(&fixture.queue);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Ready);
+    }
+
+    #[test]
+    fn manual_candidate_is_not_downloaded_after_a_disable_and_reenable() {
+        let manual = fixture_with_manual_available();
+        manual.service.set_auto_check(false);
+        manual.service.set_auto_check(true);
+        manual.auto_tick_after(7 * HOURS_MS);
+        run_queued(&manual.queue);
+        assert_eq!(manual.phase(), AppUpdatePhase::Available);
+        assert_eq!(manual.requests(), 3);
+    }
+
+    #[test]
+    fn first_check_counts_from_the_armed_schedule_not_from_startup() {
+        let fixture = fixture("0.26.0", "0.27.0", 5);
+        fixture.script_check();
+        fixture.script_archive();
+        fixture.start_auto();
+        // A slow document load passes before the window exists.
+        fixture.clock.advance(40_000);
+        fixture.service.arm_automatic_schedule();
+        fixture.auto_tick_after(0);
+        assert!(fixture.queue.lock().unwrap().is_empty());
+        fixture.auto_tick_after(29_000);
+        assert!(fixture.queue.lock().unwrap().is_empty());
+        assert_eq!(fixture.requests(), 0);
+        fixture.auto_tick_after(2_000);
+        assert_eq!(fixture.phase(), AppUpdatePhase::Checking);
     }
 
     #[test]

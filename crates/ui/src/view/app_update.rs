@@ -1015,9 +1015,10 @@ impl EditorView {
     /// an overlay, so no document coordinate changes. Its buttons are tab stops
     /// but are never focused automatically, so showing the prompt does not move
     /// the editor focus. Hidden
-    /// while the settings screen is open (the card has the same actions).
+    /// while the settings screen is open (the card has the same actions) and
+    /// while a tab close confirmation is shown; nothing is recorded as shown then.
     pub(super) fn update_prompt_element(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
-        if self.settings_open {
+        if self.settings_open || self.tab_close_confirm.is_some() {
             return None;
         }
         let controller = self.app_update.as_ref()?;
@@ -2504,6 +2505,37 @@ mod tests {
             .filter(|call| call.as_str() == "shown:cand")
             .count();
         assert_eq!(shown, 2, "the new display is reported: {:?}", controller.calls());
+    }
+
+    #[gpui::test]
+    fn prompt_is_not_drawn_or_reported_while_a_tab_close_confirmation_is_open(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let controller = FakeController::new(promptable(AppUpdatePhase::Ready));
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("body\n", "Untitled", cx));
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            let instance = view.document_instance(id).unwrap();
+            view.tab_close_confirm = Some(crate::view::TabCloseConfirm { id, instance });
+            view.attach_app_update(Some(attached));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("app-update-prompt").is_none());
+        assert!(
+            controller.calls().iter().all(|call| !call.starts_with("shown:")),
+            "nothing is recorded as shown behind the dialog: {:?}",
+            controller.calls()
+        );
+
+        view.update(cx, |view, cx| {
+            view.tab_close_confirm = None;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("app-update-prompt").is_some());
+        assert_eq!(controller.calls(), vec!["shown:cand".to_owned()]);
     }
 
     #[gpui::test]

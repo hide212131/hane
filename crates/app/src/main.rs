@@ -977,6 +977,10 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         )
         .expect("open Hane window");
     if let Some(service) = auto_update_service {
+        // The first deadline counts from the window's creation, not from
+        // process start, so a long document load cannot make the first request
+        // follow the window immediately.
+        service.arm_automatic_schedule();
         // One loop for the whole app, not one per window. It only asks the
         // service whether an automatic step is due, and sleeps for the time
         // the service names (never longer than a minute).
