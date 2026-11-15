@@ -829,6 +829,14 @@ pub struct EditorView {
     app_update: Option<Arc<dyn AppUpdateController>>,
     /// A card refresh loop is running while the update service is busy.
     app_update_polling: bool,
+    /// Keyboard focus targets of the restart prompt buttons. They are only
+    /// tracked by the buttons; showing the prompt never focuses them.
+    app_update_restart_focus: gpui::FocusHandle,
+    app_update_later_focus: gpui::FocusHandle,
+    /// The candidate whose prompt display was already reported to the
+    /// controller, so repeated renders notify it at most once. Cleared while
+    /// no prompt is drawn.
+    app_update_prompt_reported: std::cell::RefCell<Option<String>>,
     /// Held only for the synchronous restart check; while set, the shared
     /// external-open entrance answers `Busy`.
     restart_freeze: bool,
@@ -2592,7 +2600,10 @@ impl EditorView {
 
     fn store_settings(&mut self) {
         match self.stores.settings().store(&self.settings) {
-            Ok(()) => self.settings_store_error = None,
+            Ok(()) => {
+                self.settings_store_error = None;
+                self.app_update_prompt_reported.borrow_mut().take();
+            }
             Err(error) => {
                 self.settings_store_error = Some(error.to_string());
                 self.status = Some(format!("Settings failed: {error}"));

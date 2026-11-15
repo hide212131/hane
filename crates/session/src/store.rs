@@ -69,6 +69,11 @@ pub struct Settings {
     /// understood is kept as [`NetworkConfig::Invalid`] instead of becoming
     /// a working Direct setting.
     pub network: NetworkConfig,
+    /// Whether the app checks for updates by itself (`auto_update_check` key).
+    /// A file without the key means `true`; a value that is neither `true` nor
+    /// `false`, or a settings file that cannot be read, stops the automatic
+    /// checks instead of guessing (Issue #723).
+    pub auto_update_check: bool,
 }
 
 impl Default for Settings {
@@ -79,6 +84,7 @@ impl Default for Settings {
             default_folder: None,
             sidebar_sort: WorkFolderSortOrder::default(),
             network: NetworkConfig::default(),
+            auto_update_check: true,
         }
     }
 }
@@ -464,10 +470,11 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\n",
             settings.autosave,
             settings.theme.as_str(),
-            settings.sidebar_sort.as_str()
+            settings.sidebar_sort.as_str(),
+            settings.auto_update_check
         );
         if let Some(folder) = &settings.default_folder {
             contents.push_str("default_folder=");
@@ -491,6 +498,9 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             settings.network = unreadable_network_config(error.kind());
+            // The file content is unknown, so nothing may start talking to
+            // the network on its own.
+            settings.auto_update_check = false;
         }
         Ok(contents) => {
             let mut network = Vec::new();
@@ -507,6 +517,8 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.default_folder = Some(PathBuf::from(unescape_line(value)));
                 } else if let Some(value) = line.strip_prefix("sidebar_sort=") {
                     settings.sidebar_sort = WorkFolderSortOrder::parse(value);
+                } else if let Some(value) = line.strip_prefix("auto_update_check=") {
+                    settings.auto_update_check = value == "true";
                 }
             }
             settings.network = parse_network_config(network);
@@ -862,6 +874,7 @@ mod tests {
             default_folder: Some(PathBuf::from("C:\\notes")),
             sidebar_sort: WorkFolderSortOrder::UpdatedOldest,
             network: NetworkConfig::default(),
+            auto_update_check: false,
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -1068,9 +1081,48 @@ mod tests {
                     default_folder: None,
                     sidebar_sort: WorkFolderSortOrder::NameAscending,
                     network: NetworkConfig::default(),
+                    auto_update_check: true,
                 })
                 .unwrap();
         }
         assert!(!stores.settings().load().autosave);
+    }
+
+    #[test]
+    fn missing_auto_update_key_defaults_to_enabled() {
+        let loaded = load_after_writing("autosave=false\ntheme=dark\n");
+        assert!(loaded.auto_update_check);
+        // A first launch has no file at all and is enabled as well.
+        let root = temporary_directory("state-auto-update-missing");
+        let store = FileStateStore::at(&root);
+        assert!(SettingsRepository::load(&store).auto_update_check);
+    }
+
+    #[test]
+    fn auto_update_setting_round_trips() {
+        for enabled in [true, false] {
+            let root = temporary_directory("state-auto-update-round-trip");
+            let store = FileStateStore::at(&root);
+            let settings = Settings {
+                auto_update_check: enabled,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+            assert!(text.contains(&format!("auto_update_check={enabled}\n")));
+            assert_eq!(
+                SettingsRepository::load(&FileStateStore::at(&root)).auto_update_check,
+                enabled
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn invalid_auto_update_value_disables_background_checks() {
+        for value in ["maybe", "", "TRUE", "1"] {
+            let loaded = load_after_writing(&format!("auto_update_check={value}\n"));
+            assert!(!loaded.auto_update_check, "value {value:?}");
+        }
     }
 }
