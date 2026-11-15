@@ -1037,7 +1037,7 @@ mod tests {
         assert_eq!(caret, 9);
 
         let mut typed = exited;
-        typed.insert_str(caret, "x");
+        typed.insert(caret, 'x');
         assert_eq!(typed, "- abc\r\n\r\nx\r\n");
 
         let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
