@@ -65,9 +65,9 @@ use hane_markdown::{
 };
 use hane_metrics::FrameMetrics;
 #[cfg(test)]
-use hane_presentation::{BlockKind, ListRowRole, StyleKind, VisualOffset};
+use hane_presentation::{ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
-    BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
+    BlockKind, BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
     VisualBlock, VisualLine, block_height_with_disclosure, block_heights_with_disclosure,
     block_is_joinable, block_line_span, code_line_height, layout_block, parse_joined_span,
     table_delimiter_is_collapsed, trailing_blank_lines,
