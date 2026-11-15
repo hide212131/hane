@@ -11740,6 +11740,38 @@ mod tests {
         });
     }
 
+    /// Issue #714: Enter on a CRLF list keeps CRLF for the continuation and
+    /// the exit, and each step is its own undo / redo entry.
+    #[gpui::test]
+    fn source_first_list_editing_enter_twice_preserves_crlf_with_undo_redo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc\r\n", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(5)))
+                .unwrap();
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n- \r\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\n\r\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
+
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n- \r\n");
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n");
+
+            view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n- \r\n");
+            view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\n\r\n");
+        });
+    }
+
     #[gpui::test]
     fn source_first_list_editing_exits_list_after_empty_marker_backspace(
         cx: &mut gpui::TestAppContext,

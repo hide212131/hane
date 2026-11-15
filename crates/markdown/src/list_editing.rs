@@ -578,7 +578,11 @@ pub fn plan_list_edit(
             if !on_opening_line {
                 return Ok(ListEditPlanResult::NotApplicable);
             }
-            let replacement = format!("\n{}", " ".repeat(item.body_indent_columns));
+            let terminator = preferred_line_terminator(&source, caret.0);
+            let replacement = format!(
+                "{terminator}{}",
+                " ".repeat(item.body_indent_columns)
+            );
             let new_caret = SourceOffset(caret.0 + replacement.len());
             Ok(ListEditPlanResult::Handled(MarkdownEditPlan::Replace {
                 range: SourceRange::empty(caret.0),
@@ -633,7 +637,8 @@ pub fn plan_list_edit(
                 return Ok(ListEditPlanResult::NotApplicable);
             }
             let prefix = item_prefix(&source, item);
-            let replacement = format!("\n{prefix}");
+            let terminator = preferred_line_terminator(&source, caret.0);
+            let replacement = format!("{terminator}{prefix}");
             let new_caret = SourceOffset(caret.0 + replacement.len());
             Ok(ListEditPlanResult::Handled(MarkdownEditPlan::Replace {
                 range: SourceRange::empty(caret.0),
@@ -750,6 +755,28 @@ fn exit_top_level_item(source: &str, item: &ListEditItem) -> MarkdownEditPlan {
     }
 }
 
+/// The terminator to insert when splitting the physical line containing `at`.
+///
+/// Prefers the line's own terminator (even when it lies after `at`). An
+/// unterminated last line borrows the previous line's terminator, and a
+/// source with no terminator to borrow falls back to `"\n"`. Only the choice
+/// of terminator is decided here; prefixes, exit rules and caret placement
+/// belong to the callers.
+fn preferred_line_terminator(source: &str, at: usize) -> &str {
+    let bytes = source.as_bytes();
+    let at = at.min(source.len());
+    let start = line_start(bytes, at);
+    let end = line_end(bytes, start);
+    let after = line_end_inclusive(bytes, start);
+    if after > end {
+        &source[end..after]
+    } else if start > 0 {
+        line_terminator_before(source, start)
+    } else {
+        "\n"
+    }
+}
+
 /// The line terminator (`"\n"`, `"\r\n"`, or `"\r"`) ending the line
 /// immediately before `line_start`. `line_start` must be greater than `0`.
 fn line_terminator_before(source: &str, line_start: usize) -> &str {
@@ -843,6 +870,223 @@ mod tests {
         let mut result = text.to_owned();
         result.replace_range(range.as_usize(), &replacement);
         (result, selection_after.active.0)
+    }
+
+    fn assert_edit(text: &str, caret: usize, intent: ListEditIntent, expected: &str, at: usize) {
+        assert_eq!(
+            replacement(text, caret, intent),
+            (expected.to_owned(), at)
+        );
+    }
+
+    #[test]
+    fn preferred_line_terminator_selects_own_then_previous_then_lf() {
+        assert_eq!(preferred_line_terminator("", 0), "\n");
+        assert_eq!(preferred_line_terminator("abc", 3), "\n");
+        assert_eq!(preferred_line_terminator("abc\r\n", 1), "\r\n");
+        assert_eq!(preferred_line_terminator("abc\n", 3), "\n");
+        assert_eq!(preferred_line_terminator("abc\r", 3), "\r");
+        assert_eq!(preferred_line_terminator("a\r\nbc", 5), "\r\n");
+        assert_eq!(preferred_line_terminator("a\nbc", 4), "\n");
+        assert_eq!(preferred_line_terminator("a\rbc", 4), "\r");
+        // The previous line wins over the document head for an unterminated
+        // last line.
+        assert_eq!(preferred_line_terminator("a\r\nb\nc", 6), "\n");
+        // The own terminator wins over the previous line's.
+        assert_eq!(preferred_line_terminator("a\r\nb\n", 4), "\n");
+    }
+
+    #[test]
+    fn enter_continuation_preserves_crlf() {
+        assert_edit("- abc\r\n", 5, ListEditIntent::Enter, "- abc\r\n- \r\n", 9);
+    }
+
+    #[test]
+    fn enter_split_mid_body_preserves_crlf() {
+        assert_edit(
+            "- abcd\r\n",
+            4,
+            ListEditIntent::Enter,
+            "- ab\r\n- cd\r\n",
+            8,
+        );
+    }
+
+    #[test]
+    fn enter_continuation_preserves_lf() {
+        assert_edit("- abc\n", 5, ListEditIntent::Enter, "- abc\n- \n", 8);
+    }
+
+    #[test]
+    fn enter_continuation_preserves_bare_cr() {
+        assert_edit("- abc\r", 5, ListEditIntent::Enter, "- abc\r- \r", 8);
+    }
+
+    #[test]
+    fn enter_continuation_at_unterminated_eof_inherits_crlf() {
+        assert_edit(
+            "- A\r\n- bc",
+            9,
+            ListEditIntent::Enter,
+            "- A\r\n- bc\r\n- ",
+            13,
+        );
+    }
+
+    #[test]
+    fn enter_continuation_without_any_terminator_defaults_to_lf() {
+        assert_edit("- abc", 5, ListEditIntent::Enter, "- abc\n- ", 8);
+    }
+
+    #[test]
+    fn enter_mixed_endings_uses_current_lf() {
+        assert_edit(
+            "- A\r\n- bc\n",
+            8,
+            ListEditIntent::Enter,
+            "- A\r\n- b\n- c\n",
+            11,
+        );
+    }
+
+    #[test]
+    fn enter_mixed_endings_uses_current_crlf() {
+        assert_edit(
+            "- A\n- bc\r\n",
+            7,
+            ListEditIntent::Enter,
+            "- A\n- b\r\n- c\r\n",
+            11,
+        );
+    }
+
+    #[test]
+    fn shift_enter_preserves_crlf() {
+        assert_edit(
+            "- abc\r\n",
+            5,
+            ListEditIntent::ShiftEnter,
+            "- abc\r\n  \r\n",
+            9,
+        );
+    }
+
+    #[test]
+    fn shift_enter_mixed_endings_uses_current_lf() {
+        assert_edit(
+            "- A\r\n- bc\n",
+            8,
+            ListEditIntent::ShiftEnter,
+            "- A\r\n- b\n  c\n",
+            11,
+        );
+    }
+
+    #[test]
+    fn shift_enter_at_unterminated_eof_inherits_crlf() {
+        assert_edit(
+            "- A\r\n- bc",
+            9,
+            ListEditIntent::ShiftEnter,
+            "- A\r\n- bc\r\n  ",
+            13,
+        );
+    }
+
+    #[test]
+    fn ordered_enter_preserves_crlf_and_next_number() {
+        assert_edit(
+            "3. A\r\n4. B",
+            4,
+            ListEditIntent::Enter,
+            "3. A\r\n4. \r\n4. B",
+            9,
+        );
+    }
+
+    #[test]
+    fn task_enter_preserves_crlf_and_unchecks_marker() {
+        assert_edit(
+            "- [x] A\r\n",
+            7,
+            ListEditIntent::Enter,
+            "- [x] A\r\n- [ ] \r\n",
+            15,
+        );
+    }
+
+    #[test]
+    fn enter_crlf_uses_utf8_byte_offsets() {
+        assert_edit(
+            "- 日本\r\n",
+            8,
+            ListEditIntent::Enter,
+            "- 日本\r\n- \r\n",
+            12,
+        );
+    }
+
+    #[test]
+    fn enter_crlf_continuation_then_exit_preserves_boundaries() {
+        let (continued, caret) = replacement("- abc\r\n", 5, ListEditIntent::Enter);
+        assert_eq!(continued, "- abc\r\n- \r\n");
+        assert_eq!(caret, 9);
+
+        let (exited, caret) = replacement(&continued, caret, ListEditIntent::Enter);
+        assert_eq!(exited, "- abc\r\n\r\n\r\n");
+        assert_eq!(caret, 9);
+
+        let mut typed = exited;
+        typed.insert_str(caret, "x");
+        assert_eq!(typed, "- abc\r\n\r\nx\r\n");
+
+        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+        let x_paragraph = parsed
+            .tree
+            .iter()
+            .find(|(_, node)| {
+                matches!(node.kind, NodeKind::Paragraph)
+                    && typed[node.source_range.as_usize()].contains('x')
+            })
+            .expect("expected a paragraph containing \"x\"");
+        assert!(
+            !parsed
+                .tree
+                .ancestors(x_paragraph.0)
+                .skip(1)
+                .any(|ancestor| matches!(
+                    parsed.tree.node(ancestor).map(|node| node.kind),
+                    Some(NodeKind::ListItem { .. })
+                )),
+            "the paragraph for \"x\" must not be a descendant of a ListItem"
+        );
+    }
+
+    #[test]
+    fn enter_exit_unterminated_empty_item_preserves_crlf() {
+        assert_edit(
+            "- abc\r\n- ",
+            9,
+            ListEditIntent::Enter,
+            "- abc\r\n\r\n",
+            9,
+        );
+    }
+
+    #[test]
+    fn enter_exit_only_empty_crlf_item_preserves_terminator() {
+        assert_edit("- \r\n", 2, ListEditIntent::Enter, "\r\n", 0);
+    }
+
+    #[test]
+    fn enter_exit_mixed_endings_preserves_each_side() {
+        assert_edit(
+            "3. A\r\n4. \n5. C",
+            9,
+            ListEditIntent::Enter,
+            "3. A\r\n\r\n\n\n5. C",
+            8,
+        );
     }
 
     #[test]
