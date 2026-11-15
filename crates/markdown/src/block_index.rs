@@ -1784,6 +1784,58 @@ mod tests {
         );
     }
 
+    /// Issue #728: the synchronous edit context for a caret on a continuation
+    /// line (including the empty or whitespace-only last line) must be enough
+    /// for the planner, at an absolute offset inside a later block.
+    #[test]
+    fn list_edit_projection_plans_enter_on_continuation_lines() {
+        use crate::{
+            ListEditIntent, ListEditPlanResult, MarkdownEditPlan, SourceSelection, plan_list_edit,
+        };
+
+        let cases = [
+            ("# t\n\n- abc\n", 11usize, "# t\n\n- abc\n\n", 12usize),
+            ("# t\n\n- abc\n  def", 16, "# t\n\n- abc\n  def\n  ", 19),
+            ("# t\n\n- abc\n  ", 13, "# t\n\n- abc\n  \n  ", 16),
+        ];
+        for (source, caret, expected, expected_caret) in cases {
+            let buffer = RopeBuffer::from_text(source);
+            let index = BlockIndex::from_buffer(&buffer);
+            let projection = index
+                .list_edit_projection_at(&buffer, SourceOffset(caret))
+                .expect("current edit projection");
+            let ListEditPlanResult::Handled(MarkdownEditPlan::Replace {
+                range,
+                replacement,
+                selection_after,
+            }) = plan_list_edit(
+                &buffer,
+                &projection,
+                SourceSelection::caret(SourceOffset(caret)),
+                ListEditIntent::Enter,
+            )
+            .unwrap()
+            else {
+                panic!("expected a replacement for {source:?}");
+            };
+            let mut edited = source.to_owned();
+            edited.replace_range(range.as_usize(), &replacement);
+            assert_eq!(edited, expected);
+            assert_eq!(selection_after.active.0, expected_caret);
+        }
+    }
+
+    #[test]
+    fn list_edit_projection_does_not_own_a_paragraph_after_a_list() {
+        let source = "- abc\n\ndef";
+        let buffer = RopeBuffer::from_text(source);
+        let index = BlockIndex::from_buffer(&buffer);
+        let projection = index
+            .list_edit_projection_at(&buffer, SourceOffset(source.len()))
+            .expect("current edit projection");
+        assert!(projection.item_at(SourceOffset(source.len())).is_none());
+    }
+
     #[test]
     fn incremental_list_edit_keeps_fence_height_projection_current() {
         let source = "- item\n  ```\n  code\n  ```\n";
