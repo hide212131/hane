@@ -71,6 +71,9 @@
 //! - With a dedicated `CODEX_HOME`, every `account/read`, `model/list` and
 //!   `turn/start` request is appended as `RPC:<method>` to
 //!   `.hane-fake-app-server-rpc-record` there.
+//! - While `.hane-fake-app-server-hold-account-read` exists in the dedicated
+//!   `CODEX_HOME`, the `account/read` reply is withheld (the request is still
+//!   recorded), so a test can keep a preparation in its first stage.
 //! - Test-only files in the dedicated `CODEX_HOME` can select
 //!   `hold_login` or `complete_on_cancel` and persist the fake account across
 //!   fake process restarts. They are never read by the shipped runtime.
@@ -476,6 +479,14 @@ fn main() {
                 }
             }
             (Some(id), Some(method)) if method == "account/read" => {
+                // Test-only sync point: the reply is withheld while this file
+                // exists, so a test can hold a preparation in its first stage.
+                if let Some(home) = &fake_home {
+                    let hold = home.join(".hane-fake-app-server-hold-account-read");
+                    while hold.exists() {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
                 let account = if account_signed_in {
                     serde_json::json!({"type":"chatgpt", "email":"fake-user@example.invalid", "planType":"plus"})
                 } else {

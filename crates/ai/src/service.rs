@@ -572,7 +572,7 @@ impl AiServiceHandle {
     /// operation admission gate.
     pub fn cancel(&self, target: OperationId) -> Result<(), AdmissionError> {
         let busy = *self.shared.busy.lock().unwrap();
-        if !matches!(
+        let cancellable = matches!(
             busy,
             Some((
                 id,
@@ -582,7 +582,18 @@ impl AiServiceHandle {
                     | ServiceBusyReason::InstallingRuntime
                     | ServiceBusyReason::Preparing
             )) if id == target
-        ) {
+        );
+        // The preparation's own model save is atomic and never interrupted, but
+        // a cancel requested meanwhile is kept and checked at the next safe
+        // point, so no later stage starts. Ordinary saves stay non-cancelable.
+        let saving_preparation = matches!(
+            busy,
+            Some((id, ServiceBusyReason::Saving)) if id == target
+        ) && matches!(
+            self.shared.snapshot.lock().unwrap().preparation,
+            PreparationStatus::Running(PreparationStage::SavingModel)
+        );
+        if !cancellable && !saving_preparation {
             return Err(AdmissionError::WrongOperation);
         }
         self.cancel_tx
@@ -4600,6 +4611,44 @@ mod tests {
             Err(AdmissionError::Busy)
         );
         assert_eq!(handle.cancel(id), Err(AdmissionError::WrongOperation));
+    }
+
+    #[test]
+    fn cancel_during_preparation_save_is_kept_and_stops_later_stages() {
+        let (command_tx, _command_rx) = mpsc::sync_channel(1);
+        let (cancel_tx, cancel_rx) = mpsc::sync_channel(4);
+        let shared = Arc::new(SharedServiceState {
+            snapshot: Mutex::new(AiSnapshot::default()),
+            busy: Mutex::new(Some((OperationId(1), ServiceBusyReason::Saving))),
+            deferred_open_settings: AtomicBool::new(false),
+            next_operation_id: AtomicU64::new(2),
+            subscribers: Mutex::new(Vec::new()),
+            available: Mutex::new(true),
+        });
+        let handle = AiServiceHandle {
+            command_tx,
+            cancel_tx,
+            shared: shared.clone(),
+        };
+
+        // An ordinary save (no preparation stage) is still not cancelable.
+        assert_eq!(
+            handle.cancel(OperationId(1)),
+            Err(AdmissionError::WrongOperation)
+        );
+
+        shared.snapshot.lock().unwrap().preparation =
+            PreparationStatus::Running(PreparationStage::SavingModel);
+        assert_eq!(
+            handle.cancel(OperationId(2)),
+            Err(AdmissionError::WrongOperation),
+            "another operation's id is rejected"
+        );
+        assert_eq!(handle.cancel(OperationId(1)), Ok(()));
+
+        // The request survives the atomic save and is seen before any later
+        // stage (read, apply, probe) starts.
+        assert!(preparation_canceled(&cancel_rx, OperationId(1)));
     }
 
     #[test]

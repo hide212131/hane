@@ -990,13 +990,26 @@ fn closing_and_reopening_does_not_duplicate_preparation() {
     let service = spawn_service(data_root.clone(), Arc::new(RecordingBrowser::default()));
     let handle = service.handle();
 
+    // The fake withholds the first account read, so the first preparation is
+    // provably still running when the second request arrives.
+    let hold = data_root.join("ai/codex-chatgpt/.hane-fake-app-server-hold-account-read");
+    std::fs::write(&hold, b"hold").unwrap();
     handle.try_submit(AiCommand::PrepareConnection).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rpc_count(&data_root, "account/read") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the first preparation never reached its account read"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
     // A second open while the first preparation holds the service joins it:
     // it is refused as busy and queues nothing.
     assert_eq!(
         handle.try_submit(AiCommand::PrepareConnection),
         Err(AdmissionError::Busy)
     );
+    std::fs::remove_file(&hold).unwrap();
     wait_for_preparation(&service, |snapshot| {
         snapshot.preparation == PreparationStatus::Ready
     });
