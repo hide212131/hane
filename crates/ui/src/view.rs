@@ -4126,21 +4126,35 @@ impl EditorView {
         // for a continuing shift move (Issue #729): the step carries on from it
         // to the next row. Reaching the document edge there keeps the caret.
         if extend {
-            // At most an opening and a closing fence can be crossed in one step.
-            for _ in 0..2 {
-                let Some(landed) = target else {
-                    break;
-                };
+            // A wrapped fence spans several display rows, so keep resolving
+            // until the landing is no longer a crossed fence row. Each step
+            // must advance in the move direction, which bounds the loop.
+            while let Some(landed) = target {
                 if !self.is_crossed_fence(landed) {
                     break;
                 }
-                let Some((next, _, _)) = self.resolve_vertical_step(landed, down, Some(x), shaper)
+                let Some((next, step_distance, _)) =
+                    self.resolve_vertical_step(landed, down, Some(x), shaper)
                 else {
                     break;
                 };
-                target = next;
-                if next.is_none() {
-                    distance = Some(0.0);
+                match next {
+                    None => {
+                        target = None;
+                        distance = Some(0.0);
+                    }
+                    Some(next_offset) => {
+                        let advanced = if down {
+                            next_offset > landed
+                        } else {
+                            next_offset < landed
+                        };
+                        if !advanced {
+                            break;
+                        }
+                        target = next;
+                        distance = distance.zip(step_distance).map(|(sum, step)| sum + step);
+                    }
                 }
             }
         }
@@ -4581,6 +4595,9 @@ impl EditorView {
             let list_projection = self
                 .current_index()
                 .and_then(|index| index.list_projection(&indexed));
+            let fence_height_projection = self
+                .current_index()
+                .and_then(|index| index.fence_height_projection(&indexed));
             let table_projection = self
                 .current_index()
                 .and_then(|index| index.table_projection(&indexed));
@@ -4597,6 +4614,7 @@ impl EditorView {
                 shaper,
                 joined,
                 list_projection,
+                fence_height_projection,
                 table_projection,
                 diagram.as_ref(),
                 self.line_height(),
@@ -5421,6 +5439,7 @@ fn target_in_neighbor(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
     table_projection: Option<&TableProjection>,
     diagram: Option<&hane_presentation::DiagramPlan>,
     line_height: f32,
@@ -5436,6 +5455,7 @@ fn target_in_neighbor(
         shaper,
         joined,
         list_projection,
+        fence_height_projection,
         table_projection,
         diagram,
         line_height,
@@ -5471,6 +5491,7 @@ fn resolve_neighbor_target(
     shaper: &dyn LineShaper,
     joined: Option<&JoinedParse>,
     list_projection: Option<&ListProjection>,
+    fence_height_projection: Option<&FenceHeightProjection>,
     table_projection: Option<&TableProjection>,
     diagram: Option<&hane_presentation::DiagramPlan>,
     line_height: f32,
@@ -5488,7 +5509,7 @@ fn resolve_neighbor_target(
                 visible: &window,
                 joined,
                 list_projection,
-                fence_height_projection: None,
+                fence_height_projection,
                 table_projection,
                 // Vertical caret navigation onto a neighbor block, unrelated to
                 // the document-find bar's current match.
@@ -5625,6 +5646,7 @@ fn neighbor_row_target(
 ) -> Option<SourceOffset> {
     let (indexed, window) =
         neighbor_block_window(editor, index, block, down, DisclosurePolicy::Editing)?;
+    let fence_height_projection = index.and_then(|index| index.fence_height_projection(&indexed));
     target_in_neighbor(
         editor,
         &indexed,
@@ -5635,6 +5657,7 @@ fn neighbor_row_target(
         shaper,
         joined,
         None,
+        fence_height_projection,
         None,
         None,
         DEFAULT_LINE_HEIGHT,
