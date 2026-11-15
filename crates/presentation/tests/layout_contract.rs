@@ -2445,10 +2445,21 @@ fn vertical_movement_skips_hidden_fence_rows_in_both_directions() {
     let shaper = shaper();
     assert_eq!(layout.lines[0].height, 0.0, "the opening fence is hidden");
     assert_eq!(layout.lines[2].height, 0.0, "the closing fence is hidden");
+    // The block also owns the empty line after the closing fence; that line is
+    // an ordinary row, so moving down passes the hidden fence and lands on it.
+    let trailing = layout
+        .row_for_source(SourceOffset(12))
+        .expect("the trailing empty line is a row");
+    assert!(layout.lines[trailing].height > 0.0);
+    let VerticalMove::To(down) = layout.vertical_target(&block, SourceOffset(4), true, 0.0, &shaper)
+    else {
+        panic!("the trailing empty line is a row to move onto");
+    };
+    assert_eq!(down, SourceOffset(12));
     assert_eq!(
-        layout.vertical_target(&block, SourceOffset(4), true, 0.0, &shaper),
-        VerticalMove::PastEdge,
-        "the hidden closing fence is not a row to move onto"
+        layout.row_for_source(down),
+        Some(trailing),
+        "the hidden closing fence is passed over"
     );
     assert_eq!(
         layout.vertical_target(&block, SourceOffset(4), false, 0.0, &shaper),
@@ -2507,10 +2518,15 @@ fn vertical_movement_around_hidden_fences_lands_on_char_boundaries() {
     };
     assert!(source.is_char_boundary(down.0));
     assert_eq!(layout.row_for_source(down), Some(2));
-    assert_eq!(
-        layout.vertical_target(&block, down, true, 2.0 * 8.0, &shaper),
-        VerticalMove::PastEdge
-    );
+    let trailing = layout
+        .row_for_source(SourceOffset(source.len()))
+        .expect("the trailing empty line is a row");
+    let VerticalMove::To(last) = layout.vertical_target(&block, down, true, 2.0 * 8.0, &shaper)
+    else {
+        panic!("the trailing empty line is a row past the hidden closing fence");
+    };
+    assert!(source.is_char_boundary(last.0));
+    assert_eq!(layout.row_for_source(last), Some(trailing));
 }
 
 /// A row's painted text never runs past the column it was laid out against;

@@ -4127,6 +4127,9 @@ impl EditorView {
             .preferred_visual_x()
             .or_else(|| from.map(|point| point.x))?;
         let mut vertical = layout.vertical_target(&block, caret, down, x, shaper);
+        if extend {
+            vertical = self.skip_crossed_fence(&block, &layout, vertical, down, x, shaper);
+        }
         // The caret's neighbor lines may all be hidden rows (an inactive fence
         // delimiter). The block can then still hold a visible row beyond them,
         // so widen the presented window before treating this as the block edge.
@@ -4144,6 +4147,9 @@ impl EditorView {
             layout = wide_layout;
             from = layout.point_for_source(&block, caret, shaper);
             vertical = layout.vertical_target(&block, caret, down, x, shaper);
+            if extend {
+                vertical = self.skip_crossed_fence(&block, &layout, vertical, down, x, shaper);
+            }
         }
         let (target, distance) = match vertical {
             VerticalMove::To(offset) => {
@@ -4176,6 +4182,50 @@ impl EditorView {
         }
         // An unmeasurable step counts as one line so a page still terminates.
         Some(distance.unwrap_or_else(|| self.line_height()))
+    }
+
+    /// A fence row disclosed only because the selection spans it is not a stop
+    /// for a continuing shift move (Issue #729): when `vertical` lands on one,
+    /// the move carries on past it. A fence the anchor or the active end sits on
+    /// stays a normal stop.
+    fn skip_crossed_fence(
+        &self,
+        block: &VisualBlock,
+        layout: &BlockLayout,
+        vertical: VerticalMove,
+        down: bool,
+        x: f32,
+        shaper: &dyn LineShaper,
+    ) -> VerticalMove {
+        let selection = self.editor().selection();
+        let mut vertical = vertical;
+        // At most an opening and a closing fence can be crossed in one step.
+        for _ in 0..2 {
+            let VerticalMove::To(offset) = vertical else {
+                break;
+            };
+            let crossed = layout
+                .row_for_source(offset)
+                .and_then(|row| layout.lines.get(row))
+                .is_some_and(|row| {
+                    let holds = |at: SourceOffset| {
+                        row.source_range.start <= at && at <= row.source_range.end
+                    };
+                    block.kind == BlockKind::CodeBlock
+                        && block.lines.get(row.line).is_some_and(|line| {
+                            let text = line.visual_text.trim_start();
+                            line.disclosure.is_some()
+                                && (text.starts_with("```") || text.starts_with("~~~"))
+                        })
+                        && !holds(selection.anchor)
+                        && !holds(selection.active)
+                });
+            if !crossed {
+                break;
+            }
+            vertical = layout.vertical_target(block, offset, down, x, shaper);
+        }
+        vertical
     }
 
     /// Moves the caret about one viewport up or down (Issue #494).
