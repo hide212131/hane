@@ -8,6 +8,7 @@
 mod account;
 mod atomic_file;
 mod connect;
+mod connection_preparation;
 mod credential_journal;
 mod models;
 mod owner_lock;
@@ -37,6 +38,7 @@ pub use connect::{
     delete_custom_credential, delete_custom_credential_detailed, recover_at_startup,
     update_custom_credential, update_custom_credential_detailed, with_generation_checked_lock,
 };
+pub use connection_preparation::{PreparationFailure, PreparationStage, PreparationStatus};
 pub use credential_journal::{
     CredentialJournal, CredentialOperation, JournalOperationKind, JournalOperationState,
     RecoveryOutcome, recover as recover_credential_journal,

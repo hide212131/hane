@@ -131,6 +131,64 @@ pub fn saved_model_is_available(
     saved_model.map(|saved| models.iter().any(|model| model.model == saved))
 }
 
+/// The model the automatic connection preparation settles on. Every payload is
+/// `Model.model` (never `Model.id`), the value settings and inference use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelSelection {
+    /// The user's confirmed choice, which is in the catalog.
+    UserChoice(String),
+    /// The saved model, kept because the catalog still lists it.
+    Saved(String),
+    /// A model was chosen or saved but the catalog does not list it. It is
+    /// never replaced automatically.
+    SavedMissing(String),
+    /// Nothing was saved; the first catalog entry flagged `is_default`.
+    Default(String),
+    /// Nothing was saved and nothing is flagged default; the first candidate
+    /// of the fully fetched catalog.
+    FirstCandidate(String),
+    /// Nothing was saved and the catalog is empty.
+    NoCandidates,
+}
+
+fn present(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+/// Decides the ChatGPT model. Priority: the user's confirmed choice, then the
+/// saved model (when listed), then the first `is_default` candidate, then the
+/// first candidate of the whole catalog. A saved model the catalog no longer
+/// lists is reported, not replaced. `models` is the complete, already filtered
+/// catalog from [`fetch_chatgpt_models`]; no display limit applies here.
+pub fn select_chatgpt_model(
+    user_choice: Option<&str>,
+    saved_model: Option<&str>,
+    models: &[ChatGptModel],
+) -> ModelSelection {
+    let listed = |candidate: &str| models.iter().any(|model| model.model == candidate);
+    if let Some(choice) = present(user_choice) {
+        return if listed(choice) {
+            ModelSelection::UserChoice(choice.to_owned())
+        } else {
+            ModelSelection::SavedMissing(choice.to_owned())
+        };
+    }
+    if let Some(saved) = present(saved_model) {
+        return if listed(saved) {
+            ModelSelection::Saved(saved.to_owned())
+        } else {
+            ModelSelection::SavedMissing(saved.to_owned())
+        };
+    }
+    if let Some(default) = models.iter().find(|model| model.is_default) {
+        return ModelSelection::Default(default.model.clone());
+    }
+    match models.first() {
+        Some(first) => ModelSelection::FirstCandidate(first.model.clone()),
+        None => ModelSelection::NoCandidates,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +250,124 @@ mod tests {
         assert_eq!(calls[0]["includeHidden"], false);
         assert_eq!(calls[0]["limit"], PAGE_LIMIT);
         assert_eq!(calls[1]["cursor"], "page-2");
+    }
+
+    fn candidate(id: &str, model: &str, is_default: bool) -> ChatGptModel {
+        ChatGptModel {
+            id: id.to_owned(),
+            model: model.to_owned(),
+            display_name: format!("Display {model}"),
+            is_default,
+        }
+    }
+
+    #[test]
+    fn saved_model_takes_precedence_over_default() {
+        let models = [
+            candidate("c1", "gpt-first", false),
+            candidate("c2", "gpt-default", true),
+        ];
+        assert_eq!(
+            select_chatgpt_model(None, Some("gpt-first"), &models),
+            ModelSelection::Saved("gpt-first".to_owned())
+        );
+        assert_eq!(
+            select_chatgpt_model(Some("gpt-default"), Some("gpt-first"), &models),
+            ModelSelection::UserChoice("gpt-default".to_owned()),
+            "the user's confirmed choice outranks the saved model"
+        );
+    }
+
+    #[test]
+    fn missing_saved_model_is_not_replaced() {
+        let models = [candidate("c1", "gpt-default", true)];
+        assert_eq!(
+            select_chatgpt_model(None, Some("removed-model"), &models),
+            ModelSelection::SavedMissing("removed-model".to_owned())
+        );
+        assert_eq!(
+            select_chatgpt_model(None, Some("c1"), &models),
+            ModelSelection::SavedMissing("c1".to_owned()),
+            "a catalog id is not a model value"
+        );
+    }
+
+    #[test]
+    fn empty_selection_uses_default_then_first_candidate() {
+        let with_defaults = [
+            candidate("c1", "gpt-first", false),
+            candidate("c2", "gpt-default-a", true),
+            candidate("c3", "gpt-default-b", true),
+        ];
+        assert_eq!(
+            select_chatgpt_model(None, None, &with_defaults),
+            ModelSelection::Default("gpt-default-a".to_owned())
+        );
+        assert_eq!(
+            select_chatgpt_model(None, Some("  "), &with_defaults),
+            ModelSelection::Default("gpt-default-a".to_owned()),
+            "a blank saved value counts as no saved model"
+        );
+        let without_defaults = [
+            candidate("c1", "gpt-first", false),
+            candidate("c2", "gpt-second", false),
+        ];
+        assert_eq!(
+            select_chatgpt_model(None, None, &without_defaults),
+            ModelSelection::FirstCandidate("gpt-first".to_owned())
+        );
+    }
+
+    #[test]
+    fn empty_or_failed_catalog_has_no_automatic_selection() {
+        assert_eq!(
+            select_chatgpt_model(None, None, &[]),
+            ModelSelection::NoCandidates
+        );
+        let failed = fetch_chatgpt_models(|_, _| Err(()));
+        assert_eq!(failed.unwrap_err(), ModelListError::Rpc);
+    }
+
+    #[test]
+    fn selection_uses_model_value_from_all_pages() {
+        let calls = Mutex::new(0usize);
+        let models = fetch_chatgpt_models(|_, _| {
+            let mut calls = calls.lock().unwrap();
+            *calls += 1;
+            Ok(if *calls == 1 {
+                let data = (0..45)
+                    .map(|index| {
+                        model(
+                            &format!("catalog-{index}"),
+                            &format!("gpt-{index}"),
+                            false,
+                            &["text"],
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                json!({"data": data, "nextCursor": "page-2"})
+            } else {
+                json!({
+                    "data": [{
+                        "id": "catalog-default",
+                        "model": "gpt-default-model",
+                        "displayName": "Default",
+                        "hidden": false,
+                        "inputModalities": ["text"],
+                        "isDefault": true
+                    }],
+                    "nextCursor": null
+                })
+            })
+        })
+        .unwrap();
+
+        assert_eq!(models.len(), 46);
+        assert_eq!(
+            select_chatgpt_model(None, None, &models),
+            ModelSelection::Default("gpt-default-model".to_owned()),
+            "the default on a later page is found, and its model value is used"
+        );
     }
 
     #[test]
