@@ -511,8 +511,16 @@ pub fn plan_list_edit(
         return Ok(ListEditPlanResult::NotApplicable);
     }
     let caret = selection.active;
+    // Avoid the full-text copy on the input path when no list item can apply.
+    if projection.items.is_empty() {
+        return Ok(ListEditPlanResult::NotApplicable);
+    }
+    let positional_intent = matches!(intent, ListEditIntent::Enter | ListEditIntent::ShiftEnter);
+    if !positional_intent && projection.item_at(caret).is_none() {
+        return Ok(ListEditPlanResult::NotApplicable);
+    }
     let source = document.full_text();
-    let positional = if matches!(intent, ListEditIntent::Enter | ListEditIntent::ShiftEnter) {
+    let positional = if positional_intent {
         plan_positional_enter(&source, projection, caret.0)
     } else {
         None
@@ -1053,6 +1061,30 @@ mod tests {
     fn reparsed_items(text: &str) -> Vec<ListEditItem> {
         let parsed = parse_document(Revision(1), SourceRange::new(0, text.len()), text);
         build_list_edit_projection(&parsed, text).items
+    }
+
+    #[test]
+    fn documents_without_list_items_are_not_applicable() {
+        let text = "plain paragraph\n\nanother line\n";
+        let parsed = parse_document(Revision(1), SourceRange::new(0, text.len()), text);
+        let projection = build_list_edit_projection(&parsed, text);
+        assert!(projection.items.is_empty());
+        for intent in [
+            ListEditIntent::Enter,
+            ListEditIntent::ShiftEnter,
+            ListEditIntent::Backspace,
+            ListEditIntent::Indent,
+            ListEditIntent::Outdent,
+        ] {
+            let result = plan_list_edit(
+                &RopeBuffer::from_text(text),
+                &projection,
+                SourceSelection::caret(SourceOffset(5)),
+                intent,
+            )
+            .unwrap();
+            assert!(matches!(result, ListEditPlanResult::NotApplicable));
+        }
     }
 
     #[test]
