@@ -4120,16 +4120,58 @@ impl EditorView {
         shaper: &dyn LineShaper,
     ) -> Option<f32> {
         let caret = self.editor().selection().active;
+        let (mut target, mut distance, x) =
+            self.resolve_vertical_step(caret, down, None, shaper)?;
+        // A fence disclosed only because the selection spans it is not a stop
+        // for a continuing shift move (Issue #729): the step carries on from it
+        // to the next row. Reaching the document edge there keeps the caret.
+        if extend {
+            // At most an opening and a closing fence can be crossed in one step.
+            for _ in 0..2 {
+                let Some(landed) = target else {
+                    break;
+                };
+                if !self.is_crossed_fence(landed) {
+                    break;
+                }
+                let Some((next, _, _)) = self.resolve_vertical_step(landed, down, Some(x), shaper)
+                else {
+                    break;
+                };
+                target = next;
+                if next.is_none() {
+                    distance = Some(0.0);
+                }
+            }
+        }
+        // No neighbor means the caret is on the first or last row of the
+        // document: staying put is the move.
+        if let Some(target) = target
+            && let Err(error) = self.editor_mut().move_vertical_to(target, extend, x)
+        {
+            self.report_error("vertical move", error);
+        }
+        // An unmeasurable step counts as one line so a page still terminates.
+        Some(distance.unwrap_or_else(|| self.line_height()))
+    }
+
+    /// Resolves one vertical step from `caret` against the layout: the target
+    /// (`None` at the document edge), the distance travelled, and the x aimed
+    /// at. `x_hint` overrides the remembered x. `None` when the caret's block
+    /// cannot be laid out.
+    fn resolve_vertical_step(
+        &self,
+        caret: SourceOffset,
+        down: bool,
+        x_hint: Option<f32>,
+        shaper: &dyn LineShaper,
+    ) -> Option<(Option<SourceOffset>, Option<f32>, f32)> {
         let (mut block, mut layout) = self.layout_around(caret, shaper)?;
         let mut from = layout.point_for_source(&block, caret, shaper);
-        let x = self
-            .editor()
-            .preferred_visual_x()
+        let x = x_hint
+            .or_else(|| self.editor().preferred_visual_x())
             .or_else(|| from.map(|point| point.x))?;
         let mut vertical = layout.vertical_target(&block, caret, down, x, shaper);
-        if extend {
-            vertical = self.skip_crossed_fence(&block, &layout, vertical, down, x, shaper);
-        }
         // The caret's neighbor lines may all be hidden rows (an inactive fence
         // delimiter). The block can then still hold a visible row beyond them,
         // so widen the presented window before treating this as the block edge.
@@ -4147,9 +4189,6 @@ impl EditorView {
             layout = wide_layout;
             from = layout.point_for_source(&block, caret, shaper);
             vertical = layout.vertical_target(&block, caret, down, x, shaper);
-            if extend {
-                vertical = self.skip_crossed_fence(&block, &layout, vertical, down, x, shaper);
-            }
         }
         let (target, distance) = match vertical {
             VerticalMove::To(offset) => {
@@ -4173,57 +4212,22 @@ impl EditorView {
             },
             VerticalMove::Unknown => return None,
         };
-        // No neighbor means the caret is on the first or last row of the
-        // document: staying put is the move.
-        if let Some(target) = target
-            && let Err(error) = self.editor_mut().move_vertical_to(target, extend, x)
-        {
-            self.report_error("vertical move", error);
-        }
-        // An unmeasurable step counts as one line so a page still terminates.
-        Some(distance.unwrap_or_else(|| self.line_height()))
+        Some((target, distance, x))
     }
 
-    /// A fence row disclosed only because the selection spans it is not a stop
-    /// for a continuing shift move (Issue #729): when `vertical` lands on one,
-    /// the move carries on past it. A fence the anchor or the active end sits on
-    /// stays a normal stop.
-    fn skip_crossed_fence(
-        &self,
-        block: &VisualBlock,
-        layout: &BlockLayout,
-        vertical: VerticalMove,
-        down: bool,
-        x: f32,
-        shaper: &dyn LineShaper,
-    ) -> VerticalMove {
+    /// Whether `offset` sits on a fence row the selection merely spans: a row
+    /// the presentation collapses when nothing is disclosed, that neither end
+    /// of the selection (the caret included) rests on.
+    fn is_crossed_fence(&self, offset: SourceOffset) -> bool {
         let selection = self.editor().selection();
         let document = self.editor().document();
-        let line_of =
-            |at: SourceOffset| document.line_for_offset(at).ok().map(|line| line.0 as u64);
-        let ends = [line_of(selection.anchor), line_of(selection.active)];
-        let mut vertical = vertical;
-        // At most an opening and a closing fence can be crossed in one step.
-        for _ in 0..2 {
-            let VerticalMove::To(offset) = vertical else {
-                break;
-            };
-            let crossed = layout
-                .row_for_source(offset)
-                .and_then(|row| layout.lines.get(row))
-                .and_then(|row| block.lines.get(row.line))
-                .is_some_and(|line| {
-                    block.kind == BlockKind::CodeBlock
-                        && line.disclosure.is_some()
-                        && !ends.contains(&Some(line.line_id))
-                        && self.collapses_when_inactive(offset, line.line_id)
-                });
-            if !crossed {
-                break;
-            }
-            vertical = layout.vertical_target(block, offset, down, x, shaper);
-        }
-        vertical
+        let Some(line) = document.line_for_offset(offset).ok().map(|line| line.0 as u64) else {
+            return false;
+        };
+        let on_end = [selection.anchor, selection.active]
+            .into_iter()
+            .any(|end| document.line_for_offset(end).ok().map(|l| l.0 as u64) == Some(line));
+        !on_end && self.collapses_when_inactive(offset, line)
     }
 
     /// Whether the presentation collapses document line `line_id`, in the block
@@ -4266,7 +4270,11 @@ impl EditorView {
             visual
                 .lines
                 .iter()
-                .any(|row| row.line_id == line_id && row.height() <= 0.0)
+                .any(|row| {
+                    row.line_id == line_id
+                        && row.kind == BlockKind::CodeBlock
+                        && row.height() <= 0.0
+                })
         })
     }
 
