@@ -2426,6 +2426,93 @@ fn the_first_and_last_row_report_the_block_edge() {
     );
 }
 
+/// The code block of `source` laid out with the given disclosure cursor.
+fn fenced_layout(source: &str, cursor: Option<usize>) -> (VisualBlock, BlockLayout) {
+    present(source, cursor)
+        .into_iter()
+        .find(|block| block.kind == BlockKind::CodeBlock)
+        .map(|block| {
+            let layout = layout_block(&block, WIDTH, &shaper());
+            (block, layout)
+        })
+        .expect("a code block")
+}
+
+#[test]
+fn vertical_movement_skips_hidden_fence_rows_in_both_directions() {
+    let source = "```\nabc\n```\n";
+    let (block, layout) = fenced_layout(source, None);
+    let shaper = shaper();
+    assert_eq!(layout.lines[0].height, 0.0, "the opening fence is hidden");
+    assert_eq!(layout.lines[2].height, 0.0, "the closing fence is hidden");
+    assert_eq!(
+        layout.vertical_target(&block, SourceOffset(4), true, 0.0, &shaper),
+        VerticalMove::PastEdge,
+        "the hidden closing fence is not a row to move onto"
+    );
+    assert_eq!(
+        layout.vertical_target(&block, SourceOffset(4), false, 0.0, &shaper),
+        VerticalMove::PastEdge,
+        "the hidden opening fence is not a row to move onto"
+    );
+}
+
+#[test]
+fn vertical_movement_stops_on_blank_lines_inside_the_code_body() {
+    let source = "```\na\n\nb\n```\n";
+    let (block, layout) = fenced_layout(source, None);
+    let shaper = shaper();
+    let VerticalMove::To(blank) = layout.vertical_target(&block, SourceOffset(4), true, 0.0, &shaper)
+    else {
+        panic!("the blank code line is a row");
+    };
+    assert_eq!(layout.row_for_source(blank), Some(2));
+    let VerticalMove::To(last) = layout.vertical_target(&block, blank, true, 0.0, &shaper) else {
+        panic!("the last code line is a row");
+    };
+    assert_eq!(layout.row_for_source(last), Some(3));
+    let VerticalMove::To(back) = layout.vertical_target(&block, last, false, 0.0, &shaper) else {
+        panic!("moving back up reaches the blank code line");
+    };
+    assert_eq!(layout.row_for_source(back), Some(2));
+}
+
+#[test]
+fn a_disclosed_closing_fence_is_a_row_the_caret_can_move_through() {
+    let source = "```\nabc\n```\n";
+    let (block, layout) = fenced_layout(source, Some(9));
+    let shaper = shaper();
+    assert!(layout.lines[2].height > 0.0, "the disclosed fence has a height");
+    let VerticalMove::To(onto) = layout.vertical_target(&block, SourceOffset(4), true, 0.0, &shaper)
+    else {
+        panic!("the disclosed closing fence is a row");
+    };
+    assert_eq!(layout.row_for_source(onto), Some(2));
+    let VerticalMove::To(up) = layout.vertical_target(&block, SourceOffset(9), false, 0.0, &shaper)
+    else {
+        panic!("moving up from the disclosed fence reaches the code line");
+    };
+    assert_eq!(layout.row_for_source(up), Some(1));
+}
+
+#[test]
+fn vertical_movement_around_hidden_fences_lands_on_char_boundaries() {
+    let source = "```\nあいう\nxy\n```\n";
+    let (block, layout) = fenced_layout(source, None);
+    let shaper = shaper();
+    let VerticalMove::To(down) =
+        layout.vertical_target(&block, SourceOffset(4), true, 2.0 * 8.0, &shaper)
+    else {
+        panic!("the next code line is a row");
+    };
+    assert!(source.is_char_boundary(down.0));
+    assert_eq!(layout.row_for_source(down), Some(2));
+    assert_eq!(
+        layout.vertical_target(&block, down, true, 2.0 * 8.0, &shaper),
+        VerticalMove::PastEdge
+    );
+}
+
 /// A row's painted text never runs past the column it was laid out against;
 /// otherwise a soft-wrap "row" is a lie and the viewport would need a
 /// horizontal scrollbar to read it.
