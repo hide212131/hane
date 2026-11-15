@@ -11811,9 +11811,15 @@ mod tests {
             view.after_input(cx);
             assert_eq!(view.editor().document().full_text(), "- abc\n  def\n  ghi");
 
+            // The first Undo unwinds only the typed text, not the Enter.
             view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\n  def\n  ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(14)));
             view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
             assert_eq!(view.editor().document().full_text(), "- abc\n  def");
+
+            view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\n  def\n  ");
         });
     }
 

@@ -700,6 +700,9 @@ fn plan_positional_enter(
         if caret >= item.body_range.start.0 {
             return None;
         }
+        if !exit_is_trustworthy(item) {
+            return Some(ListEditPlanResult::NotApplicable);
+        }
         let marker_start = item.marker_range.start.0;
         if !item.in_quote
             && caret <= marker_start
@@ -737,11 +740,7 @@ fn plan_positional_enter(
     if indent_len == 0 {
         return None;
     }
-    let marker_text = source
-        .get(owner.marker_range.as_usize())
-        .unwrap_or_default()
-        .trim_end_matches([' ', '\t']);
-    let required = owner.marker_indent_columns + marker_text.len() + 1;
+    let required = continuation_indent_required(source, owner);
     if columns(&line[..indent_len]) < required {
         return None;
     }
@@ -761,8 +760,21 @@ fn starts_interrupting_block(text: &str) -> bool {
     text.starts_with("```") || text.starts_with("~~~") || text.starts_with('>')
 }
 
+/// The minimum indent columns a line needs to continue `item`'s body.
+fn continuation_indent_required(source: &str, item: &ListEditItem) -> usize {
+    let marker_text = source
+        .get(item.marker_range.as_usize())
+        .unwrap_or_default()
+        .trim_end_matches([' ', '\t']);
+    item.marker_indent_columns + marker_text.len() + 1
+}
+
 /// The item whose opening line precedes the physical line at `ls` with only
-/// non-blank, non-fence, non-quote lines in between.
+/// non-fence, non-quote lines in between. Whitespace-only lines indented far
+/// enough to continue the item (such as the ones Enter itself produces) are
+/// crossed, but only while the parser still keeps the content after them
+/// inside the item: a non-blank line following such a blank must start inside
+/// the owner's `item_range`.
 fn continuation_owner<'a>(
     source: &str,
     projection: &'a ListEditProjection,
@@ -770,6 +782,11 @@ fn continuation_owner<'a>(
 ) -> Option<&'a ListEditItem> {
     let bytes = source.as_bytes();
     let mut cursor = ls;
+    // Start of the closest non-blank line passed so far, and the blank lines
+    // crossed (by their leading whitespace), checked once the owner is known.
+    let mut nearest_content: Option<usize> = None;
+    let mut crossed_blank = false;
+    let mut min_blank_columns = usize::MAX;
     while cursor > 0 {
         let content_end = cursor - line_terminator_before(source, cursor).len();
         let start = line_start(bytes, content_end);
@@ -778,12 +795,25 @@ fn continuation_owner<'a>(
             .iter()
             .find(|item| item.prefix_range.start.0 == start)
         {
-            return Some(item);
+            if !crossed_blank {
+                return Some(item);
+            }
+            let inside_item = nearest_content.is_none_or(|content| content < item.item_range.end.0);
+            let required = continuation_indent_required(source, item);
+            return (inside_item && min_blank_columns >= required).then_some(item);
         }
         let text = &source[start..content_end];
         let trimmed = text.trim_start_matches([' ', '\t']);
-        if is_ascii_blank(text) || starts_interrupting_block(trimmed) {
+        if starts_interrupting_block(trimmed) {
             return None;
+        }
+        if is_ascii_blank(text) {
+            crossed_blank = true;
+            min_blank_columns = min_blank_columns.min(columns(text));
+        } else {
+            // The lowest non-blank line is the one most likely to be outside
+            // the item, so only the first one seen is kept.
+            nearest_content.get_or_insert(start);
         }
         cursor = start;
     }
@@ -1106,6 +1136,32 @@ mod tests {
         assert_edit("- abc\n  ", 8, enter, "- abc\n  \n  ", 11);
         let items = reparsed_items("- abc\n  def\n  ");
         assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn repeated_enter_on_generated_blank_continuation_keeps_item_context() {
+        let enter = ListEditIntent::Enter;
+        let lf = "- abc\n  \n  ";
+        assert_edit(lf, lf.len(), enter, "- abc\n  \n  \n  ", lf.len() + 3);
+        let crlf = "- abc\r\n  \r\n  ";
+        assert_edit(
+            crlf,
+            crlf.len(),
+            enter,
+            "- abc\r\n  \r\n  \r\n  ",
+            crlf.len() + 4,
+        );
+        // The parser keeps the content after a real blank outside the item.
+        assert!(not_applicable("- abc\n\n  def", 12, enter));
+        assert!(not_applicable("- abc\n\n  def\n  ", 15, enter));
+    }
+
+    #[test]
+    fn enter_left_of_unconfirmed_marker_like_line_is_ordinary_editing() {
+        let enter = ListEditIntent::Enter;
+        assert!(not_applicable("```\n  - code\n```", 5, enter));
+        assert!(not_applicable("    - code", 0, enter));
+        assert_edit("- a\n  - b", 4, enter, "- a\n\n  - b", 5);
     }
 
     #[test]

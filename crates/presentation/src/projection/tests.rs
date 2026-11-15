@@ -2355,12 +2355,26 @@ fn present_container_block(
     cached: bool,
     tail_only: bool,
 ) -> (VisualBlock, usize) {
+    present_first_block(source, formal, cached, tail_only, |kind| {
+        matches!(kind, NodeKind::List { .. } | NodeKind::Quote)
+    })
+}
+
+/// Same as [`present_container_block`], but for the first block whose kind
+/// satisfies `pick`.
+fn present_first_block(
+    source: &str,
+    formal: bool,
+    cached: bool,
+    tail_only: bool,
+    pick: impl Fn(NodeKind) -> bool,
+) -> (VisualBlock, usize) {
     let document = RopeBuffer::from_text(source);
     let index = BlockIndex::build(Revision(1), source);
     let block = index
         .blocks()
-        .find(|block| matches!(block.kind, NodeKind::List { .. } | NodeKind::Quote))
-        .expect("list or quote block");
+        .find(|block| pick(block.kind))
+        .expect("requested block");
     let span = block_line_span(&document, &block).expect("block line span");
     let trailing = trailing_blank_lines(&document, &span);
     let content_end = span.end - trailing;
@@ -2571,6 +2585,47 @@ fn list_enter_results_keep_source_offsets_and_caret_points_consistent() {
                     "caret point for {start:?} in {source:?} formal={formal}"
                 );
             }
+        }
+    }
+}
+
+/// Issue #728: after the list exit (case 2-1) the outer paragraph is a plain
+/// block with no list ownership, and the caret at its start round-trips
+/// between source offset and hit-testing.
+#[test]
+fn outer_paragraph_after_list_exit_has_no_list_ownership() {
+    let shaper = testing::FixedAdvanceShaper::default();
+    for (source, caret) in [("- abc\n\ndef", 7), ("- abc\r\n\r\ndef", 9)] {
+        for formal in [false, true] {
+            let (visual, _) = present_first_block(source, formal, true, false, |kind| {
+                matches!(kind, NodeKind::Paragraph)
+            });
+            assert!(!visual.lines.is_empty(), "{source:?} formal={formal}");
+            assert!(
+                visual
+                    .lines
+                    .iter()
+                    .all(|line| line.list.is_none() && line.quote.is_none()),
+                "outer paragraph keeps a list owner: {source:?} formal={formal}"
+            );
+            let layout = layout_block(&visual, 400.0, &shaper);
+            let point = layout
+                .point_for_source(&visual, SourceOffset(caret), &shaper)
+                .expect("caret point");
+            assert_eq!(point.x, 0.0, "{source:?} formal={formal}");
+            assert_eq!(
+                layout.source_for_point(&visual, 0.0, point.y + point.height / 2.0, &shaper),
+                Some(SourceOffset(caret)),
+                "{source:?} formal={formal}"
+            );
+            let row = layout
+                .row_for_source(SourceOffset(caret))
+                .expect("row for caret");
+            assert_eq!(
+                layout.source_at_x(&visual, row, 0.0, &shaper),
+                Some(SourceOffset(caret)),
+                "{source:?} formal={formal}"
+            );
         }
     }
 }
