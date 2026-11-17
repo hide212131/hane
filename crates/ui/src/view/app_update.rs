@@ -227,6 +227,8 @@ pub(crate) enum CardAction {
     Download(String),
     Cancel,
     Restart,
+    /// "保存して再起動" for the candidate the card was drawn for.
+    SaveAndRestart(String),
     DiscardReady,
 }
 
@@ -900,6 +902,10 @@ impl EditorView {
                 self.start_update_restart(None, cx);
                 return;
             }
+            CardAction::SaveAndRestart(candidate) => {
+                self.start_save_and_restart(&candidate, cx);
+                return;
+            }
             CardAction::DiscardReady => controller.discard_ready(),
         }
         self.poll_app_update(cx);
@@ -1022,7 +1028,8 @@ impl EditorView {
             return None;
         }
         let controller = self.app_update.as_ref()?;
-        let Some(model) = prompt_model(&controller.snapshot()) else {
+        let snapshot = controller.snapshot();
+        let Some(model) = prompt_model(&snapshot) else {
             self.app_update_prompt_reported.borrow_mut().take();
             return None;
         };
@@ -1035,16 +1042,26 @@ impl EditorView {
         let border = rgb(self.theme.sidebar_active_background);
         let restart_id = model.candidate_id.clone();
         let later_id = model.candidate_id;
-        let restart_button = (!self.restart_in_progress).then(|| {
+        let save_first = self.save_and_restart_targets(&snapshot, cx).is_some();
+        let restart_button = (!self.update_restart_busy()).then(|| {
+            let (id, label) = if save_first {
+                ("app-update-prompt-save-restart", "保存して再起動")
+            } else {
+                ("app-update-prompt-restart", "再起動して更新")
+            };
             Self::update_prompt_button(
                 cx,
                 border,
-                "app-update-prompt-restart",
-                "再起動して更新",
+                id,
+                label,
                 &self.app_update_restart_focus,
                 move |view, cx| {
                     view.restart_message = None;
-                    view.start_update_restart(Some(&restart_id), cx);
+                    if save_first {
+                        view.start_save_and_restart(&restart_id, cx);
+                    } else {
+                        view.start_update_restart(Some(&restart_id), cx);
+                    }
                 },
             )
         });
@@ -1105,11 +1122,26 @@ impl EditorView {
         let controller = self.app_update.as_ref()?;
         let snapshot = controller.snapshot();
         let model = card_model(&snapshot);
-        let restarting = self.restart_in_progress;
+        let restarting = self.update_restart_busy();
+        let save_first = self.save_and_restart_targets(&snapshot, cx).is_some();
+        let candidate = snapshot.candidate_id.clone();
         let buttons: Vec<Button> = model
             .actions
             .into_iter()
-            .filter(|(action, _)| !(restarting && *action == CardAction::Restart))
+            .map(|(action, label)| {
+                if save_first
+                    && action == CardAction::Restart
+                    && let Some(candidate) = candidate.clone()
+                {
+                    (CardAction::SaveAndRestart(candidate), "保存して再起動")
+                } else {
+                    (action, label)
+                }
+            })
+            .filter(|(action, _)| {
+                !(restarting
+                    && matches!(action, CardAction::Restart | CardAction::SaveAndRestart(_)))
+            })
             .enumerate()
             .map(|(index, (action, label))| {
                 let view = cx.entity();
@@ -1482,7 +1514,7 @@ impl EditorView {
     /// `expected` is the candidate a button was rendered for; when the service
     /// has moved on to another one, nothing starts.
     fn start_update_restart(&mut self, expected: Option<&str>, cx: &mut Context<Self>) {
-        if self.restart_in_progress {
+        if self.update_restart_busy() {
             return;
         }
         let Some(controller) = self.app_update.clone() else {
@@ -1615,6 +1647,372 @@ impl EditorView {
                 self.keep_running_after_restart_attempt(message, cx);
             }
         }
+    }
+}
+
+/// What `save_session_tracked` did with one save request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SaveStart {
+    /// A write was started; its completion is reported for this ticket.
+    Started(SaveTicket),
+    /// A write was already running; the request was queued behind it.
+    Queued,
+    /// The document has no path.
+    NeedsPath,
+    /// A confirmed overwrite no longer matched.
+    ApprovalExpired,
+    /// A folder move to the Trash refused the write.
+    Refused,
+    /// The session does not exist any more.
+    Gone,
+}
+
+impl SaveStart {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Started(_) => "保存を開始しました",
+            Self::Queued => "別の保存が進行中のため、保存を開始できませんでした",
+            Self::NeedsPath => "保存先が決まっていません",
+            Self::ApprovalExpired => "確認後に文書または外部のファイルが変更されました",
+            Self::Refused => "フォルダをゴミ箱へ移動中のため保存できません",
+            Self::Gone => "文書が閉じられました",
+        }
+    }
+}
+
+/// How a started write ended, as reported once to the batch that waits for it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum TrackedSaveResult {
+    Saved,
+    SavedStale,
+    Conflict,
+    Failed(String),
+    Superseded,
+}
+
+impl TrackedSaveResult {
+    pub(crate) fn from_outcome(outcome: &SaveOutcome) -> Self {
+        match outcome {
+            SaveOutcome::Saved => Self::Saved,
+            SaveOutcome::SavedStale => Self::SavedStale,
+            SaveOutcome::Conflict => Self::Conflict,
+            SaveOutcome::Failed(error) => Self::Failed(error.to_string()),
+            SaveOutcome::Superseded => Self::Superseded,
+        }
+    }
+
+    fn reason(&self) -> String {
+        match self {
+            Self::Saved => "保存しました".to_owned(),
+            Self::SavedStale => {
+                "保存中に文書が編集されました。編集内容は保持しています".to_owned()
+            }
+            Self::Conflict => {
+                "保存先のファイルが外部で変更されています。上書きは行っていません".to_owned()
+            }
+            Self::Failed(error) => error.clone(),
+            Self::Superseded => "保存の対象の文書が変わりました".to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UpdateSaveTarget {
+    id: SessionId,
+    label: String,
+    path: PathBuf,
+}
+
+/// One session as the batch saw it when it started.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpdateSaveSession {
+    id: SessionId,
+    instance: Option<DocumentInstance>,
+    revision: Revision,
+    path: Option<PathBuf>,
+}
+
+/// The "save and restart" operation: it writes every unsaved, file-backed
+/// document one at a time and only then joins `start_update_restart`.
+#[derive(Debug)]
+pub(crate) struct UpdateSaveBatch {
+    candidate_id: String,
+    workspace_generation: u64,
+    /// Every session at the start; any difference aborts the batch.
+    sessions: Vec<UpdateSaveSession>,
+    /// The dirty documents, in `SessionId` order.
+    targets: Vec<UpdateSaveTarget>,
+    /// Index of the target being written, or the next one to write.
+    next: usize,
+    /// The one write whose completion is being waited for.
+    awaiting: Option<(SessionId, SaveTicket)>,
+}
+
+fn save_failure_message(target: &UpdateSaveTarget, reason: &str) -> String {
+    format!(
+        "「{}」を保存できなかったため、更新を中止しました。\n保存先: {}\n理由: {}",
+        target.label,
+        target.path.display(),
+        reason
+    )
+}
+
+impl EditorView {
+    fn update_save_sessions(&self) -> Vec<UpdateSaveSession> {
+        self.sessions
+            .sessions()
+            .map(|session| UpdateSaveSession {
+                id: session.id(),
+                instance: self.document_instance(session.id()),
+                revision: session.revision(),
+                path: session.path().map(Path::to_path_buf),
+            })
+            .collect()
+    }
+
+    /// The sessions "保存して再起動" would save, or `None` when it must not be
+    /// offered. Side-effect free, so it is safe to call while drawing: it never
+    /// runs `prepare_update_restart` (which writes drafts and settings).
+    ///
+    /// Offered only when the update is restartable, nothing is running, the only
+    /// restart blockers are unsaved documents, and every unsaved document has a
+    /// file path. An edited untitled note stays dirty even after its draft was
+    /// written, so one such note withholds the action.
+    pub(super) fn save_and_restart_targets(
+        &self,
+        snapshot: &AppUpdateSnapshot,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<SessionId>> {
+        if snapshot.phase != AppUpdatePhase::Ready
+            || !snapshot.restart_supported
+            || snapshot.restoring
+            || snapshot.candidate_id.is_none()
+        {
+            return None;
+        }
+        if self.restart_in_progress || self.update_save_batch.is_some() || self.restart_freeze {
+            return None;
+        }
+        let dirty: Vec<&DocumentSession> = self
+            .sessions
+            .sessions()
+            .filter(|session| session.is_dirty())
+            .collect();
+        if dirty.is_empty() || dirty.iter().any(|session| session.path().is_none()) {
+            return None;
+        }
+        if !self
+            .restart_blockers(cx)
+            .iter()
+            .all(|blocker| matches!(blocker, RestartBlocker::DirtyDocument(_)))
+        {
+            return None;
+        }
+        let mut ids: Vec<SessionId> = dirty.iter().map(|session| session.id()).collect();
+        ids.sort();
+        Some(ids)
+    }
+
+    /// True while a restart or a save-and-restart batch owns the action.
+    pub(super) fn update_restart_busy(&self) -> bool {
+        self.restart_in_progress || self.update_save_batch.is_some()
+    }
+
+    /// "保存して再起動". `expected` is the candidate the button was drawn for.
+    /// The batch is registered before the first write starts, in this same UI
+    /// turn, so a second activation finds it and does nothing.
+    pub(super) fn start_save_and_restart(&mut self, expected: &str, cx: &mut Context<Self>) {
+        if self.update_restart_busy() {
+            return;
+        }
+        let Some(controller) = self.app_update.clone() else {
+            return;
+        };
+        let snapshot = controller.snapshot();
+        if snapshot.candidate_id.as_deref() != Some(expected) {
+            return;
+        }
+        self.restart_message = None;
+        let Some(ids) = self.save_and_restart_targets(&snapshot, cx) else {
+            // The situation changed since the button was drawn: the normal
+            // path reports whatever blocks the restart now.
+            self.start_update_restart(Some(expected), cx);
+            return;
+        };
+        let targets: Vec<UpdateSaveTarget> = ids
+            .iter()
+            .filter_map(|id| {
+                let session = self.sessions.get(*id)?;
+                Some(UpdateSaveTarget {
+                    id: *id,
+                    label: session.label(),
+                    path: session.path()?.to_path_buf(),
+                })
+            })
+            .collect();
+        if targets.len() != ids.len() {
+            self.start_update_restart(Some(expected), cx);
+            return;
+        }
+        self.update_save_batch = Some(UpdateSaveBatch {
+            candidate_id: expected.to_owned(),
+            workspace_generation: self.work_folder_generation,
+            sessions: self.update_save_sessions(),
+            targets,
+            next: 0,
+            awaiting: None,
+        });
+        self.continue_update_save(cx);
+    }
+
+    /// Why the batch cannot go on, or `None`. Anything that changed since the
+    /// batch started (documents, paths, workspace, candidate, other blockers)
+    /// is a reason; the remaining targets' unsaved state is the one allowed
+    /// difference until `finished`.
+    fn update_save_problem(
+        &self,
+        batch: &UpdateSaveBatch,
+        finished: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let label_of = |id: SessionId| {
+            self.sessions
+                .get(id)
+                .map(DocumentSession::label)
+                .unwrap_or_default()
+        };
+        let candidate_current = self.app_update.as_ref().is_some_and(|controller| {
+            let snapshot = controller.snapshot();
+            snapshot.phase == AppUpdatePhase::Ready
+                && snapshot.restart_supported
+                && snapshot.candidate_id.as_deref() == Some(batch.candidate_id.as_str())
+        });
+        if !candidate_current {
+            return Some("更新の候補が変わったため、更新を中止しました。".to_owned());
+        }
+        if self.work_folder_generation != batch.workspace_generation {
+            return Some("作業フォルダーが切り替わったため、更新を中止しました。".to_owned());
+        }
+        let now = self.update_save_sessions();
+        if now.len() != batch.sessions.len()
+            || now.iter().zip(&batch.sessions).any(|(a, b)| a.id != b.id)
+        {
+            return Some("開いている文書の構成が変わったため、更新を中止しました。".to_owned());
+        }
+        for (current, started) in now.iter().zip(&batch.sessions) {
+            let label = label_of(current.id);
+            if current.instance != started.instance {
+                return Some(format!(
+                    "「{label}」が別の文書に置き換わったため、更新を中止しました。"
+                ));
+            }
+            if current.path != started.path {
+                let path = current
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                return Some(format!(
+                    "「{label}」の保存先が変更されたため、更新を中止しました。\n保存先: {path}"
+                ));
+            }
+            if current.revision != started.revision {
+                return Some(format!(
+                    "「{label}」が編集されたため、更新を中止しました。編集内容は保持しています。"
+                ));
+            }
+        }
+        let remaining = &batch.targets[batch.next.min(batch.targets.len())..];
+        for session in self.sessions.sessions() {
+            let expected = remaining.iter().any(|target| target.id == session.id());
+            if session.is_dirty() != expected {
+                return Some(format!(
+                    "「{}」の未保存の状態が変わったため、更新を中止しました。",
+                    session.label()
+                ));
+            }
+        }
+        let reasons: Vec<String> = self
+            .restart_blockers(cx)
+            .iter()
+            .filter(|blocker| finished || !matches!(blocker, RestartBlocker::DirtyDocument(_)))
+            .map(RestartBlocker::message)
+            .collect();
+        if !reasons.is_empty() {
+            return Some(format!(
+                "他の操作が行われたため、更新を中止しました。{}",
+                reasons.join(" ")
+            ));
+        }
+        None
+    }
+
+    /// Writes the next target, or, when every target was saved, joins the
+    /// normal restart path. The batch is held outside `self` only for the
+    /// duration of this call.
+    fn continue_update_save(&mut self, cx: &mut Context<Self>) {
+        let Some(mut batch) = self.update_save_batch.take() else {
+            return;
+        };
+        let finished = batch.next >= batch.targets.len();
+        if let Some(problem) = self.update_save_problem(&batch, finished, cx) {
+            self.restart_message = Some(problem);
+            cx.notify();
+            return;
+        }
+        if finished {
+            // The batch is gone; the existing entrance re-observes everything
+            // and takes its own ticket, so nothing from before the saves is
+            // reused.
+            self.restart_message = None;
+            self.start_update_restart(Some(&batch.candidate_id), cx);
+            return;
+        }
+        let target = batch.targets[batch.next].clone();
+        let total = batch.targets.len();
+        match self.save_session_tracked(target.id, SaveIntent::Current, cx) {
+            SaveStart::Started(ticket) => {
+                batch.awaiting = Some((target.id, ticket));
+                self.restart_message =
+                    Some(format!("保存しています…（{}／{}）", batch.next, total));
+                self.update_save_batch = Some(batch);
+            }
+            other => {
+                self.restart_message = Some(save_failure_message(&target, other.reason()));
+            }
+        }
+        cx.notify();
+    }
+
+    /// Called by `finish_save` on every path once the write of `ticket` has
+    /// been fully processed. Only the write the batch waits for counts, and
+    /// only `Saved` lets it go on.
+    pub(super) fn report_tracked_save(
+        &mut self,
+        id: SessionId,
+        ticket: SaveTicket,
+        result: TrackedSaveResult,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(batch) = self.update_save_batch.as_mut() else {
+            return;
+        };
+        if batch.awaiting != Some((id, ticket)) {
+            return;
+        }
+        batch.awaiting = None;
+        if result == TrackedSaveResult::Saved {
+            batch.next += 1;
+            self.continue_update_save(cx);
+            return;
+        }
+        let target = batch.targets.get(batch.next).cloned();
+        self.update_save_batch = None;
+        self.restart_message = Some(match target {
+            Some(target) => save_failure_message(&target, &result.reason()),
+            None => result.reason(),
+        });
+        cx.notify();
     }
 }
 
@@ -2296,6 +2694,8 @@ mod tests {
         snapshot: Mutex<Option<AppUpdateSnapshot>>,
         calls: Mutex<Vec<String>>,
         diagnostics: Option<String>,
+        /// When set, `prepare_restart` answers `Prepared` and logs into it.
+        prepared_log: Option<CallLog>,
     }
 
     impl FakeController {
@@ -2304,6 +2704,7 @@ mod tests {
                 snapshot: Mutex::new(Some(snapshot)),
                 calls: Mutex::new(Vec::new()),
                 diagnostics: None,
+                prepared_log: None,
             })
         }
 
@@ -2312,7 +2713,24 @@ mod tests {
                 snapshot: Mutex::new(Some(snapshot)),
                 calls: Mutex::new(Vec::new()),
                 diagnostics: Some(text.to_owned()),
+                prepared_log: None,
             })
+        }
+
+        fn with_prepared(snapshot: AppUpdateSnapshot, log: CallLog) -> Arc<Self> {
+            Arc::new(Self {
+                snapshot: Mutex::new(Some(snapshot)),
+                calls: Mutex::new(Vec::new()),
+                diagnostics: None,
+                prepared_log: Some(log),
+            })
+        }
+
+        fn prepare_calls(&self) -> usize {
+            self.calls()
+                .iter()
+                .filter(|call| call.starts_with("prepare:"))
+                .count()
         }
 
         fn calls(&self) -> Vec<String> {
@@ -2365,7 +2783,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("prepare:{candidate_id}"));
-            Err("prepare refused by the test controller".to_owned())
+            match &self.prepared_log {
+                Some(log) => Ok(Box::new(LoggingPrepared(log.clone()))),
+                None => Err("prepare refused by the test controller".to_owned()),
+            }
         }
     }
 
@@ -3295,5 +3716,664 @@ mod tests {
         });
         cx.run_until_parked();
         std::fs::remove_file(path).unwrap();
+    }
+
+    // ---- Issue #745: 保存して再起動 ----
+
+    /// An in-memory filesystem that records every write and can refuse chosen
+    /// files. A write only runs once the test lets the executor run, so the
+    /// window between "write started" and "write finished" stays open for as
+    /// long as the test does not park; nothing here waits on a clock.
+    #[derive(Default)]
+    struct RecordingFiles {
+        inner: hane_session::testing::MemoryFileService,
+        saves: Mutex<Vec<PathBuf>>,
+        failing: Mutex<HashSet<String>>,
+        active: std::sync::atomic::AtomicUsize,
+        max_active: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingFiles {
+        fn saved_names(&self) -> Vec<String> {
+            self.saves
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+                .collect()
+        }
+
+        fn fail(&self, name: &str) {
+            self.failing.lock().unwrap().insert(name.to_owned());
+        }
+    }
+
+    impl FileService for RecordingFiles {
+        fn load(&self, path: &Path) -> std::io::Result<LoadedFile> {
+            self.inner.load(path)
+        }
+        fn open_reader(&self, path: &Path) -> std::io::Result<hane_session::ReadFile> {
+            self.inner.open_reader(path)
+        }
+        fn save(&self, path: &Path, document: &RopeBuffer) -> std::io::Result<SavedFile> {
+            use std::sync::atomic::Ordering;
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+            self.saves.lock().unwrap().push(path.to_path_buf());
+            let refused = path
+                .file_name()
+                .is_some_and(|name| self.failing.lock().unwrap().contains(&*name.to_string_lossy()));
+            let result = if refused {
+                Err(std::io::Error::other("disk full"))
+            } else {
+                self.inner.save(path, document)
+            };
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            result
+        }
+        fn stamp(&self, path: &Path) -> Option<hane_session::FileStamp> {
+            self.inner.stamp(path)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.inner.rename(from, to)
+        }
+        fn rename_folder(&self, from: &Path, to: &Path) -> std::io::Result<()> {
+            self.inner.rename_folder(from, to)
+        }
+        fn create_dir(&self, path: &Path) -> std::io::Result<()> {
+            self.inner.create_dir(path)
+        }
+    }
+
+    struct BatchFixture<'a> {
+        view: gpui::Entity<EditorView>,
+        cx: &'a mut gpui::VisualTestContext,
+        files: Arc<RecordingFiles>,
+        controller: Arc<FakeController>,
+        ids: Vec<SessionId>,
+    }
+
+    /// One file-backed session per name, all clean, with a Ready update.
+    fn batch_fixture<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        names: &[&str],
+        controller: Arc<FakeController>,
+    ) -> BatchFixture<'a> {
+        let files = Arc::new(RecordingFiles::default());
+        let paths: Vec<PathBuf> = names
+            .iter()
+            .map(|name| PathBuf::from(format!("/notes/{name}")))
+            .collect();
+        for path in &paths {
+            files.inner.write_externally(path, "start\n");
+        }
+        let service: Arc<dyn FileService> = files.clone();
+        let build_paths = paths.clone();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            let mut set = SessionSet::with_loaded(service.load(&build_paths[0]).unwrap());
+            for path in &build_paths[1..] {
+                set.apply_open(None, service.load(path).unwrap());
+            }
+            EditorView::from_sessions(set, service.clone(), StateStores::memory(), cx)
+        });
+        let attached: Arc<dyn AppUpdateController> = controller.clone();
+        view.update(cx, |view, _| view.attach_app_update(Some(attached)));
+        let ids = (0..names.len() as u64).map(SessionId).collect();
+        BatchFixture {
+            view,
+            cx,
+            files,
+            controller,
+            ids,
+        }
+    }
+
+    impl BatchFixture<'_> {
+        fn edit(&mut self, index: usize, text: &str) {
+            let id = self.ids[index];
+            self.view.update(self.cx, |view, cx| {
+                view.sessions.activate(id);
+                view.on_document_replaced();
+                view.editor_mut().insert_text(text).unwrap();
+                view.after_input(cx);
+            });
+        }
+
+        fn targets(&mut self) -> Option<Vec<SessionId>> {
+            self.view.update(self.cx, |view, cx| {
+                view.save_and_restart_targets(&promptable(AppUpdatePhase::Ready), cx)
+            })
+        }
+
+        fn start(&mut self) {
+            self.view
+                .update(self.cx, |view, cx| view.start_save_and_restart("cand", cx));
+        }
+
+        fn park(&mut self) {
+            self.cx.run_until_parked();
+        }
+
+        fn message(&mut self) -> Option<String> {
+            self.view
+                .read_with(self.cx, |view, _| view.restart_message.clone())
+        }
+
+        fn batch_active(&mut self) -> bool {
+            self.view
+                .read_with(self.cx, |view, _| view.update_save_batch.is_some())
+        }
+
+        fn is_dirty(&mut self, index: usize) -> bool {
+            let id = self.ids[index];
+            self.view
+                .read_with(self.cx, |view, _| view.sessions.get(id).unwrap().is_dirty())
+        }
+
+        fn text_of(&mut self, index: usize) -> String {
+            let id = self.ids[index];
+            self.view.update(self.cx, |view, _| {
+                view.sessions.activate(id);
+                view.editor().document().full_text()
+            })
+        }
+
+        fn redraw(&mut self) {
+            self.view.update(self.cx, |_, cx| cx.notify());
+            self.cx.run_until_parked();
+        }
+    }
+
+    fn ready_controller() -> Arc<FakeController> {
+        FakeController::new(promptable(AppUpdatePhase::Ready))
+    }
+
+    #[gpui::test]
+    fn save_and_restart_is_offered_only_for_path_backed_dirty_sessions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut fixture = batch_fixture(cx, &["a.md", "b.md", "c.md"], ready_controller());
+        fixture.redraw();
+        assert_eq!(fixture.targets(), None, "nothing unsaved: the plain restart");
+        assert!(fixture.cx.debug_bounds("app-update-prompt-restart").is_some());
+        assert!(
+            fixture
+                .cx
+                .debug_bounds("app-update-prompt-save-restart")
+                .is_none()
+        );
+
+        // A background (inactive) document is a target too.
+        fixture.edit(1, "B");
+        fixture.edit(0, "A");
+        fixture.redraw();
+        assert_eq!(
+            fixture.targets(),
+            Some(vec![fixture.ids[0], fixture.ids[1]]),
+            "ordered by session id, the inactive one included"
+        );
+        assert!(
+            fixture
+                .cx
+                .debug_bounds("app-update-prompt-save-restart")
+                .is_some()
+        );
+        assert!(fixture.cx.debug_bounds("app-update-prompt-restart").is_none());
+
+        // The check has no side effect: nothing was saved or prepared.
+        assert!(fixture.files.saved_names().is_empty());
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+
+        // The settings card offers the same action.
+        fixture.view.update(fixture.cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::General;
+            cx.notify();
+        });
+        fixture.park();
+        assert!(fixture.cx.debug_bounds("settings-app-update-card").is_some());
+        let card_has_save_action = fixture.view.update(fixture.cx, |view, cx| {
+            let snapshot = view.app_update.as_ref().unwrap().snapshot();
+            view.save_and_restart_targets(&snapshot, cx).is_some()
+        });
+        assert!(card_has_save_action);
+    }
+
+    #[gpui::test]
+    fn a_dirty_unnamed_session_disables_save_and_restart_even_after_draft_flush(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        assert!(fixture.targets().is_some());
+        fixture.view.update(fixture.cx, |view, _| {
+            view.sessions.open_untitled("", "Untitled");
+            view.on_document_replaced();
+            view.editor_mut().insert_text("memo").unwrap();
+        });
+        assert_eq!(fixture.targets(), None);
+        // Writing the draft does not make the note clean.
+        let still_dirty = fixture.view.update(fixture.cx, |view, _| {
+            let _ = view.flush_pending_drafts_checked();
+            view.sessions.active().is_dirty()
+        });
+        assert!(still_dirty);
+        assert_eq!(fixture.targets(), None);
+    }
+
+    #[gpui::test]
+    fn a_clean_unnamed_session_does_not_disable_save_and_restart(cx: &mut gpui::TestAppContext) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.view.update(fixture.cx, |view, _| {
+            view.sessions.open_untitled("", "Untitled");
+        });
+        fixture.edit(0, "A");
+        assert_eq!(fixture.targets(), Some(vec![fixture.ids[0]]));
+    }
+
+    #[gpui::test]
+    fn other_restart_blockers_keep_the_existing_message_and_actions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        assert!(fixture.targets().is_some());
+        fixture.view.update(fixture.cx, |view, _| {
+            view.restart_test_ai_busy = true;
+            view.save_as_dialogs_open = 1;
+            view.loading_paths.insert(PathBuf::from("pending.md"));
+        });
+        assert_eq!(fixture.targets(), None);
+        fixture.redraw();
+        assert!(fixture.cx.debug_bounds("app-update-prompt-restart").is_some());
+        assert!(
+            fixture
+                .cx
+                .debug_bounds("app-update-prompt-save-restart")
+                .is_none()
+        );
+        fixture.view.update(fixture.cx, |view, cx| {
+            view.start_update_restart(Some("cand"), cx);
+        });
+        let message = fixture.message().unwrap();
+        assert!(message.contains("未保存の文書があります"), "{message}");
+        assert!(message.contains("AIの処理が実行中"), "{message}");
+        assert!(message.contains("保存先の選択"), "{message}");
+        assert!(message.contains("ファイルを開いている途中"), "{message}");
+        assert!(fixture.files.saved_names().is_empty());
+
+        // Further kinds of blocker are not turned into a save either.
+        fixture.view.update(fixture.cx, |view, _| {
+            view.restart_test_ai_busy = false;
+            view.save_as_dialogs_open = 0;
+            view.loading_paths.clear();
+            view.file_context_menu_busy = true;
+        });
+        assert_eq!(fixture.targets(), None);
+    }
+
+    #[gpui::test]
+    fn save_and_restart_saves_all_targets_before_preparing_the_helper(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut fixture = batch_fixture(cx, &["a.md", "b.md", "c.md"], ready_controller());
+        fixture.edit(2, "C");
+        fixture.edit(0, "A");
+        let (first, second) = (fixture.ids[0], fixture.ids[2]);
+        fixture.start();
+        assert!(fixture.batch_active());
+        // Only the first write is open; the second waits for its completion.
+        let in_flight = fixture.view.read_with(fixture.cx, |view, _| {
+            (
+                view.sessions.get(first).unwrap().save_in_flight(),
+                view.sessions.get(second).unwrap().save_in_flight(),
+            )
+        });
+        assert_eq!(in_flight, (true, false));
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+
+        fixture.park();
+        assert_eq!(fixture.files.saved_names(), ["a.md", "c.md"]);
+        assert_eq!(
+            fixture.files.max_active.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(
+            fixture
+                .files
+                .inner
+                .contents("/notes/a.md")
+                .is_some_and(|text| text.contains('A'))
+        );
+        assert!(
+            fixture
+                .files
+                .inner
+                .contents("/notes/c.md")
+                .is_some_and(|text| text.contains('C'))
+        );
+        assert_eq!(
+            fixture.controller.prepare_calls(),
+            1,
+            "the helper is prepared once, after every save"
+        );
+        assert!(!fixture.batch_active());
+    }
+
+    #[gpui::test]
+    fn save_and_restart_rejoins_the_existing_exit_sequence(cx: &mut gpui::TestAppContext) {
+        let log: CallLog = Arc::new(Mutex::new(Vec::new()));
+        let controller = FakeController::with_prepared(promptable(AppUpdatePhase::Ready), log.clone());
+        let mut fixture = batch_fixture(cx, &["a.md", "b.md"], controller);
+        let ai: Arc<dyn AiLifecycle> = Arc::new(LoggingAi(log.clone()));
+        fixture
+            .view
+            .update(fixture.cx, |view, _| view.attach_ai_lifecycle(Some(ai)));
+        fixture.edit(0, "A");
+        fixture.edit(1, "B");
+        fixture.start();
+        fixture.park();
+        assert_eq!(fixture.files.saved_names(), ["a.md", "b.md"]);
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            ["ticket", "stop_ai", "authorize"],
+            "the saved window goes through the ticket, AI stop and authorization"
+        );
+        assert!(!fixture.is_dirty(0));
+        assert!(!fixture.is_dirty(1));
+    }
+
+    #[gpui::test]
+    fn a_save_failure_stops_the_batch_and_shows_the_target_and_reason(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut fixture = batch_fixture(cx, &["a.md", "b.md", "c.md"], ready_controller());
+        fixture.files.fail("b.md");
+        fixture.edit(0, "A");
+        fixture.edit(1, "B");
+        fixture.edit(2, "C");
+        fixture.start();
+        fixture.park();
+        assert_eq!(
+            fixture.files.saved_names(),
+            ["a.md", "b.md"],
+            "the batch stops at the failure"
+        );
+        let message = fixture.message().unwrap();
+        assert!(message.contains("b.md"), "{message}");
+        assert!(message.contains("disk full"), "{message}");
+        assert!(message.contains("更新を中止"), "{message}");
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+        assert!(!fixture.batch_active());
+        // The finished save stays; the failed and untouched ones keep their text.
+        assert!(!fixture.is_dirty(0));
+        assert!(fixture.is_dirty(1));
+        assert!(fixture.is_dirty(2));
+        assert!(fixture.text_of(1).contains('B'));
+
+        // Both surfaces show it.
+        fixture.redraw();
+        assert!(fixture.cx.debug_bounds("app-update-prompt-message").is_some());
+        fixture.view.update(fixture.cx, |view, cx| {
+            view.settings_open = true;
+            view.settings_category = SettingsCategory::General;
+            cx.notify();
+        });
+        fixture.park();
+        assert!(
+            fixture
+                .cx
+                .debug_bounds("settings-app-update-restart-message")
+                .is_some()
+        );
+    }
+
+    #[gpui::test]
+    fn an_external_conflict_never_forces_save_or_restart(cx: &mut gpui::TestAppContext) {
+        let mut fixture = batch_fixture(cx, &["a.md", "b.md"], ready_controller());
+        fixture.edit(0, "A");
+        fixture.edit(1, "B");
+        fixture
+            .files
+            .inner
+            .write_externally("/notes/a.md", "external\n");
+        fixture.start();
+        fixture.park();
+        assert_eq!(
+            fixture.files.inner.contents("/notes/a.md").as_deref(),
+            Some("external\n"),
+            "the external version is never overwritten"
+        );
+        assert!(fixture.files.saved_names().is_empty());
+        let message = fixture.message().unwrap();
+        assert!(message.contains("a.md"), "{message}");
+        assert!(message.contains("外部"), "{message}");
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+        assert!(fixture.is_dirty(0));
+        assert!(fixture.is_dirty(1));
+    }
+
+    #[gpui::test]
+    fn a_stale_save_aborts_restart_without_losing_new_edits(cx: &mut gpui::TestAppContext) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        fixture.start();
+        // The write is open; the document is edited before it finishes.
+        fixture.edit(0, "Z");
+        fixture.park();
+        assert_eq!(fixture.files.saved_names(), ["a.md"]);
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+        assert!(fixture.is_dirty(0), "the newer edit is still unsaved");
+        let text = fixture.text_of(0);
+        assert!(text.contains('Z') && text.contains('A'), "{text}");
+        assert!(fixture.message().unwrap().contains("更新を中止"));
+    }
+
+    #[gpui::test]
+    fn changes_to_another_session_abort_the_batch(cx: &mut gpui::TestAppContext) {
+        let mut fixture = batch_fixture(cx, &["a.md", "b.md", "c.md"], ready_controller());
+        fixture.edit(0, "A");
+        fixture.edit(1, "B");
+        fixture.start();
+        // A document outside the batch is edited while the first write runs.
+        fixture.edit(2, "C");
+        fixture.park();
+        assert_eq!(
+            fixture.files.saved_names(),
+            ["a.md"],
+            "the second target is never started"
+        );
+        let message = fixture.message().unwrap();
+        assert!(message.contains("c.md"), "{message}");
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+        assert!(fixture.is_dirty(1));
+    }
+
+    #[gpui::test]
+    fn replaced_sessions_and_changed_paths_cannot_continue_the_batch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        let id = fixture.ids[0];
+        let problem = |fixture: &mut BatchFixture<'_>, change: &dyn Fn(&mut UpdateSaveBatch)| {
+            fixture.view.update(fixture.cx, |view, cx| {
+                let mut batch = UpdateSaveBatch {
+                    candidate_id: "cand".to_owned(),
+                    workspace_generation: view.work_folder_generation,
+                    sessions: view.update_save_sessions(),
+                    targets: vec![UpdateSaveTarget {
+                        id,
+                        label: view.sessions.get(id).unwrap().label(),
+                        path: view.sessions.get(id).unwrap().path().unwrap().to_path_buf(),
+                    }],
+                    next: 0,
+                    awaiting: None,
+                };
+                change(&mut batch);
+                view.update_save_problem(&batch, false, cx)
+            })
+        };
+        assert_eq!(problem(&mut fixture, &|_| {}), None);
+        let swapped = problem(&mut fixture, &|batch| {
+            batch.sessions[0].instance = None;
+        });
+        assert!(swapped.is_some_and(|text| text.contains("置き換わった")));
+        let moved = problem(&mut fixture, &|batch| {
+            batch.sessions[0].path = Some(PathBuf::from("/elsewhere/a.md"));
+        });
+        assert!(moved.is_some_and(|text| text.contains("保存先が変更")));
+        let workspace = problem(&mut fixture, &|batch| batch.workspace_generation += 1);
+        assert!(workspace.is_some_and(|text| text.contains("作業フォルダー")));
+        let candidate = problem(&mut fixture, &|batch| {
+            batch.candidate_id = "other".to_owned();
+        });
+        assert!(candidate.is_some_and(|text| text.contains("候補")));
+
+        // A session added or closed after the start changes the composition.
+        fixture.view.update(fixture.cx, |view, _| {
+            view.sessions.open_untitled("", "Untitled");
+        });
+        let composition = problem(&mut fixture, &|batch| {
+            batch.sessions.pop();
+        });
+        assert!(composition.is_some_and(|text| text.contains("構成")));
+    }
+
+    #[gpui::test]
+    fn double_activation_starts_only_one_save_batch(cx: &mut gpui::TestAppContext) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        fixture.view.update(fixture.cx, |view, cx| {
+            view.start_save_and_restart("cand", cx);
+            // Mouse, keyboard, the card and the plain restart entrance again.
+            view.start_save_and_restart("cand", cx);
+            view.run_app_update_action(CardAction::SaveAndRestart("cand".to_owned()), cx);
+            view.run_app_update_action(CardAction::Restart, cx);
+            view.start_update_restart(Some("cand"), cx);
+        });
+        fixture.park();
+        assert_eq!(fixture.files.saved_names(), ["a.md"]);
+        assert_eq!(fixture.controller.prepare_calls(), 1);
+    }
+
+    #[gpui::test]
+    fn a_changed_candidate_cannot_be_restarted_after_saving(cx: &mut gpui::TestAppContext) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        // A button drawn for an older candidate does nothing.
+        fixture.view.update(fixture.cx, |view, cx| {
+            view.start_save_and_restart("older", cx);
+        });
+        assert!(!fixture.batch_active());
+        assert!(fixture.files.saved_names().is_empty());
+
+        fixture.start();
+        *fixture.controller.snapshot.lock().unwrap() = Some(AppUpdateSnapshot {
+            candidate_id: Some("other".to_owned()),
+            ..promptable(AppUpdatePhase::Ready)
+        });
+        fixture.park();
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+        assert!(fixture.message().unwrap().contains("候補"));
+        assert!(!fixture.batch_active());
+    }
+
+    #[gpui::test]
+    fn tracked_save_reports_every_terminal_path_once(cx: &mut gpui::TestAppContext) {
+        let outcomes = [
+            (SaveOutcome::Saved, TrackedSaveResult::Saved),
+            (SaveOutcome::SavedStale, TrackedSaveResult::SavedStale),
+            (SaveOutcome::Conflict, TrackedSaveResult::Conflict),
+            (SaveOutcome::Superseded, TrackedSaveResult::Superseded),
+            (
+                SaveOutcome::Failed(std::io::Error::other("boom")),
+                TrackedSaveResult::Failed("boom".to_owned()),
+            ),
+        ];
+        for (outcome, expected) in outcomes {
+            assert_eq!(TrackedSaveResult::from_outcome(&outcome), expected);
+        }
+
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        let id = fixture.ids[0];
+        let (gone, started, queued) = fixture.view.update(fixture.cx, |view, cx| {
+            let gone = view.save_session_tracked(SessionId(99), SaveIntent::Current, cx);
+            let started = view.save_session_tracked(id, SaveIntent::Current, cx);
+            let queued = view.save_session_tracked(id, SaveIntent::Current, cx);
+            (gone, started, queued)
+        });
+        assert_eq!(gone, SaveStart::Gone);
+        assert!(matches!(started, SaveStart::Started(_)));
+        assert_eq!(queued, SaveStart::Queued);
+        fixture.park();
+
+        // An untitled document has no path to write.
+        let needs_path = fixture.view.update(fixture.cx, |view, cx| {
+            let untitled = view.sessions.open_untitled("", "Untitled");
+            view.save_session_tracked(untitled, SaveIntent::Current, cx)
+        });
+        assert_eq!(needs_path, SaveStart::NeedsPath);
+    }
+
+    #[gpui::test]
+    fn a_document_replaced_during_the_write_is_reported_and_stops_the_batch(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        fixture.start();
+        // The workspace is exchanged while the write is open: the completion no
+        // longer belongs to this document, and the batch is told so.
+        fixture
+            .view
+            .update(fixture.cx, |view, _| view.work_folder_generation += 1);
+        fixture.park();
+        assert!(!fixture.batch_active());
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+        assert!(fixture.message().unwrap().contains("更新を中止"));
+    }
+
+    #[gpui::test]
+    fn post_save_pending_work_blocks_restart(cx: &mut gpui::TestAppContext) {
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.edit(0, "A");
+        fixture.start();
+        // Something else starts while the write is open and is still going on
+        // when the write has been reported.
+        fixture.view.update(fixture.cx, |view, _| {
+            view.loading_paths.insert(PathBuf::from("late.md"));
+        });
+        fixture.park();
+        assert_eq!(fixture.files.saved_names(), ["a.md"]);
+        assert_eq!(fixture.controller.prepare_calls(), 0);
+        let message = fixture.message().unwrap();
+        assert!(message.contains("ファイルを開いている途中"), "{message}");
+    }
+
+    #[gpui::test]
+    fn persistence_failure_after_batch_save_still_blocks_restart(cx: &mut gpui::TestAppContext) {
+        let root = draft_root("save-restart-draft");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let mut fixture = batch_fixture(cx, &["a.md"], ready_controller());
+        fixture.view.update(fixture.cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.draft_store = Arc::new(FailingDraftStore);
+        });
+        fixture.edit(0, "A");
+        fixture.start();
+        fixture.park();
+        assert_eq!(fixture.files.saved_names(), ["a.md"]);
+        assert_eq!(
+            fixture.controller.prepare_calls(),
+            0,
+            "a draft that cannot be written still stops the restart"
+        );
+        let message = fixture.message().unwrap();
+        assert!(message.contains("下書きを書き込めませんでした"), "{message}");
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

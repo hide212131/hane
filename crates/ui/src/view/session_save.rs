@@ -732,6 +732,19 @@ impl EditorView {
         intent: SaveIntent,
         cx: &mut Context<Self>,
     ) {
+        self.save_session_tracked(id, intent, cx);
+    }
+
+    /// [`Self::save_session`] that also says whether a write was started and,
+    /// if so, for which ticket. `finish_save` reports that ticket's result to
+    /// the "save and restart" batch (see `report_tracked_save`) once all of its
+    /// own follow-up work is done, on every path it can end through.
+    pub(super) fn save_session_tracked(
+        &mut self,
+        id: SessionId,
+        intent: SaveIntent,
+        cx: &mut Context<Self>,
+    ) -> SaveStart {
         // A folder is being moved to the OS Trash: a write under it would
         // recreate the original path or mark the session Present again once
         // the move lands. The content stays in the session, unsaved.
@@ -755,7 +768,7 @@ impl EditorView {
                         .to_owned(),
                 );
                 cx.notify();
-                return;
+                return SaveStart::Refused;
             }
         }
         // Publish protection before the save slot can be taken, so a request
@@ -770,12 +783,12 @@ impl EditorView {
             .map(|session| session.request_save(intent))
         else {
             self.sync_external_open_guard();
-            return;
+            return SaveStart::Gone;
         };
         // Recompute from every session: this lowers the early publication when
         // nothing started (e.g. no path) without clearing other sessions' state.
         self.sync_external_open_guard();
-        match decision {
+        let start = match decision {
             SaveDecision::NeedsPath => {
                 // Guidance, not a save state: the footer's save display is
                 // derived from the document itself. Another document's
@@ -789,11 +802,12 @@ impl EditorView {
                     }
                     None => "保存先が決まっていません。名前を付けて保存してください".to_owned(),
                 });
+                SaveStart::NeedsPath
             }
             // The footer derives "保存処理中…" from the document's own
             // `save_in_flight()`, so queued and started writes need no
             // message of their own.
-            SaveDecision::Queued => {}
+            SaveDecision::Queued => SaveStart::Queued,
             SaveDecision::ApprovalExpired => {
                 // The confirmation was for an older document or an older
                 // external version; nothing was written and the choice has
@@ -802,6 +816,7 @@ impl EditorView {
                     "確認後に文書または外部のファイルが変更されました。もう一度、操作を選んでください"
                         .to_owned(),
                 );
+                SaveStart::ApprovalExpired
             }
             SaveDecision::Write(job) => {
                 // A started write replaces any older transient message, the
@@ -893,9 +908,11 @@ impl EditorView {
                     });
                 })
                 .detach();
+                SaveStart::Started(ticket)
             }
-        }
+        };
         cx.notify();
+        start
     }
 
     fn finish_save(
@@ -927,6 +944,7 @@ impl EditorView {
             // belongs to anything open.
             self.settle_save_as_copies(id, instance, path, false, cx);
             self.sync_external_open_guard();
+            self.report_tracked_save(id, ticket, TrackedSaveResult::Superseded, cx);
             return;
         }
         let revision_before = self.sessions.get(id).map(DocumentSession::revision);
@@ -937,8 +955,10 @@ impl EditorView {
         else {
             self.settle_save_as_copies(id, instance, path, false, cx);
             self.sync_external_open_guard();
+            self.report_tracked_save(id, ticket, TrackedSaveResult::Superseded, cx);
             return;
         };
+        let tracked = TrackedSaveResult::from_outcome(&outcome);
         let landed = matches!(outcome, SaveOutcome::Saved | SaveOutcome::SavedStale);
         // Images a Save As copied for this write stay only if it landed.
         self.settle_save_as_copies(id, instance, path, landed, cx);
@@ -1044,6 +1064,9 @@ impl EditorView {
         // the next external request sees the exact state without waiting for a
         // render; other sessions' dirty / saving state keeps it raised.
         self.sync_external_open_guard();
+        // Reported last, so a pending save or title sync this completion
+        // started is already visible to the batch's re-check.
+        self.report_tracked_save(id, ticket, tracked, cx);
         cx.notify();
     }
 
