@@ -100,6 +100,7 @@ pub use app_update::{
     RestartBlocker, RestartObservation, RestartPreparation, RestartTicketFile, RestartTicketSnapshot,
     SharedExternalOpenQueue,
 };
+use app_update::{SaveStart, TrackedSaveResult, UpdateSaveBatch};
 mod ai_settings;
 mod background_parse;
 mod basic_editing_keys;
@@ -865,6 +866,9 @@ pub struct EditorView {
     restart_in_progress: bool,
     /// Why the last restart attempt did not proceed, shown on the card.
     restart_message: Option<String>,
+    /// The "save and restart" batch that is writing the unsaved documents
+    /// before it joins the normal restart path.
+    update_save_batch: Option<UpdateSaveBatch>,
     /// Version of the update this process was started for, shown once after
     /// the helper's durable commit.
     update_completed: Option<String>,
