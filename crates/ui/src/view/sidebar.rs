@@ -3316,7 +3316,8 @@ mod tests {
         );
 
         // The pin is shown on hover but refuses to toggle while renaming.
-        move_mouse(cx, name_area_bounds(cx, index).center());
+        let name_center = name_area_bounds(cx, index).center();
+        move_mouse(cx, name_center);
         let pin = cx.debug_bounds(pin_selector(index)).expect("the pin slot");
         cx.simulate_click(pin.center(), gpui::Modifiers::none());
         cx.run_until_parked();
