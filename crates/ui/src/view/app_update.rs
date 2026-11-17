@@ -1076,6 +1076,7 @@ impl EditorView {
         let notice = self.restart_message.clone().map(|message| {
             div()
                 .id("app-update-prompt-message")
+                .debug_selector(|| "app-update-prompt-message".to_owned())
                 .text_color(rgb(self.theme.quote_foreground))
                 .child(message)
         });
@@ -4364,6 +4365,12 @@ mod tests {
             view.draft_store = Arc::new(FailingDraftStore);
         });
         fixture.edit(0, "A");
+        // タイトル同期のデバウンス（750ms）を経過させ、PendingEdit ブロッカーを解消してから開始する。
+        fixture
+            .cx
+            .executor()
+            .advance_clock(std::time::Duration::from_millis(800));
+        fixture.park();
         fixture.start();
         fixture.park();
         assert_eq!(fixture.files.saved_names(), ["a.md"]);
