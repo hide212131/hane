@@ -2354,6 +2354,9 @@ impl EditorView {
         if !self.sessions.close_discarding_changes(id, "Untitled") {
             return;
         }
+        // A discarded untitled note must not be restored from its recovery
+        // journal the next time the folder is opened.
+        self.retire_work_folder_draft(id, cx);
         self.finish_tab_close(id, was_active, cx);
     }
 
@@ -13946,6 +13949,58 @@ mod tests {
         let recovered = OsDraftStore.recover(&root).unwrap();
         assert_eq!(recovered.drafts.len(), 1);
         assert_eq!(recovered.drafts[0].text, draft_text);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // Issue #744: "close without saving" is the first path that closes a
+    // journaled unnamed note without it earning a name, so it must retire the
+    // draft or the discarded note would be recovered on the next open.
+    #[gpui::test]
+    fn discarding_a_draft_note_retires_its_recovery_journal(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("discard-retires-draft");
+        std::fs::create_dir_all(&root).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+
+        let id = view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            let id = view.sessions.active_id();
+            view.work_folder_drafts.insert(
+                id,
+                WorkFolderDraft {
+                    draft_id: DraftId::generate(),
+                    target_directory: root.clone(),
+                },
+            );
+            view.editor_mut().insert_text("discard me").unwrap();
+            view.after_input(cx);
+            id
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(900));
+        cx.run_until_parked();
+        assert_eq!(OsDraftStore.recover(&root).unwrap().drafts.len(), 1);
+
+        let confirm = view.update(cx, |view, cx| {
+            view.request_tab_close(id, cx);
+            view.tab_close_confirm.expect("confirm armed")
+        });
+        view.update(cx, |view, cx| view.confirm_discard_and_close_tab(confirm, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.work_folder_drafts.contains_key(&id));
+        });
+        assert!(OsDraftStore.recover(&root).unwrap().drafts.is_empty());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

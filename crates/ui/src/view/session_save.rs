@@ -615,7 +615,10 @@ impl EditorView {
     /// the (future) H1-derived rename or a manual Save As. The recovery
     /// journal entry is removed on a background thread; a failure here just
     /// leaves a harmless leftover file, never lost content.
-    fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
+    ///
+    /// Also called after "close without saving" discards a draft note: the
+    /// session is closed, so its journal must not be recovered on next open.
+    pub(super) fn retire_work_folder_draft(&mut self, id: SessionId, cx: &mut Context<Self>) {
         let Some(draft) = self.work_folder_drafts.remove(&id) else {
             return;
         };
