@@ -596,6 +596,62 @@ fn closing_refuses_to_drop_unsaved_work_and_never_empties_the_window() {
 }
 
 #[test]
+fn explicit_discard_closes_a_dirty_session_without_writing() {
+    let service = service_with(&[("/notes/a.md", "a\n"), ("/notes/b.md", "b\n")]);
+    let mut sessions = opened(&service, "/notes/a.md");
+    let first = sessions.active_id();
+    let second = sessions.apply_open(None, service.load(Path::new("/notes/b.md")).unwrap());
+    assert!(sessions.activate(first));
+    type_into(sessions.active_mut(), "unsaved");
+    let saves_before = service.save_calls();
+
+    assert!(sessions.close_discarding_changes(first, "Untitled"));
+
+    assert!(sessions.get(first).is_none());
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions.active_id(), second);
+    assert_eq!(service.save_calls(), saves_before, "nothing is written");
+    assert_eq!(service.contents("/notes/a.md").as_deref(), Some("a\n"));
+    assert!(!sessions.close_discarding_changes(first, "Untitled"));
+}
+
+#[test]
+fn explicit_discard_of_the_last_session_creates_a_clean_untitled() {
+    let service = service_with(&[("/notes/a.md", "a\n")]);
+    let mut sessions = opened(&service, "/notes/a.md");
+    let first = sessions.active_id();
+    type_into(sessions.active_mut(), "unsaved");
+
+    assert!(sessions.close_discarding_changes(first, "Untitled"));
+
+    assert_eq!(sessions.len(), 1);
+    assert_ne!(sessions.active_id(), first);
+    assert!(sessions.get(first).is_none());
+    assert!(!sessions.active().is_dirty());
+    assert_eq!(sessions.active().path(), None);
+    assert_eq!(sessions.active().editor().document().full_text(), "");
+    assert_eq!(service.contents("/notes/a.md").as_deref(), Some("a\n"));
+}
+
+#[test]
+fn explicit_discard_of_an_inactive_session_keeps_the_active_session() {
+    let service = service_with(&[("/notes/a.md", "a\n"), ("/notes/b.md", "b\n")]);
+    let mut sessions = opened(&service, "/notes/a.md");
+    let first = sessions.active_id();
+    type_into(sessions.active_mut(), "unsaved");
+    let second = sessions.apply_open(None, service.load(Path::new("/notes/b.md")).unwrap());
+    assert_eq!(sessions.active_id(), second);
+
+    assert!(sessions.close_discarding_changes(first, "Untitled"));
+
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions.active_id(), second);
+    assert_eq!(sessions.active().path(), Some(Path::new("/notes/b.md")));
+    assert!(sessions.get(first).is_none());
+    assert_eq!(service.contents("/notes/a.md").as_deref(), Some("a\n"));
+}
+
+#[test]
 fn switching_sessions_keeps_each_documents_own_state() {
     let service = service_with(&[("/notes/a.md", "a\n"), ("/notes/b.md", "b\n")]);
     let mut sessions = opened(&service, "/notes/a.md");

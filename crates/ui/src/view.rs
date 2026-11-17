@@ -652,11 +652,14 @@ struct SidebarContextMenu {
 /// against the live `tab_close_confirm` by value, not just by `id`: a stale
 /// click dispatched against an old confirmation must not be mistaken for one
 /// against a newer confirmation that happens to reuse the same `id` but
-/// carries a different `instance`.
+/// carries a different `instance`. `generation` additionally tells apart two
+/// displays of the confirmation for the very same document instance (cancel,
+/// then close again).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TabCloseConfirm {
     id: SessionId,
     instance: DocumentInstance,
+    generation: u64,
 }
 
 /// How the native Save As dialog `prompt_save_as_for_close` opens resolved,
@@ -972,6 +975,8 @@ pub struct EditorView {
     /// A tab middle-click-close request that hit unsaved changes and is
     /// waiting on the user's save-or-cancel answer.
     tab_close_confirm: Option<TabCloseConfirm>,
+    /// Counter stamped into each newly shown `TabCloseConfirm`.
+    tab_close_confirm_generation: u64,
     /// Sessions with a "save, then close" request in flight, keyed to the
     /// document instance the request was made against. An instance mismatch
     /// when a write completes means the document was replaced meanwhile —
@@ -2050,7 +2055,13 @@ impl EditorView {
                     generation: session.generation(),
                     workspace: self.work_folder_generation,
                 };
-                self.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+                self.tab_close_confirm_generation =
+                    self.tab_close_confirm_generation.wrapping_add(1);
+                self.tab_close_confirm = Some(TabCloseConfirm {
+                    id,
+                    instance,
+                    generation: self.tab_close_confirm_generation,
+                });
                 cx.notify();
             }
         }
@@ -2315,6 +2326,40 @@ impl EditorView {
         if matches!(self.sessions.close(id, "Untitled"), CloseDecision::Reject(_)) {
             return;
         }
+        self.finish_tab_close(id, was_active, cx);
+    }
+
+    /// The "close without saving" answer to the confirmation prompt: the user
+    /// explicitly chose to discard the unsaved changes. Nothing is written. Every guard
+    /// runs before any state is touched, so a stale click returns untouched.
+    fn confirm_discard_and_close_tab(
+        &mut self,
+        requested: TabCloseConfirm,
+        cx: &mut Context<Self>,
+    ) {
+        if self.tab_close_confirm != Some(requested) {
+            return;
+        }
+        let id = requested.id;
+        if self.document_instance(id) != Some(requested.instance) {
+            return;
+        }
+        let Some(session) = self.sessions.get(id) else {
+            return;
+        };
+        if session.save_in_flight() {
+            return;
+        }
+        let was_active = self.sessions.active_id() == id;
+        if !self.sessions.close_discarding_changes(id, "Untitled") {
+            return;
+        }
+        self.finish_tab_close(id, was_active, cx);
+    }
+
+    /// Shared follow-up once `SessionSet` has actually removed `id`.
+    fn finish_tab_close(&mut self, id: SessionId, was_active: bool, cx: &mut Context<Self>) {
+        self.sync_external_open_guard();
         self.tab_close_after_save.remove(&id);
         self.save_problems.remove(&id);
         if self
@@ -6167,6 +6212,22 @@ impl EditorView {
             cx,
             move |view, _, _, cx| view.confirm_save_and_close_tab(snapshot, cx),
         );
+        let save_in_flight = self
+            .sessions
+            .get(id)
+            .is_some_and(DocumentSession::save_in_flight);
+        let discard = self
+            .file_tab_context_menu_item(
+                "tab-close-confirm-discard",
+                "保存せずに閉じる",
+                !save_in_flight,
+                cx,
+                move |view, _, _, cx| view.confirm_discard_and_close_tab(snapshot, cx),
+            )
+            .flex_shrink_0()
+            .whitespace_nowrap();
+        let cancel = cancel.flex_shrink_0().whitespace_nowrap();
+        let save_and_close = save_and_close.flex_shrink_0().whitespace_nowrap();
         div()
             .id("tab-close-confirm-overlay")
             .debug_selector(|| "tab-close-confirm-overlay".to_owned())
@@ -6182,7 +6243,7 @@ impl EditorView {
                     .id("tab-close-confirm")
                     .debug_selector(|| "tab-close-confirm".to_owned())
                     .min_w(px(280.0))
-                    .max_w(px(420.0))
+                    .max_w(px(560.0))
                     .flex()
                     .flex_col()
                     .gap_2()
@@ -6196,10 +6257,14 @@ impl EditorView {
                         view.dismiss_tab_close_confirm_if(snapshot, cx);
                     }))
                     .child(div().child(format!("\"{label}\" の変更を保存しますか?")))
+                    .when(save_in_flight, |element| {
+                        element.child(div().child("保存処理中です"))
+                    })
                     .child(
                         h_flex()
                             .gap_2()
                             .child(cancel)
+                            .child(discard)
                             .child(save_and_close),
                     ),
             )
@@ -18044,6 +18109,429 @@ mod tests {
         });
 
         std::fs::remove_dir_all(&old_root).unwrap();
+    }
+
+    /// A single-tab view over a real file with one unsaved edit appended,
+    /// resized and rendered. `autosave` is set on this view's own settings
+    /// only (its stores are in-memory), before the edit, so a disabled
+    /// autosave never arms a timer for the edit.
+    fn dirty_file_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        label: &str,
+        autosave: bool,
+    ) -> (
+        PathBuf,
+        gpui::Entity<EditorView>,
+        &'a mut gpui::VisualTestContext,
+    ) {
+        let root = draft_test_root(label);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("note.md");
+        std::fs::write(&path, "before").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_loaded(loaded),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.settings.autosave = autosave;
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut().set_selection(Selection::caret(end)).unwrap();
+            view.editor_mut().insert_text(" after").unwrap();
+            view.after_input(cx);
+        });
+        cx.run_until_parked();
+        (root, view, cx)
+    }
+
+    fn middle_click_selector(cx: &mut gpui::VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).expect("element rendered");
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.simulate_mouse_up(bounds.center(), MouseButton::Middle, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    /// Two dirty path-less-on-disk sessions (ids 0 and 1), session 0 active.
+    fn two_dirty_sessions_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut sessions = SessionSet::with_loaded(LoadedFile {
+                document: RopeBuffer::from_text("active\n"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("active.md")),
+                stamp: None,
+                fingerprint: None,
+            });
+            sessions.active_mut().editor_mut().insert_text("one").unwrap();
+            sessions.active_mut().note_edit();
+            sessions.apply_open(
+                None,
+                LoadedFile {
+                    document: RopeBuffer::from_text("other\n"),
+                    identity: hane_session::FileIdentity::lexical(PathBuf::from("other.md")),
+                    stamp: None,
+                    fingerprint: None,
+                },
+            );
+            sessions.active_mut().editor_mut().insert_text("two").unwrap();
+            sessions.active_mut().note_edit();
+            assert!(sessions.activate(SessionId(0)));
+            EditorView::from_sessions(sessions, Arc::new(OsFileService), StateStores::memory(), cx)
+        });
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    #[gpui::test]
+    fn tab_close_confirm_renders_three_choices_in_order(cx: &mut gpui::TestAppContext) {
+        let (root, view, cx) = dirty_file_view(cx, "discard-three-choices", false);
+        middle_click_selector(cx, "file-tab-first");
+        view.read_with(cx, |view, _| assert!(view.tab_close_confirm.is_some()));
+
+        let dialog = cx.debug_bounds("tab-close-confirm").expect("dialog rendered");
+        let cancel = cx
+            .debug_bounds("tab-close-confirm-cancel")
+            .expect("cancel rendered");
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard rendered");
+        let save = cx
+            .debug_bounds("tab-close-confirm-save")
+            .expect("save rendered");
+
+        assert!(cancel.right() <= discard.left(), "cancel must sit left of discard");
+        assert!(discard.right() <= save.left(), "discard must sit left of save");
+        for button in [cancel, discard, save] {
+            assert!(button.size.width > px(0.0));
+            assert!(button.left() >= dialog.left());
+            assert!(button.right() <= dialog.right());
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn middle_click_dirty_tab_discard_and_close_keeps_file_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, view, cx) = dirty_file_view(cx, "discard-keeps-file", false);
+        let path = root.join("note.md");
+        let original_id = view.read_with(cx, |view, _| view.sessions.active_id());
+
+        middle_click_selector(cx, "file-tab-first");
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard rendered");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert!(view.sessions.get(original_id).is_none());
+            assert_eq!(view.sessions.len(), 1);
+            assert!(view.sessions.active().path().is_none());
+            assert!(!view.sessions.active().is_dirty());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_and_close_an_untitled_tab_does_not_prompt_save_as(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("discard-untitled");
+        std::fs::create_dir_all(&root).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(640.0), px(240.0)));
+        cx.run_until_parked();
+        let original_id = view.update(cx, |view, cx| {
+            view.settings.autosave = false;
+            view.editor_mut().insert_text("scratch").unwrap();
+            view.after_input(cx);
+            view.sessions.active_id()
+        });
+        cx.run_until_parked();
+
+        middle_click_selector(cx, "file-tab-first");
+        view.read_with(cx, |view, _| assert!(view.tab_close_confirm.is_some()));
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard rendered");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert_eq!(view.save_as_dialogs_open, 0, "no Save As dialog may open");
+            assert_ne!(view.sessions.active_id(), original_id);
+            assert!(!view.sessions.active().is_dirty());
+            assert!(view.sessions.active().path().is_none());
+        });
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_and_close_an_inactive_tab_keeps_the_active_document(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = two_dirty_sessions_view(cx);
+        let (selection, active_text) = view.read_with(cx, |view, _| {
+            (
+                view.editor().selection(),
+                view.editor().document().full_text(),
+            )
+        });
+
+        middle_click_selector(cx, "file-tab-last");
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.tab_close_confirm.as_ref().map(|confirm| confirm.id),
+                Some(SessionId(1))
+            );
+        });
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard rendered");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_none());
+            assert_eq!(view.sessions.len(), 1);
+            assert!(view.sessions.get(SessionId(1)).is_none());
+            assert_eq!(view.sessions.active_id(), SessionId(0));
+            assert_eq!(view.editor().selection(), selection);
+            assert_eq!(view.editor().document().full_text(), active_text);
+            assert!(view.sessions.active().is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    fn discard_and_close_clears_pending_save_close_for_its_target_only(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = two_dirty_sessions_view(cx);
+        view.update(cx, |view, cx| {
+            let first = view.document_instance(SessionId(0)).unwrap();
+            let second = view.document_instance(SessionId(1)).unwrap();
+            view.tab_close_after_save.insert(SessionId(0), first);
+            view.tab_close_after_save.insert(SessionId(1), second);
+            view.request_tab_close(SessionId(1), cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_discard_and_close_tab(confirm, cx);
+
+            assert!(view.tab_close_confirm.is_none());
+            assert!(view.sessions.get(SessionId(1)).is_none());
+            assert!(!view.tab_close_after_save.contains_key(&SessionId(1)));
+            assert_eq!(view.tab_close_after_save.get(&SessionId(0)), Some(&first));
+        });
+    }
+
+    #[gpui::test]
+    fn discard_and_close_is_disabled_while_a_save_is_in_flight(cx: &mut gpui::TestAppContext) {
+        let (root, view, cx) = dirty_file_view(cx, "discard-save-in-flight", false);
+        let id = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.request_tab_close(id, cx);
+            // Marks the save as in flight without a job that could complete.
+            let _ = view.sessions.active_mut().request_save(SaveIntent::Current);
+            assert!(view.sessions.active().save_in_flight());
+            cx.notify();
+            id
+        });
+        cx.run_until_parked();
+
+        let discard = cx
+            .debug_bounds("tab-close-confirm-discard")
+            .expect("discard stays rendered while disabled");
+        cx.simulate_click(discard.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.tab_close_confirm.is_some(), "the click must be inert");
+            assert!(view.sessions.get(id).is_some());
+        });
+
+        view.update(cx, |view, cx| {
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_discard_and_close_tab(confirm, cx);
+            assert_eq!(view.tab_close_confirm, Some(confirm));
+            assert!(view.sessions.get(id).is_some());
+            assert!(view.sessions.get(id).unwrap().is_dirty());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn discard_and_close_invalidates_pending_autosave_and_title_sync(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        // Autosave is on, so the edit in the fixture armed its debounce timer.
+        let (root, view, cx) = dirty_file_view(cx, "discard-pending-timers", true);
+        let path = root.join("note.md");
+
+        view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.confirm_discard_and_close_tab(confirm, cx);
+            assert!(view.sessions.get(id).is_none());
+            assert!(!view.title_sync_scheduled.contains_key(&id));
+        });
+        settle_debounce(cx);
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.active().path().is_none());
+            assert!(!view.sessions.active().is_dirty());
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_and_close_tab_ignores_a_stale_document_instance(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, view, cx) = dirty_file_view(cx, "discard-stale-instance", false);
+        let (id, confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.request_tab_close(id, cx);
+            let confirm = view.tab_close_confirm.expect("confirm armed");
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+                fingerprint: None,
+            });
+            (id, confirm)
+        });
+
+        view.update(cx, |view, cx| view.confirm_discard_and_close_tab(confirm, cx));
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.sessions.get(id).and_then(DocumentSession::path),
+                Some(PathBuf::from("replaced.md")).as_deref(),
+                "the replacement document must not be closed by a stale click"
+            );
+            assert_eq!(view.sessions.len(), 1);
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_and_close_tab_ignores_a_stale_snapshot_after_id_reuse(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, view, cx) = dirty_file_view(cx, "discard-stale-id-reuse", false);
+        let (id, stale_confirm, fresh_confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.request_tab_close(id, cx);
+            let stale_confirm = view.tab_close_confirm.expect("confirm armed");
+            view.tab_close_confirm = None;
+            view.sessions.active_mut().adopt(LoadedFile {
+                document: RopeBuffer::from_text("replaced"),
+                identity: hane_session::FileIdentity::lexical(PathBuf::from("replaced.md")),
+                stamp: None,
+                fingerprint: None,
+            });
+            view.editor_mut().insert_text("draft").unwrap();
+            view.after_input(cx);
+            view.request_tab_close(id, cx);
+            let fresh_confirm = view.tab_close_confirm.expect("confirm armed");
+            let instance = view.document_instance(id).unwrap();
+            view.tab_close_after_save.insert(id, instance);
+            (id, stale_confirm, fresh_confirm)
+        });
+        assert_ne!(stale_confirm.instance, fresh_confirm.instance);
+
+        view.update(cx, |view, cx| {
+            view.confirm_discard_and_close_tab(stale_confirm, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some_and(DocumentSession::is_dirty));
+            assert_eq!(view.tab_close_confirm, Some(fresh_confirm));
+            assert!(view.tab_close_after_save.contains_key(&id));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn confirm_discard_and_close_tab_ignores_a_stale_snapshot_after_reprompting_the_same_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, view, cx) = dirty_file_view(cx, "discard-stale-reprompt", false);
+        let (id, stale_confirm, fresh_confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.request_tab_close(id, cx);
+            let stale_confirm = view.tab_close_confirm.expect("confirm armed");
+            assert!(view.dismiss_tab_close_confirm(cx));
+            view.request_tab_close(id, cx);
+            let fresh_confirm = view.tab_close_confirm.expect("confirm armed");
+            (id, stale_confirm, fresh_confirm)
+        });
+        assert_eq!(stale_confirm.instance, fresh_confirm.instance);
+        assert_ne!(stale_confirm.generation, fresh_confirm.generation);
+
+        view.update(cx, |view, cx| {
+            view.confirm_discard_and_close_tab(stale_confirm, cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.sessions.get(id).is_some_and(DocumentSession::is_dirty));
+            assert_eq!(view.tab_close_confirm, Some(fresh_confirm));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui::test]
+    fn tab_close_confirm_buttons_ignore_stale_snapshots_after_reprompting_the_same_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (root, view, cx) = dirty_file_view(cx, "confirm-buttons-stale-reprompt", false);
+        let (id, stale_confirm, fresh_confirm) = view.update(cx, |view, cx| {
+            let id = view.sessions.active_id();
+            view.request_tab_close(id, cx);
+            let stale_confirm = view.tab_close_confirm.expect("confirm armed");
+            assert!(view.dismiss_tab_close_confirm(cx));
+            view.request_tab_close(id, cx);
+            let fresh_confirm = view.tab_close_confirm.expect("confirm armed");
+            (id, stale_confirm, fresh_confirm)
+        });
+        assert_eq!(stale_confirm.instance, fresh_confirm.instance);
+        assert_ne!(stale_confirm.generation, fresh_confirm.generation);
+
+        view.update(cx, |view, cx| {
+            // Save, Cancel and the backdrop all route through these two.
+            view.confirm_save_and_close_tab(stale_confirm, cx);
+            assert!(!view.dismiss_tab_close_confirm_if(stale_confirm, cx));
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.sessions.active().save_in_flight());
+            assert!(!view.tab_close_after_save.contains_key(&id));
+            assert!(view.sessions.get(id).is_some_and(DocumentSession::is_dirty));
+            assert_eq!(view.tab_close_confirm, Some(fresh_confirm));
+        });
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     // PR #416 review follow-up: the native Save As dialog

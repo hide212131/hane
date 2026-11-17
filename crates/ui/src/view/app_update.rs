@@ -2517,7 +2517,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let id = view.sessions.active_id();
             let instance = view.document_instance(id).unwrap();
-            view.tab_close_confirm = Some(crate::view::TabCloseConfirm { id, instance });
+            view.tab_close_confirm = Some(crate::view::TabCloseConfirm {
+                id,
+                instance,
+                generation: 1,
+            });
             view.attach_app_update(Some(attached));
             cx.notify();
         });
