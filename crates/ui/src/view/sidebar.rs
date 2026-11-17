@@ -3280,6 +3280,9 @@ mod tests {
             let (_view, cx) = cx.add_window_view(|_, _| TrailingFixture { can_toggle_pin });
             cx.simulate_resize(gpui::size(px(300.0), px(100.0)));
             cx.run_until_parked();
+            // The initial mouse position is inside the row, so move it below the row
+            // (still inside the 300x100 window) before checking the resting state.
+            move_mouse(cx, gpui::point(px(150.0), px(90.0)));
             assert!(date_painted(cx, 0), "the date shows at rest");
 
             move_mouse(cx, gpui::point(px(150.0), px(SIDEBAR_ROW_HEIGHT / 2.0)));
