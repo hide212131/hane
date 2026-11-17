@@ -171,6 +171,9 @@ impl EditorView {
                     // heights are dropped; the next job starts from the basis
                     // that is applied now, so the difference stays valid.
                     view.last_background_height_disclosure = None;
+                    if index_was_updated {
+                        view.resync_heights_for_current_disclosure();
+                    }
                     view.schedule_document_parse(cx);
                     view.ensure_active_disclosure_height();
                     cx.notify();

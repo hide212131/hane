@@ -759,6 +759,30 @@ mod tests {
         });
     }
 
+    /// Switching to plain-text mode drops a Rich conversion started under the
+    /// Markdown display: nothing is inserted and the Undo history is unchanged.
+    #[gpui::test]
+    fn switching_to_plain_text_mode_drops_a_running_conversion(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "ab\n");
+        select(&view, cx, forward(0, 2));
+        set_clipboard(cx, "");
+        set_test_snapshot(Some("<b>x</b>"), false, None);
+        let can_undo = view.read_with(cx, |view, _| view.editor().can_undo());
+        paste(&view, cx, PasteMode::Rich);
+        view.read_with(cx, |view, _| assert!(view.clipboard_job.is_some()));
+        view.update(cx, |view, cx| assert!(view.set_plain_text(true, cx)));
+        view.read_with(cx, |view, _| {
+            assert!(view.clipboard_job.is_none());
+            assert_eq!(view.status, None);
+        });
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), "ab\n");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), forward(0, 2));
+            assert_eq!(view.editor().can_undo(), can_undo);
+        });
+    }
+
     /// Copy and Cut invalidate a running conversion too.
     #[gpui::test]
     fn copy_invalidates_a_running_conversion(cx: &mut gpui::TestAppContext) {

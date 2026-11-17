@@ -75,6 +75,9 @@ impl EditorView {
         }
         // A drag or autoscroll belongs to the geometry of the old display.
         self.cancel_text_selection_autoscroll();
+        // A Paste started under the old display may not finish under the new
+        // one: plain-text mode never converts clipboard HTML.
+        self.invalidate_clipboard_job();
         self.settings.plain_text_mode = plain;
         self.rebuild_presentation_for_mode_change();
         // A failed write keeps the switch for this run, like the theme.

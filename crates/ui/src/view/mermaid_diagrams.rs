@@ -291,6 +291,9 @@ impl EditorView {
     /// The short reason a block's source is shown instead of a picture, placed
     /// at the top right of the block.
     pub(super) fn mermaid_note_element(&self, visual: &VisualBlock) -> Option<Div> {
+        if self.plain_text() {
+            return None;
+        }
         let note = self
             .mermaid
             .note(visual.id, visual.source_range, self.mermaid_dark())?;
@@ -607,6 +610,24 @@ mod tests {
             assert_eq!(jobs_started(&view, cx), 0, "{source:?}");
             assert_eq!(text(&view, cx), source);
         }
+    }
+
+    #[gpui::test]
+    fn plain_text_mode_hides_a_stored_failure_note(cx: &mut gpui::TestAppContext) {
+        let source = "```mermaid\npie title x\n  \"a\": 1\n```\n";
+        let (view, cx) = open(cx, source);
+        let block = fence_block(&view, cx, source);
+        let visual = presented(&view, cx, block.id).expect("presented");
+        view.read_with(cx, |view, _| {
+            assert!(view.mermaid_note_element(&visual).is_some());
+        });
+        view.update(cx, |view, cx| assert!(view.set_plain_text(true, cx)));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.plain_text());
+            assert!(view.mermaid_note_element(&visual).is_none());
+        });
+        assert_eq!(text(&view, cx), source);
     }
 
     #[gpui::test]

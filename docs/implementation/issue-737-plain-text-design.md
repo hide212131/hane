@@ -677,7 +677,7 @@ Editor、DocumentSession、保存、autosave、ドラフト、履歴には一切
 | テスト名 | 手順 | 期待 |
 | --- | --- | --- |
 | `plain_toggle_preserves_document_snapshot` | 編集して dirty にし、ON → OFF → ON | 毎回 `snapshot` 不変、本文文字列不変 |
-| `plain_toggle_preserves_caret_and_selection_offsets` | `**bo|ld**` の中、表セル内、フェンス行、複数ブロック選択 | 選択のアンカー・ヘッドのオフセット不変 |
+| `plain_toggle_preserves_caret_and_selection_offsets` | `**bo\|ld**` の中、表セル内、フェンス行、複数ブロック選択 | 選択のアンカー・ヘッドのオフセット不変 |
 | `plain_toggle_keeps_caret_row_on_screen` | 長文の中ほどにスクロールして切替 | `assert_caret_row_on_screen` |
 | `plain_toggle_round_trip_restores_scroll` | ON → OFF | キャレット行の画面内位置が許容差内で元に戻る |
 | `plain_toggle_does_not_enter_undo_history` | 入力 → 切替 → Undo | 入力が取り消される。`can_undo` の遷移が切替なしと同じ |
@@ -708,11 +708,11 @@ Editor、DocumentSession、保存、autosave、ドラフト、履歴には一切
 
 | テスト名 | 手順 | 期待 |
 | --- | --- | --- |
-| `plain_enter_in_list_inserts_bare_newline` | `- a|` で Enter | `- a\n`。マーカーなし |
-| `plain_enter_on_empty_list_item_keeps_marker` | `- |` で Enter | `- \n` |
+| `plain_enter_in_list_inserts_bare_newline` | `- a\|` で Enter | `- a\n`。マーカーなし |
+| `plain_enter_on_empty_list_item_keeps_marker` | `- \|` で Enter | `- \n` |
 | `plain_shift_enter_inserts_bare_newline` | 同上 | `\n` のみ |
-| `plain_backspace_after_marker_deletes_one_grapheme` | `- |a` で Backspace | `-a` |
-| `plain_tab_in_list_does_not_indent_item` | `- a|` で Tab（フェーズ 1〜2） | 本文不変 |
+| `plain_backspace_after_marker_deletes_one_grapheme` | `- \|a` で Backspace | `-a` |
+| `plain_tab_in_list_does_not_indent_item` | `- a\|` で Tab（フェーズ 1〜2） | 本文不変 |
 | `plain_enter_is_ignored_while_composing` | 合成中 Enter | 本文に改行なし |
 | `plain_paste_html_inserts_plain_text` | HTML + テキストのクリップボード | テキストがそのまま入る |
 | `plain_paste_url_over_selection_replaces_text` | 選択 + URL | リンク化されない |
