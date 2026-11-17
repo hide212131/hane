@@ -18159,9 +18159,9 @@ mod tests {
     }
 
     /// Two dirty path-less-on-disk sessions (ids 0 and 1), session 0 active.
-    fn two_dirty_sessions_view<'a>(
-        cx: &'a mut gpui::TestAppContext,
-    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+    fn two_dirty_sessions_view(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<EditorView>, &mut gpui::VisualTestContext) {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut sessions = SessionSet::with_loaded(LoadedFile {
                 document: RopeBuffer::from_text("active\n"),
