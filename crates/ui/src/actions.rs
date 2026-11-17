@@ -454,7 +454,11 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter | InputTarget::InlineRename => {}
             InputTarget::Body => {
-                view.apply_list_edit_intent(ListEditIntent::Indent, cx);
+                if !view.apply_list_edit_intent(ListEditIntent::Indent, cx) {
+                    // Only acts in plain-text mode; elsewhere Tab outside a
+                    // list stays a no-op.
+                    view.plain_indent(cx);
+                }
             }
         }
     },
@@ -472,7 +476,9 @@ command_actions! {
         match view.input_target() {
             InputTarget::SidebarFilter | InputTarget::InlineRename => {}
             InputTarget::Body => {
-                view.apply_list_edit_intent(ListEditIntent::Outdent, cx);
+                if !view.apply_list_edit_intent(ListEditIntent::Outdent, cx) {
+                    view.plain_outdent(cx);
+                }
             }
         }
     },

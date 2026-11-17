@@ -197,9 +197,15 @@ impl EditorView {
             document: self.document_key(),
             content_generation,
             name: self.sessions.active().file().short_label(),
-            description: match self.editor_mode() {
-                EditorMode::Editing => "編集モード。表示範囲内のリンクのみ公開しています",
-                EditorMode::Reading => "閲覧モード。表示範囲内のリンクのみ公開しています",
+            description: match (self.plain_text(), self.editor_mode()) {
+                (true, EditorMode::Editing) => "プレーンテキスト編集モード",
+                (true, EditorMode::Reading) => "プレーンテキスト表示（読み取り専用）",
+                (false, EditorMode::Editing) => {
+                    "編集モード。表示範囲内のリンクのみ公開しています"
+                }
+                (false, EditorMode::Reading) => {
+                    "閲覧モード。表示範囲内のリンクのみ公開しています"
+                }
             },
             links,
         }

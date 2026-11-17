@@ -96,6 +96,10 @@ impl EditorView {
     /// the picture is made when the edit position leaves it, and the source
     /// stays on screen until it is ready.
     pub(super) fn schedule_mermaid(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
+        // Plain-text mode shows the fence as source, so no diagram is rendered.
+        if self.plain_text() {
+            return;
+        }
         let dark = self.mermaid_dark();
         // Blocks whose own entry already matches, and blocks that still need one.
         let mut claimed = HashSet::new();
@@ -250,7 +254,7 @@ impl EditorView {
     /// exact current text and palette, or an edit position, selection,
     /// composition or find match on the construct.
     pub(super) fn diagram_plan_for(&self, block: &IndexedBlock) -> Option<DiagramPlan> {
-        if block.confidence != Confidence::Formal {
+        if self.plain_text() || block.confidence != Confidence::Formal {
             return None;
         }
         let known = self
@@ -287,6 +291,9 @@ impl EditorView {
     /// The short reason a block's source is shown instead of a picture, placed
     /// at the top right of the block.
     pub(super) fn mermaid_note_element(&self, visual: &VisualBlock) -> Option<Div> {
+        if self.plain_text() {
+            return None;
+        }
         let note = self
             .mermaid
             .note(visual.id, visual.source_range, self.mermaid_dark())?;
@@ -360,6 +367,27 @@ mod tests {
         cx.update(crate::actions::register_key_bindings);
         let source = source.to_owned();
         let (view, cx) = cx.add_window_view(move |_, cx| EditorView::new(&source, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        settle(cx);
+        (view, cx)
+    }
+
+    /// `open` over an in-memory state store, for tests that toggle settings
+    /// and must not write the shared `settings.conf`.
+    fn open_isolated<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        source: &str,
+    ) -> (TestView, &'a mut TestCx) {
+        cx.update(crate::actions::register_key_bindings);
+        let source = source.to_owned();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled(&source, "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
         cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
         settle(cx);
         (view, cx)
@@ -603,6 +631,24 @@ mod tests {
             assert_eq!(jobs_started(&view, cx), 0, "{source:?}");
             assert_eq!(text(&view, cx), source);
         }
+    }
+
+    #[gpui::test]
+    fn plain_text_mode_hides_a_stored_failure_note(cx: &mut gpui::TestAppContext) {
+        let source = "```mermaid\npie title x\n  \"a\": 1\n```\n";
+        let (view, cx) = open_isolated(cx, source);
+        let block = fence_block(&view, cx, source);
+        let visual = presented(&view, cx, block.id).expect("presented");
+        view.read_with(cx, |view, _| {
+            assert!(view.mermaid_note_element(&visual).is_some());
+        });
+        view.update(cx, |view, cx| assert!(view.set_plain_text(true, cx)));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.plain_text());
+            assert!(view.mermaid_note_element(&visual).is_none());
+        });
+        assert_eq!(text(&view, cx), source);
     }
 
     #[gpui::test]

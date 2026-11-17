@@ -93,6 +93,13 @@ impl EditorView {
         if !self.body_paste_ready() {
             return;
         }
+        // Plain-text mode pastes the text as it is: no image file, no
+        // HTML-to-Markdown conversion and no link wrapping.
+        let mode = if self.plain_text() {
+            PasteMode::PlainText
+        } else {
+            mode
+        };
         self.invalidate_clipboard_job();
         if self.editor().ime().is_some() {
             self.status = Some(COMPOSING_MESSAGE.to_owned());
@@ -252,6 +259,33 @@ mod tests {
     ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
         let text = text.to_owned();
         let (view, cx) = cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            let handle = view.read(app).focus_handle.clone();
+            window.focus(&handle, app);
+        });
+        cx.run_until_parked();
+        set_test_snapshot(None, false, None);
+        (view, cx)
+    }
+
+    /// `open_view` over an in-memory state store, for tests that toggle
+    /// settings and must not write the shared `settings.conf`.
+    fn open_view_isolated<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        text: &str,
+    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+        let text = text.to_owned();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled(&text, "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
         cx.update(|window, _| window.activate_window());
         cx.run_until_parked();
@@ -749,6 +783,30 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.editor().selection(), forward(0, 2));
             assert_eq!(view.status, None);
+        });
+    }
+
+    /// Switching to plain-text mode drops a Rich conversion started under the
+    /// Markdown display: nothing is inserted and the Undo history is unchanged.
+    #[gpui::test]
+    fn switching_to_plain_text_mode_drops_a_running_conversion(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view_isolated(cx, "ab\n");
+        select(&view, cx, forward(0, 2));
+        set_clipboard(cx, "");
+        set_test_snapshot(Some("<b>x</b>"), false, None);
+        let can_undo = view.read_with(cx, |view, _| view.editor().can_undo());
+        paste(&view, cx, PasteMode::Rich);
+        view.read_with(cx, |view, _| assert!(view.clipboard_job.is_some()));
+        view.update(cx, |view, cx| assert!(view.set_plain_text(true, cx)));
+        view.read_with(cx, |view, _| {
+            assert!(view.clipboard_job.is_none());
+            assert_eq!(view.status, None);
+        });
+        cx.run_until_parked();
+        assert_eq!(text_of(&view, cx), "ab\n");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().selection(), forward(0, 2));
+            assert_eq!(view.editor().can_undo(), can_undo);
         });
     }
 

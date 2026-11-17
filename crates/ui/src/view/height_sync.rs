@@ -13,6 +13,9 @@ impl EditorView {
                 let index = self
                     .current_index()
                     .expect("block granularity has an index");
+                if self.plain_text() {
+                    return plain_block_heights(document, index, line_height);
+                }
                 let disclosure = self.active_height_disclosure();
                 block_heights_with_disclosure(document, index, line_height, disclosure)
             }
@@ -437,6 +440,10 @@ impl EditorView {
     }
 
     pub(super) fn active_height_disclosure(&self) -> Option<SourceRange> {
+        // Plain-text mode has no structural row to keep expanded.
+        if self.plain_text() {
+            return None;
+        }
         if !self.body_editable() {
             // Reading opens no Markdown markers, so no structural row stays
             // expanded: `None` makes every fence and table delimiter row count
@@ -561,9 +568,13 @@ impl EditorView {
         };
         let line_height = self.line_height();
         let disclosure = self.active_height_disclosure();
+        let plain = self.plain_text();
         let initial_heights = inserted
             .iter()
             .map(|block| {
+                if plain {
+                    return plain_block_height(self.editor().document(), index, block, line_height);
+                }
                 block_height_with_disclosure(
                     self.editor().document(),
                     index,

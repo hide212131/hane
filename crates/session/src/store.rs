@@ -74,6 +74,10 @@ pub struct Settings {
     /// `false`, or a settings file that cannot be read, stops the automatic
     /// checks instead of guessing (Issue #723).
     pub auto_update_check: bool,
+    /// Whether the editor shows the Markdown source as-is, without any
+    /// projection (`plain_text_mode` key, Issue #737). A missing or invalid
+    /// value means `false`.
+    pub plain_text_mode: bool,
 }
 
 impl Default for Settings {
@@ -85,6 +89,7 @@ impl Default for Settings {
             sidebar_sort: WorkFolderSortOrder::default(),
             network: NetworkConfig::default(),
             auto_update_check: true,
+            plain_text_mode: false,
         }
     }
 }
@@ -470,11 +475,12 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
-            settings.auto_update_check
+            settings.auto_update_check,
+            settings.plain_text_mode
         );
         if let Some(folder) = &settings.default_folder {
             contents.push_str("default_folder=");
@@ -519,6 +525,8 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.sidebar_sort = WorkFolderSortOrder::parse(value);
                 } else if let Some(value) = line.strip_prefix("auto_update_check=") {
                     settings.auto_update_check = value == "true";
+                } else if let Some(value) = line.strip_prefix("plain_text_mode=") {
+                    settings.plain_text_mode = value == "true";
                 }
             }
             settings.network = parse_network_config(network);
@@ -875,6 +883,7 @@ mod tests {
             sidebar_sort: WorkFolderSortOrder::UpdatedOldest,
             network: NetworkConfig::default(),
             auto_update_check: false,
+            plain_text_mode: true,
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -1082,6 +1091,7 @@ mod tests {
                     sidebar_sort: WorkFolderSortOrder::NameAscending,
                     network: NetworkConfig::default(),
                     auto_update_check: true,
+                    plain_text_mode: false,
                 })
                 .unwrap();
         }
@@ -1115,6 +1125,43 @@ mod tests {
                 enabled
             );
             fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn plain_text_mode_survives_a_store_reload() {
+        let root = temporary_directory("state-plain-text-round-trip");
+        let store = FileStateStore::at(&root);
+        let settings = Settings {
+            autosave: false,
+            theme: ThemePreference::Dark,
+            sidebar_sort: WorkFolderSortOrder::UpdatedOldest,
+            plain_text_mode: true,
+            ..Settings::default()
+        };
+        SettingsRepository::store(&store, &settings).unwrap();
+        let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+        assert!(text.contains("plain_text_mode=true\n"));
+        let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+        assert!(loaded.plain_text_mode);
+        assert_eq!(loaded, settings);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plain_text_mode_defaults_to_false_when_missing() {
+        let loaded = load_after_writing("autosave=false\ntheme=dark\n");
+        assert!(!loaded.plain_text_mode);
+        let root = temporary_directory("state-plain-text-missing");
+        let store = FileStateStore::at(&root);
+        assert!(!SettingsRepository::load(&store).plain_text_mode);
+    }
+
+    #[test]
+    fn plain_text_mode_ignores_invalid_value() {
+        for value in ["yes", "", "TRUE", "1"] {
+            let loaded = load_after_writing(&format!("plain_text_mode={value}\n"));
+            assert!(!loaded.plain_text_mode, "value {value:?}");
         }
     }
 

@@ -68,7 +68,8 @@ pub use layout::{
 pub use projection::{
     BlockLine, BlockWindow, JoinedParse, block_height_with_disclosure, block_heights,
     block_heights_with_disclosure, block_line_span, expected_disclosures, parse_joined_block,
-    parse_joined_span, present_block, present_block_with_list_projection,
+    parse_joined_span, plain_block_height, plain_block_heights, present_block,
+    present_block_plain, present_block_with_list_projection,
     present_block_with_table_projection, present_markdown, present_markdown_with_disclosure,
     present_polished_line, table_delimiter_is_collapsed, trailing_blank_lines,
 };

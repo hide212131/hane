@@ -99,6 +99,11 @@ impl EditorView {
     /// The presentation policy for the current mode, handed to every
     /// presentation, cache check and movement calculation.
     pub(super) fn disclosure_policy(&self) -> DisclosurePolicy {
+        // Plain-text mode (Issue #737) is its own axis: it projects nothing
+        // whether the body is editable or read-only.
+        if self.plain_text() {
+            return DisclosurePolicy::Plain;
+        }
         match self.editor_mode {
             EditorMode::Editing => DisclosurePolicy::Editing,
             EditorMode::Reading => DisclosurePolicy::Reading,
@@ -151,7 +156,7 @@ impl EditorView {
     /// the height tree for the new one, without touching the document, its
     /// history, the selection or the tabs. The scroll position is carried by
     /// `install_heights` on the source offset at the top of the viewport.
-    fn rebuild_presentation_for_mode_change(&mut self) {
+    pub(super) fn rebuild_presentation_for_mode_change(&mut self) {
         // The measured heights below are about to be replaced by estimates, and
         // a long wrapped line would be clamped to its estimated one-row height.
         // Remember the position as the source row at the top of the viewport,

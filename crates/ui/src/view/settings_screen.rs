@@ -609,6 +609,15 @@ impl EditorView {
             .on_click(move |checked, _window, app| {
                 autosave_view.update(app, |view, cx| view.set_autosave(*checked, cx));
             });
+        let plain_text_view = cx.entity();
+        let plain_text = Checkbox::new("settings-plain-text-mode")
+            .checked(self.plain_text())
+            .label("プレーンテキストで表示・編集する（Markdownの記号を隠さない）")
+            .on_click(move |checked, _window, app| {
+                plain_text_view.update(app, |view, cx| {
+                    view.set_plain_text(*checked, cx);
+                });
+            });
         let store_error = self.settings_store_error.as_ref().map(|error| {
             div()
                 .id("settings-store-error")
@@ -664,7 +673,8 @@ impl EditorView {
                                     .gap_2()
                                     .children(theme_buttons),
                             ),
-                    ),
+                    )
+                    .child(card("settings-plain-text-card").child(plain_text)),
             )
             .child(
                 div()

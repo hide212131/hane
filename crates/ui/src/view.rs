@@ -70,7 +70,7 @@ use hane_presentation::{
     BlockKind, BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
     VisualBlock, VisualLine, block_height_with_disclosure, block_heights_with_disclosure,
     block_is_joinable, block_line_span, code_line_height, layout_block, parse_joined_span,
-    table_delimiter_is_collapsed, trailing_blank_lines,
+    plain_block_height, plain_block_heights, table_delimiter_is_collapsed, trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, CloseDecision, DocumentSession, DraftId, DraftStore, FileEvent,
@@ -134,6 +134,7 @@ mod mermaid_diagrams;
 use mermaid_diagrams::diagram_plan_matches;
 mod network_settings;
 pub use network_settings::NetworkSettingsApplier;
+mod plain_text_mode;
 mod reading_mode;
 use reading_mode::{EditorMode, ModeAnchor, command_changes_text};
 mod render;
@@ -3606,6 +3607,11 @@ impl EditorView {
             // run either.
             return true;
         }
+        if self.plain_text() {
+            // Plain-text mode edits the characters as they are: no marker
+            // continuation, renumbering, item removal or list indentation.
+            return false;
+        }
         if self.editor().ime().is_some() {
             return false;
         }
@@ -4250,6 +4256,10 @@ impl EditorView {
     /// under the reading policy, which discloses nothing, so no source text is
     /// inspected here.
     fn collapses_when_inactive(&self, offset: SourceOffset, line_id: u64) -> bool {
+        // Plain-text mode shows every source row, fence delimiters included.
+        if self.plain_text() {
+            return false;
+        }
         let Some(indexed) = self.block_at_offset(offset) else {
             return false;
         };
@@ -4516,12 +4526,19 @@ impl EditorView {
         }
         let window = window_start..window_end;
         let diagram = self.diagram_plan_for(&indexed);
+        let plain = self.plain_text();
         let drawn = self
             .block_cache
             .get(&indexed.id)
-            .filter(|block| block.matches(&indexed) && block.covers(&window))
-            .filter(|block| self.disclosures_are_current(&indexed, block))
-            .filter(|block| diagram_plan_matches(block, diagram.as_ref()));
+            .filter(|block| {
+                if plain {
+                    block.matches_plain(&indexed) && block.covers(&window)
+                } else {
+                    block.matches(&indexed) && block.covers(&window)
+                }
+            })
+            .filter(|block| plain || self.disclosures_are_current(&indexed, block))
+            .filter(|block| plain || diagram_plan_matches(block, diagram.as_ref()));
         if let Some(block) = drawn
             && let Some(entry) = self.layout_cache.get(&indexed.id).filter(|entry| {
                 entry.is_valid(
@@ -4937,6 +4954,10 @@ impl EditorView {
     /// and an inactive table delimiter is omitted from the same visual prefix;
     /// the render path never enumerates off-screen structural rows.
     fn visible_line_prefix(&self, block: &IndexedBlock, physical_line: usize) -> usize {
+        // Plain-text mode collapses no row, so every physical line counts.
+        if self.plain_text() {
+            return physical_line;
+        }
         let Some(index) = self.current_index() else {
             return physical_line;
         };
@@ -5234,11 +5255,18 @@ impl EditorView {
             } else {
                 false
             };
+            // A plain-text block is always `Unsupported` and has no disclosure
+            // or diagram to agree with, so only its identity and coverage count.
+            let plain_reusable = self.plain_text() && cached.matches_plain(block);
             if reusable
-                && cached.matches(block)
-                && cached.covers(visible)
-                && self.disclosures_are_current(block, &cached)
-                && diagram_plan_matches(&cached, diagram.as_ref())
+                && if plain_reusable {
+                    cached.covers(visible)
+                } else {
+                    cached.matches(block)
+                        && cached.covers(visible)
+                        && self.disclosures_are_current(block, &cached)
+                        && diagram_plan_matches(&cached, diagram.as_ref())
+                }
             {
                 self.block_cache.insert(block.id, cached.clone());
                 return Some((cached, true));
@@ -5389,12 +5417,14 @@ fn neighbor_block_window_from(
                 .ime()
                 .map(|ime| ime.current_range)
                 .or_else(|| Some(editor.selection().range())),
-            DisclosurePolicy::Reading => None,
+            DisclosurePolicy::Reading | DisclosurePolicy::Plain => None,
         };
         // Preserve tiled trailing blank lines as navigable rows. Only fall
         // back to the table's last formal row when the physical last line is
         // itself a collapsed delimiter (the header-only table edge case).
-        let hidden_delimiter_is_last_line = index
+        // Plain-text mode collapses nothing, so every physical line is a row.
+        let hidden_delimiter_is_last_line = policy != DisclosurePolicy::Plain
+            && index
             .and_then(|index| index.table_projection(&indexed))
             .and_then(|projection| {
                 let delimiter_line = projection
@@ -6336,6 +6366,7 @@ impl EditorView {
             // Outside the scrolling strip, so it keeps its size with many tabs
             // or a narrow window and its press never reaches the strip's
             // body-click handler.
+            .child(self.plain_text_button(cx))
             .child(self.reading_mode_button(cx))
     }
 

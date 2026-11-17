@@ -105,6 +105,88 @@ pub fn block_height_with_disclosure(
         + line_height * trailing_empty_lines as f32
 }
 
+/// Block heights while the plain-text mode shows every source line verbatim.
+///
+/// No row collapses and no block kind scales its first line, so a block is
+/// `line_height` times its physical lines (plus the empty caret line after a
+/// trailing line ending for the final block).
+pub fn plain_block_heights(document: &RopeBuffer, index: &BlockIndex, line_height: f32) -> Vec<f32> {
+    index
+        .blocks()
+        .map(|block| plain_block_height(document, index, &block, line_height))
+        .collect()
+}
+
+/// Plain-text height of one block, shared by full snapshots and incremental
+/// height-index splices. The line set is the one
+/// [`block_height_with_disclosure`] counts.
+pub fn plain_block_height(
+    document: &RopeBuffer,
+    index: &BlockIndex,
+    block: &IndexedBlock,
+    line_height: f32,
+) -> f32 {
+    let trailing_empty_lines = if block.ordinal + 1 == index.len() {
+        block_line_span(document, block)
+            .map_or(0, |span| span.len().saturating_sub(block.line_count))
+    } else {
+        0
+    };
+    line_height * (block.line_count + trailing_empty_lines) as f32
+}
+
+/// Presents `window.render`'s lines of one indexed block as plain source text.
+///
+/// Nothing is hidden, converted or disclosed: every line is the raw source of
+/// its physical line (without the line ending) through an identity source map,
+/// and the block is [`BlockKind::Unsupported`] so layout takes the ordinary text
+/// path even for a table. `style_runs` stay empty; this is the single place a
+/// source highlighter can attach styling later.
+pub fn present_block_plain(
+    block: &IndexedBlock,
+    revision: Revision,
+    window: &BlockWindow<'_>,
+    line_height: f32,
+) -> VisualBlock {
+    let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
+    for line in window
+        .lines
+        .iter()
+        .filter(|line| window.render.contains(&line.line))
+    {
+        let mut presented = present_raw_source(
+            line.line as u64,
+            revision,
+            line.range,
+            line.text,
+            line_height,
+        );
+        while presented.visual_text.ends_with(['\r', '\n']) {
+            presented.visual_text.pop();
+        }
+        lines.push(presented);
+    }
+    let lines_before = lines.first().map_or(0, |line| {
+        (line.line_id as usize).saturating_sub(window.span.start)
+    });
+    let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
+    VisualBlock {
+        id: block.id,
+        kind: BlockKind::Unsupported,
+        source_range: block.source_range,
+        revision,
+        confidence: block.confidence,
+        span: window.span.clone(),
+        lines,
+        table_projection: None,
+        lines_before,
+        lines_after,
+        zero_height_lines_before: 0,
+        zero_height_lines_after: 0,
+        line_height,
+    }
+}
+
 /// One physical source line handed to [`present_block`].
 #[derive(Clone, Copy, Debug)]
 pub struct BlockLine<'a> {

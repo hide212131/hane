@@ -58,6 +58,10 @@ impl EditorView {
         // describes, so the heights of a job that started before it are
         // dropped by generation (the source-only index is still kept).
         let mode_generation = self.mode_generation;
+        // Plain-text mode sizes every block by its physical lines; a toggle
+        // bumps `mode_generation`, which drops these heights like any other
+        // mode switch.
+        let plain = self.plain_text();
         let line_height = self.line_height();
         let line_height_bits = line_height.to_bits();
         let previous_height_disclosure = self
@@ -105,12 +109,16 @@ impl EditorView {
                 .background_executor()
                 .spawn(async move {
                     let index = BlockIndex::from_buffer(&snapshot);
-                    let heights = HeightIndex::new(block_heights_with_disclosure(
-                        &snapshot,
-                        &index,
-                        line_height,
-                        disclosure,
-                    ));
+                    let heights = if plain {
+                        HeightIndex::new(plain_block_heights(&snapshot, &index, line_height))
+                    } else {
+                        HeightIndex::new(block_heights_with_disclosure(
+                            &snapshot,
+                            &index,
+                            line_height,
+                            disclosure,
+                        ))
+                    };
                     (index, heights)
                 })
                 .await;
@@ -163,6 +171,9 @@ impl EditorView {
                     // heights are dropped; the next job starts from the basis
                     // that is applied now, so the difference stays valid.
                     view.last_background_height_disclosure = None;
+                    if index_was_updated {
+                        view.resync_heights_for_current_disclosure();
+                    }
                     view.schedule_document_parse(cx);
                     view.ensure_active_disclosure_height();
                     cx.notify();
@@ -262,6 +273,10 @@ impl EditorView {
         blocks: &[IndexedBlock],
         cx: &mut Context<Self>,
     ) {
+        // Plain-text mode never joins lines into a shared parse.
+        if self.plain_text() {
+            return;
+        }
         let revision = self.editor().document().revision();
         for block in blocks {
             if self.joined_parse_jobs_running >= MAX_JOINED_PARSE_JOBS {
