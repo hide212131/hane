@@ -617,25 +617,9 @@ impl EditorView {
                             .inline_rename
                             .as_ref()
                             .is_some_and(|rename| rename.from == path);
-                        let content = if is_renaming {
-                            file_row_content(
-                                index,
-                                file_indent,
-                                &self.theme,
-                                self.inline_rename_label(cx),
-                                None,
-                            )
-                        } else {
-                            file_name_label(
-                                index,
-                                entry.file_name(),
-                                file_indent,
-                                today,
-                                &self.theme,
-                            )
-                        };
                         let menu_path = path.clone();
                         let pin_relative = self.pin_relative(&path);
+                        let can_toggle_pin = pin_relative.is_some();
                         let pinned = pin_relative
                             .as_deref()
                             .is_some_and(|relative| pinned_relative.contains(relative));
@@ -646,6 +630,27 @@ impl EditorView {
                             pinned,
                             cx,
                         );
+                        let content = if is_renaming {
+                            let trailing =
+                                file_row_trailing_slot(index, None, pin_slot, can_toggle_pin);
+                            file_row_content(
+                                index,
+                                file_indent,
+                                &self.theme,
+                                self.inline_rename_label(cx),
+                                trailing,
+                            )
+                        } else {
+                            file_name_label(
+                                index,
+                                entry.file_name(),
+                                file_indent,
+                                today,
+                                &self.theme,
+                                pin_slot,
+                                can_toggle_pin,
+                            )
+                        };
                         div()
                             .id(("work-folder-entry", index))
                             .group("sidebar-pin-row")
@@ -671,7 +676,7 @@ impl EditorView {
                                 element.bg(rgb(self.theme.sidebar_active_background))
                             })
                             .child(content)
-                            .child(pin_slot)
+                            .children(file_row_bounds_probe(index))
                             .on_click(cx.listener(move |view, event: &ClickEvent, window, cx| {
                                 window.focus(&view.focus_handle, cx);
                                 if !event.is_keyboard() && event.click_count() >= 2 {
@@ -2256,18 +2261,79 @@ fn entry_icon(
     }
 }
 
+/// Test-only measurement hook: the file row's own `sidebar-file` selector is
+/// shared by every row, so a non-interactive absolute child covering the row
+/// (padding included) registers per-row outer bounds. Nothing in non-test
+/// builds.
+#[cfg(test)]
+fn file_row_bounds_probe(row_index: usize) -> Option<gpui::Div> {
+    Some(
+        div()
+            .absolute()
+            .inset_0()
+            .debug_selector(move || format!("sidebar-file-row:{row_index}")),
+    )
+}
+
+#[cfg(not(test))]
+fn file_row_bounds_probe(_row_index: usize) -> Option<gpui::Div> {
+    None
+}
+
+/// The shared trailing region of a file row: the date text in normal flow and
+/// the pin toggle absolutely placed at the right end of the same region. The
+/// region is `max(date width, PIN_SLOT_SIZE)` wide, so hovering the row swaps
+/// the date for the pin in place (the date turns `invisible()` but keeps its
+/// width) without moving anything. When the row has no pin target
+/// (`can_toggle_pin == false`) the date stays visible on hover. The region
+/// itself has no click handler; `pin_slot` stops its own mouse-down.
+fn file_row_trailing_slot(
+    row_index: usize,
+    date: Option<gpui::Div>,
+    pin_slot: gpui::Div,
+    can_toggle_pin: bool,
+) -> gpui::Div {
+    let date = date.map(|date| {
+        if can_toggle_pin {
+            date.group_hover("sidebar-pin-row", |style| style.invisible())
+        } else {
+            date
+        }
+    });
+    div()
+        .relative()
+        .flex_none()
+        .h(px(sidebar_pins::PIN_SLOT_SIZE))
+        .min_w(px(sidebar_pins::PIN_SLOT_SIZE))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_end()
+        .debug_selector(move || format!("sidebar-file-trailing:{row_index}"))
+        .children(date)
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(sidebar_pins::PIN_SLOT_SIZE))
+                .h(px(sidebar_pins::PIN_SLOT_SIZE))
+                .child(pin_slot),
+        )
+}
+
 /// The content region of a file row: the indented icon and name on the left
-/// (the shrinkable name area) and, when given, the date text on the right.
-/// The date sits outside the indented content, so a deep indent or a long
-/// name shrinks the name area first and the date keeps its right edge, which
-/// is the left edge of the row's pin slot. `row_index` only keys the test
-/// selectors of the per-row bounds.
+/// (the shrinkable name area) and the shared trailing region (date / pin) on
+/// the right. The trailing region sits outside the indented content, so a deep
+/// indent or a long name shrinks the name area first and the trailing region
+/// keeps its right edge, which is the row's right padding edge. `row_index`
+/// only keys the test selectors of the per-row bounds.
 fn file_row_content(
     row_index: usize,
     indent: gpui::Pixels,
     theme: &Theme,
     name: gpui::Div,
-    date: Option<gpui::Div>,
+    trailing: gpui::Div,
 ) -> gpui::Div {
     // The padding must not sit on the shrinkable name area: padding is a
     // minimum width, so a deep indent would keep it wide and push the date
@@ -2304,7 +2370,7 @@ fn file_row_content(
         .gap_1()
         .debug_selector(move || format!("sidebar-file-content:{row_index}"))
         .child(name_area)
-        .children(date)
+        .child(trailing)
 }
 
 /// The sidebar's file-row label: the file name (minus a trailing `.md`)
@@ -2319,18 +2385,22 @@ fn file_name_label(
     indent: gpui::Pixels,
     today: CalendarDate,
     theme: &Theme,
+    pin_slot: gpui::Div,
+    can_toggle_pin: bool,
 ) -> gpui::Div {
     let file_name = display_file_name(file_name);
     let name_text = |text: String| div().flex_1().min_w(px(0.0)).truncate().child(text);
     let Some(badge) = split_file_name_for_badge(file_name) else {
         let name = name_text(file_name.to_owned());
-        return file_row_content(row_index, indent, theme, name, None);
+        let trailing = file_row_trailing_slot(row_index, None, pin_slot, can_toggle_pin);
+        return file_row_content(row_index, indent, theme, name, trailing);
     };
     // A date-only name keeps an empty name text so the flexible left side
     // still fills the row and the date stays on the right.
     let name = name_text(badge.remainder().to_owned());
     let date = date_badge_text(row_index, badge.date, today, theme);
-    file_row_content(row_index, indent, theme, name, Some(date))
+    let trailing = file_row_trailing_slot(row_index, Some(date), pin_slot, can_toggle_pin);
+    file_row_content(row_index, indent, theme, name, trailing)
 }
 
 /// Opacity of the date text: the file name's own foreground for today, and
@@ -2362,7 +2432,14 @@ fn date_badge_text(
         )
         .text_size(px(10.0))
         .debug_selector(move || format!("sidebar-file-date:{row_index}"))
-        .child(format_relative_date_label(date, today))
+        // Test-only paint probe: a descendant of the date that is not painted
+        // while the date is `invisible()` (the date's own bounds stay
+        // registered either way, so they prove nothing about visibility).
+        .child(
+            div()
+                .debug_selector(move || format!("sidebar-file-date-paint:{row_index}"))
+                .child(format_relative_date_label(date, today)),
+        )
 }
 
 /// A short label for an unnamed note in the sidebar: its first non-blank
@@ -2782,26 +2859,79 @@ mod tests {
             .expect("the row renders its date text")
     }
 
-    /// Asserts the date text's right edge is the left edge of the row's
-    /// (always reserved) pin slot, and that it is whole and inside its row.
-    fn assert_date_aligned_to_pin_slot(
+    fn row_bounds(
+        cx: &mut gpui::VisualTestContext,
+        row_index: usize,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        cx.debug_bounds(row_selector("sidebar-file-row", row_index))
+            .expect("the file row registers its outer bounds")
+    }
+
+    fn name_area_bounds(
+        cx: &mut gpui::VisualTestContext,
+        row_index: usize,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        cx.debug_bounds(row_selector("sidebar-file-name-area", row_index))
+            .expect("the row renders its name area")
+    }
+
+    fn trailing_bounds(
+        cx: &mut gpui::VisualTestContext,
+        row_index: usize,
+    ) -> gpui::Bounds<gpui::Pixels> {
+        cx.debug_bounds(row_selector("sidebar-file-trailing", row_index))
+            .expect("the row renders its shared trailing region")
+    }
+
+    /// Whether the date is actually painted: its test-only descendant probe
+    /// registers bounds only while the date is not `invisible()`. The date's
+    /// own bounds are registered either way, so they prove nothing.
+    fn date_painted(cx: &mut gpui::VisualTestContext, row_index: usize) -> bool {
+        cx.debug_bounds(row_selector("sidebar-file-date-paint", row_index))
+            .is_some()
+    }
+
+    /// Whether the pin button is actually painted: its descendant selector is
+    /// registered only while the (invisible-at-rest) pin slot is visible.
+    fn pin_painted(cx: &mut gpui::VisualTestContext, row_index: usize) -> bool {
+        cx.debug_bounds(row_selector(
+            "sidebar-pin-toggle-row:work-folder-pin-toggle",
+            row_index,
+        ))
+        .is_some()
+    }
+
+    fn move_mouse(cx: &mut gpui::VisualTestContext, position: gpui::Point<gpui::Pixels>) {
+        cx.simulate_mouse_move(position, None, gpui::Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    fn move_mouse_away(cx: &mut gpui::VisualTestContext) {
+        move_mouse(cx, gpui::point(px(900.0), px(10.0)));
+    }
+
+    /// Asserts the date text's right edge is the row's right edge minus its
+    /// horizontal padding, and that it is whole and inside its row.
+    fn assert_date_aligned_to_row_right_edge(
         cx: &mut gpui::VisualTestContext,
         row_index: usize,
         context: &str,
     ) -> gpui::Bounds<gpui::Pixels> {
         let date = date_bounds(cx, row_index);
-        let pin = cx
-            .debug_bounds(pin_selector(row_index))
-            .expect("the row reserves a pin slot");
+        let row = row_bounds(cx, row_index);
+        let trailing = trailing_bounds(cx, row_index);
         let content = cx
             .debug_bounds(row_selector("sidebar-file-content", row_index))
             .expect("the row renders its content region");
-        let name_area = cx
-            .debug_bounds(row_selector("sidebar-file-name-area", row_index))
-            .expect("the row renders its name area");
+        let name_area = name_area_bounds(cx, row_index);
+        let expected_right = px_f32(row.right()) - SIDEBAR_ROW_HORIZONTAL_PADDING;
         assert!(
-            (px_f32(date.right()) - px_f32(pin.left())).abs() <= 0.5,
-            "{context}: the date's right edge {date:?} meets the pin slot {pin:?}"
+            (px_f32(date.right()) - expected_right).abs() <= 0.5,
+            "{context}: the date's right edge {date:?} is inside the row padding of {row:?}"
+        );
+        assert!(
+            (px_f32(trailing.right()) - expected_right).abs() <= 0.5,
+            "{context}: the trailing region {trailing:?} ends at the row padding edge of {row:?}"
         );
         assert!(
             (px_f32(date.right()) - px_f32(content.right())).abs() <= 0.5,
@@ -2825,7 +2955,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn date_badge_text_aligns_to_the_content_right_edge(cx: &mut gpui::TestAppContext) {
+    fn date_badge_text_aligns_to_row_padding_edge(cx: &mut gpui::TestAppContext) {
         let root = date_test_root("align");
         let names = [
             "2020-01-02_短い.md".to_owned(),
@@ -2836,11 +2966,13 @@ mod tests {
             std::fs::write(root.join(name), "x").unwrap();
         }
         let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+        move_mouse_away(cx);
 
         let mut right_edges = Vec::new();
         for name in &names {
             let index = file_row_index(&view, cx, &root.join(name));
-            let date = assert_date_aligned_to_pin_slot(cx, index, name);
+            let date = assert_date_aligned_to_row_right_edge(cx, index, name);
+            assert!(date_painted(cx, index), "{name}: the date is shown at rest");
             right_edges.push(px_f32(date.right()));
         }
         for edge in &right_edges {
@@ -2864,8 +2996,8 @@ mod tests {
 
         let only_index = file_row_index(&view, cx, &date_only);
         let named_index = file_row_index(&view, cx, &named);
-        let only = assert_date_aligned_to_pin_slot(cx, only_index, "date only");
-        let with_name = assert_date_aligned_to_pin_slot(cx, named_index, "with name");
+        let only = assert_date_aligned_to_row_right_edge(cx, only_index, "date only");
+        let with_name = assert_date_aligned_to_row_right_edge(cx, named_index, "with name");
         assert!(
             (px_f32(only.right()) - px_f32(with_name.right())).abs() <= 0.5,
             "the date-only row aligns like a named row"
@@ -2907,8 +3039,13 @@ mod tests {
         );
         let deep_index = file_row_index(&view, cx, &deep);
         let shallow_index = file_row_index(&view, cx, &shallow);
-        let deep_date = assert_date_aligned_to_pin_slot(cx, deep_index, "deep and long");
-        let shallow_date = assert_date_aligned_to_pin_slot(cx, shallow_index, "shallow");
+        let deep_date = assert_date_aligned_to_row_right_edge(cx, deep_index, "deep and long");
+        let shallow_date = assert_date_aligned_to_row_right_edge(cx, shallow_index, "shallow");
+        let deep_name = name_area_bounds(cx, deep_index);
+        assert!(
+            px_f32(deep_name.right()) <= px_f32(deep_date.left()) + 0.5,
+            "the name shrinks before the date: {deep_name:?} vs {deep_date:?}"
+        );
         assert!(
             px_f32(deep_date.right()) <= px_f32(list.right()),
             "the deep row's date {deep_date:?} stays inside the viewport {list:?}"
@@ -2926,7 +3063,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pin_hover_does_not_move_date_badge_text(cx: &mut gpui::TestAppContext) {
+    fn file_row_hover_swaps_date_and_pin_without_relayout(cx: &mut gpui::TestAppContext) {
         let root = date_test_root("pin-hover");
         let file = root.join("2020-01-02_ピン.md");
         std::fs::write(&file, "x").unwrap();
@@ -2934,30 +3071,270 @@ mod tests {
         let index = file_row_index(&view, cx, &file);
 
         // Away from the sidebar: the row is not hovered.
-        cx.simulate_mouse_move(gpui::point(px(900.0), px(10.0)), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        let before = assert_date_aligned_to_pin_slot(cx, index, "not hovered");
+        move_mouse_away(cx);
+        let date_before = assert_date_aligned_to_row_right_edge(cx, index, "not hovered");
+        let name_before = name_area_bounds(cx, index);
+        let trailing_before = trailing_bounds(cx, index);
+        assert!(date_painted(cx, index), "the date shows at rest");
+        assert!(!pin_painted(cx, index), "the pin is hidden at rest");
 
-        let content = cx
-            .debug_bounds(row_selector("sidebar-file-content", index))
-            .expect("the row content");
-        cx.simulate_mouse_move(content.center(), None, gpui::Modifiers::none());
-        cx.run_until_parked();
-        let hovered = assert_date_aligned_to_pin_slot(cx, index, "hovered");
-        assert_eq!(before, hovered, "hovering the row does not move the date");
+        for (label, position) in [
+            ("name", name_before.center()),
+            (
+                "pin",
+                cx.debug_bounds(pin_selector(index))
+                    .expect("the pin slot")
+                    .center(),
+            ),
+        ] {
+            move_mouse(cx, position);
+            let date = assert_date_aligned_to_row_right_edge(cx, index, label);
+            assert_eq!(date_before, date, "{label}: the date does not move");
+            assert_eq!(name_before, name_area_bounds(cx, index), "{label}: name");
+            assert_eq!(trailing_before, trailing_bounds(cx, index), "{label}: slot");
+            assert!(!date_painted(cx, index), "{label}: the date is swapped out");
+            assert!(pin_painted(cx, index), "{label}: the pin is swapped in");
+        }
 
-        // Toggling the pin may shift rows vertically (the Pinned area), but
-        // never the date horizontally.
-        let pin = cx.debug_bounds(pin_selector(index)).expect("the pin button");
+        move_mouse_away(cx);
+        assert_eq!(date_before, date_bounds(cx, index));
+        assert_eq!(name_before, name_area_bounds(cx, index));
+        assert_eq!(trailing_before, trailing_bounds(cx, index));
+        assert!(date_painted(cx, index), "leaving restores the date");
+        assert!(!pin_painted(cx, index), "leaving hides the pin");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn pinned_file_row_restores_date_after_hover(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("pinned-restore");
+        let file = root.join("2020-01-02_留める.md");
+        std::fs::write(&file, "x").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+
+        let index = file_row_index(&view, cx, &file);
+        let name = name_area_bounds(cx, index);
+        move_mouse(cx, name.center());
+        let pin = cx.debug_bounds(pin_selector(index)).expect("the pin slot");
         cx.simulate_click(pin.center(), gpui::Modifiers::none());
         cx.run_until_parked();
-        let pinned = view.read_with(cx, |view, _| !view.sidebar_pins.entries.is_empty());
-        assert!(pinned, "the file is pinned");
+        view.read_with(cx, |view, _| {
+            assert!(!view.sidebar_pins.entries.is_empty(), "the file is pinned");
+        });
+
+        // Pinning may add the Pinned area above; measure the row again.
+        move_mouse_away(cx);
         let index = file_row_index(&view, cx, &file);
-        let after = assert_date_aligned_to_pin_slot(cx, index, "after pinning");
-        assert_eq!(px_f32(before.left()), px_f32(after.left()));
-        assert_eq!(px_f32(before.right()), px_f32(after.right()));
-        assert_eq!(px_f32(before.size.width), px_f32(after.size.width));
+        assert_date_aligned_to_row_right_edge(cx, index, "pinned, not hovered");
+        assert!(date_painted(cx, index), "the pinned row shows its date");
+        assert!(!pin_painted(cx, index), "the unpin button is hidden at rest");
+
+        // Hovering shows the unpin button, and it works.
+        let name = name_area_bounds(cx, index);
+        move_mouse(cx, name.center());
+        assert!(pin_painted(cx, index), "the unpin button shows on hover");
+        assert!(!date_painted(cx, index), "the date yields to the button");
+        let pin = cx.debug_bounds(pin_selector(index)).expect("the pin slot");
+        cx.simulate_click(pin.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.sidebar_pins.entries.is_empty(), "the file is unpinned");
+        });
+
+        move_mouse_away(cx);
+        let index = file_row_index(&view, cx, &file);
+        assert_date_aligned_to_row_right_edge(cx, index, "after unpinning");
+        assert!(date_painted(cx, index));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn file_row_without_date_keeps_pin_reachable(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("no-date-pin");
+        let file = root.join("日付なし.md");
+        std::fs::write(&file, "# 日付なし\n").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+        let index = file_row_index(&view, cx, &file);
+
+        move_mouse_away(cx);
+        assert!(
+            cx.debug_bounds(row_selector("sidebar-file-date", index))
+                .is_none(),
+            "the row has no date"
+        );
+        let trailing = trailing_bounds(cx, index);
+        assert!(
+            (px_f32(trailing.size.width) - sidebar_pins::PIN_SLOT_SIZE).abs() <= 0.5
+                && (px_f32(trailing.size.height) - sidebar_pins::PIN_SLOT_SIZE).abs() <= 0.5,
+            "the empty region keeps 24px: {trailing:?}"
+        );
+        let name = name_area_bounds(cx, index);
+        assert!(
+            px_f32(name.right()) <= px_f32(trailing.left()) + 0.5,
+            "the name does not overlap the pin region"
+        );
+
+        move_mouse(cx, name.center());
+        assert!(pin_painted(cx, index), "the pin shows on hover");
+        let pin = cx.debug_bounds(pin_selector(index)).expect("the pin slot");
+        cx.simulate_click(pin.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.sidebar_pins.entries.len(), 1, "pinned exactly once");
+            assert!(view.loading_paths.is_empty(), "the pin click opens nothing");
+            assert_ne!(view.sessions.active().path(), Some(file.as_path()));
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn file_row_trailing_pin_click_does_not_open_or_rename(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("trailing-click");
+        let file = root.join("2020-01-02_押す.md");
+        std::fs::write(&file, "# 押す\n").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+
+        // Click the trailing 24px twice (pin, then unpin); the rows may shift
+        // when the Pinned area appears, so measure again each time.
+        for _ in 0..2 {
+            let index = file_row_index(&view, cx, &file);
+            let name = name_area_bounds(cx, index);
+            move_mouse(cx, name.center());
+            let pin = cx.debug_bounds(pin_selector(index)).expect("the pin slot");
+            cx.simulate_click(pin.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.loading_paths.is_empty(), "the pin click opens nothing");
+                assert_ne!(view.sessions.active().path(), Some(file.as_path()));
+                assert!(view.inline_rename.is_none(), "the pin click does not rename");
+            });
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn file_row_name_click_opens_file_with_shared_trailing_slot(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("name-click");
+        let file = root.join("2020-01-02_開く.md");
+        std::fs::write(&file, "# 開く\n").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+        let index = file_row_index(&view, cx, &file);
+
+        let point = name_area_bounds(cx, index).center();
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                !view.loading_paths.is_empty()
+                    || view.sessions.active().path() == Some(file.as_path()),
+                "the click reached the file row and opened its file"
+            );
+            assert!(view.inline_rename.is_none(), "a single click does not rename");
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A row whose pin target is unavailable (`can_toggle_pin == false`) keeps
+    /// its date on hover; with a target the date is swapped out.
+    struct TrailingFixture {
+        can_toggle_pin: bool,
+    }
+
+    impl gpui::Render for TrailingFixture {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let date = div().flex_none().child(
+                div()
+                    .debug_selector(|| "sidebar-file-date-paint:0".to_owned())
+                    .child("本日"),
+            );
+            let pin_slot = div()
+                .w(px(sidebar_pins::PIN_SLOT_SIZE))
+                .h(px(sidebar_pins::PIN_SLOT_SIZE));
+            div()
+                .group("sidebar-pin-row")
+                .w(px(300.0))
+                .h(px(SIDEBAR_ROW_HEIGHT))
+                .flex()
+                .flex_row()
+                .child(file_row_trailing_slot(
+                    0,
+                    Some(date),
+                    pin_slot,
+                    self.can_toggle_pin,
+                ))
+        }
+    }
+
+    #[gpui::test]
+    fn file_date_stays_visible_when_pin_target_is_unavailable(cx: &mut gpui::TestAppContext) {
+        for can_toggle_pin in [true, false] {
+            let (_view, cx) = cx.add_window_view(|_, _| TrailingFixture { can_toggle_pin });
+            cx.simulate_resize(gpui::size(px(300.0), px(100.0)));
+            cx.run_until_parked();
+            // The initial mouse position is inside the row, so move it below the row
+            // (still inside the 300x100 window) before checking the resting state.
+            move_mouse(cx, gpui::point(px(150.0), px(90.0)));
+            assert!(date_painted(cx, 0), "the date shows at rest");
+
+            move_mouse(cx, gpui::point(px(150.0), px(SIDEBAR_ROW_HEIGHT / 2.0)));
+            assert_eq!(
+                date_painted(cx, 0),
+                !can_toggle_pin,
+                "can_toggle_pin={can_toggle_pin}: the date hides on hover only with a pin target"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn inline_rename_keeps_shared_pin_slot_and_blocks_toggle(cx: &mut gpui::TestAppContext) {
+        let root = date_test_root("rename-pin");
+        let file = root.join("2020-01-02_変更.md");
+        std::fs::write(&file, "x").unwrap();
+        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
+
+        let index = file_row_index(&view, cx, &file);
+        let point = name_area_bounds(cx, index).center();
+        cx.simulate_click(point, gpui::Modifiers::none());
+        cx.simulate_keystrokes("f2");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.inline_rename_active()));
+        assert!(
+            cx.debug_bounds(row_selector("sidebar-file-date", index))
+                .is_none(),
+            "renaming shows no date"
+        );
+        let trailing = trailing_bounds(cx, index);
+        assert!(
+            (px_f32(trailing.size.width) - sidebar_pins::PIN_SLOT_SIZE).abs() <= 0.5,
+            "the 24px region stays: {trailing:?}"
+        );
+
+        // The pin is shown on hover but refuses to toggle while renaming.
+        let name_center = name_area_bounds(cx, index).center();
+        move_mouse(cx, name_center);
+        let pin = cx.debug_bounds(pin_selector(index)).expect("the pin slot");
+        cx.simulate_click(pin.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(view.inline_rename_active(), "the rename input is kept");
+            assert!(view.sidebar_pins.entries.is_empty(), "no pin was toggled");
+        });
+
+        // Cancel restores the date.
+        cx.simulate_keystrokes("escape");
+        move_mouse_away(cx);
+        view.read_with(cx, |view, _| assert!(!view.inline_rename_active()));
+        assert_date_aligned_to_row_right_edge(cx, index, "after cancel");
+        assert!(date_painted(cx, index));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -2973,7 +3350,7 @@ mod tests {
         assert!(cx
             .debug_bounds(row_selector("sidebar-file-date", index))
             .is_some());
-        let point = date_bounds(cx, index).center();
+        let point = name_area_bounds(cx, index).center();
         cx.simulate_click(point, gpui::Modifiers::none());
         cx.simulate_keystrokes("f2");
         cx.run_until_parked();
@@ -2984,11 +3361,11 @@ mod tests {
             "renaming hides the date text"
         );
 
-        // Cancel restores it.
+        // Cancel restores it (pointer outside the row, so the date shows).
         cx.simulate_keystrokes("escape");
-        cx.run_until_parked();
+        move_mouse_away(cx);
         view.read_with(cx, |view, _| assert!(!view.inline_rename_active()));
-        assert_date_aligned_to_pin_slot(cx, index, "after cancel");
+        assert_date_aligned_to_row_right_edge(cx, index, "after cancel");
 
         // Commit restores it on the renamed file's row.
         cx.simulate_keystrokes("f2");
@@ -3007,31 +3384,9 @@ mod tests {
         view.read_with(cx, |view, _| assert!(!view.inline_rename_active()));
         let renamed = root.join("2020-01-02_確定.md");
         assert!(renamed.exists(), "the rename was committed");
+        move_mouse_away(cx);
         let index = file_row_index(&view, cx, &renamed);
-        assert_date_aligned_to_pin_slot(cx, index, "after commit");
-
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[gpui::test]
-    fn clicking_date_badge_text_opens_its_file_row(cx: &mut gpui::TestAppContext) {
-        let root = date_test_root("click");
-        let file = root.join("2020-01-02_開く.md");
-        std::fs::write(&file, "# 開く\n").unwrap();
-        let (view, cx) = date_sidebar_view(cx, &root, &[], false);
-        let index = file_row_index(&view, cx, &file);
-
-        let point = date_bounds(cx, index).center();
-        cx.simulate_click(point, gpui::Modifiers::none());
-        cx.run_until_parked();
-        view.read_with(cx, |view, _| {
-            assert!(
-                !view.loading_paths.is_empty()
-                    || view.sessions.active().path() == Some(file.as_path()),
-                "the click reached the file row and opened its file"
-            );
-            assert!(view.inline_rename.is_none(), "a single click does not rename");
-        });
+        assert_date_aligned_to_row_right_edge(cx, index, "after commit");
 
         std::fs::remove_dir_all(&root).unwrap();
     }

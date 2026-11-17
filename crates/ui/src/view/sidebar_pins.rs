@@ -585,7 +585,10 @@ impl EditorView {
     }
 
     /// The toggle slot at the right end of a row. The slot always takes its
-    /// space; only the button inside shows on row hover. Mouse-down on it is
+    /// space; only the button inside shows on row hover. In ordinary-tree file
+    /// rows it is placed inside the shared trailing region (swapped in place
+    /// with the date); the returned element carries no absolute positioning,
+    /// the caller wraps it. Mouse-down on it is
     /// stopped here, so the row's open / expand / rename never sees the click.
     pub(super) fn pin_toggle_slot(
         &self,
