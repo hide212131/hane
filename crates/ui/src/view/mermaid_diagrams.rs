@@ -96,6 +96,10 @@ impl EditorView {
     /// the picture is made when the edit position leaves it, and the source
     /// stays on screen until it is ready.
     pub(super) fn schedule_mermaid(&mut self, blocks: &[IndexedBlock], cx: &mut Context<Self>) {
+        // Plain-text mode shows the fence as source, so no diagram is rendered.
+        if self.plain_text() {
+            return;
+        }
         let dark = self.mermaid_dark();
         // Blocks whose own entry already matches, and blocks that still need one.
         let mut claimed = HashSet::new();
@@ -250,7 +254,7 @@ impl EditorView {
     /// exact current text and palette, or an edit position, selection,
     /// composition or find match on the construct.
     pub(super) fn diagram_plan_for(&self, block: &IndexedBlock) -> Option<DiagramPlan> {
-        if block.confidence != Confidence::Formal {
+        if self.plain_text() || block.confidence != Confidence::Formal {
             return None;
         }
         let known = self

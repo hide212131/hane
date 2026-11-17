@@ -36,6 +36,10 @@ pub const ICON_CHECK: &str = "icons/check.svg";
 pub const ICON_READING_MODE: &str = "icons/reading-mode.svg";
 /// The tab-row button that switches back to editing: an outlined pencil.
 pub const ICON_EDITING_MODE: &str = "icons/editing-mode.svg";
+/// The tab-row button that switches to plain-text mode: three text lines.
+pub const ICON_PLAIN_TEXT_MODE: &str = "icons/plain-text-mode.svg";
+/// The tab-row button that switches back from plain-text mode: the Markdown mark.
+pub const ICON_MARKDOWN_MODE: &str = "icons/markdown-mode.svg";
 
 const FILE_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -93,6 +97,14 @@ const EDITING_MODE_SVG: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../assets/icons/editing-mode.svg"
 ));
+const PLAIN_TEXT_MODE_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/plain-text-mode.svg"
+));
+const MARKDOWN_MODE_SVG: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../assets/icons/markdown-mode.svg"
+));
 
 /// Serves the work-folder sidebar icons from memory. Every other asset
 /// path falls through to `None`, the same as gpui's default no-op
@@ -118,6 +130,8 @@ impl AssetSource for WorkFolderIcons {
             ICON_CHECK => Some(Cow::Borrowed(CHECK_SVG)),
             ICON_READING_MODE => Some(Cow::Borrowed(READING_MODE_SVG)),
             ICON_EDITING_MODE => Some(Cow::Borrowed(EDITING_MODE_SVG)),
+            ICON_PLAIN_TEXT_MODE => Some(Cow::Borrowed(PLAIN_TEXT_MODE_SVG)),
+            ICON_MARKDOWN_MODE => Some(Cow::Borrowed(MARKDOWN_MODE_SVG)),
             _ => None,
         })
     }
@@ -173,6 +187,8 @@ mod tests {
             ICON_CHECK,
             ICON_READING_MODE,
             ICON_EDITING_MODE,
+            ICON_PLAIN_TEXT_MODE,
+            ICON_MARKDOWN_MODE,
         ] {
             assert_eq!(
                 AppAssets.load(path).unwrap(),

@@ -27,8 +27,9 @@ use std::ops::Range;
 mod block;
 pub use block::{
     BlockLine, BlockWindow, block_height_with_disclosure, block_heights,
-    block_heights_with_disclosure, block_line_span, expected_disclosures, present_block,
-    present_block_with_list_projection, present_block_with_table_projection, trailing_blank_lines,
+    block_heights_with_disclosure, block_line_span, expected_disclosures, plain_block_height,
+    plain_block_heights, present_block, present_block_plain, present_block_with_list_projection,
+    present_block_with_table_projection, trailing_blank_lines,
 };
 
 fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &str) -> VisualLine {
@@ -3331,3 +3332,6 @@ pub fn present_markdown(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod plain_tests;

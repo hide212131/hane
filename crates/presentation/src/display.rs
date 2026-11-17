@@ -682,6 +682,14 @@ impl VisualBlock {
             && self.kind == block_display_kind(block.kind)
     }
 
+    /// [`Self::matches`] for a plain-text presentation. A plain block is always
+    /// [`BlockKind::Unsupported`], so the kind is not compared.
+    pub fn matches_plain(&self, block: &IndexedBlock) -> bool {
+        self.id == block.id
+            && self.source_range == block.source_range
+            && self.confidence == block.confidence
+    }
+
     /// True when a bare URL target of this presentation could change meaning
     /// if a reference definition elsewhere in the document is added or removed.
     ///

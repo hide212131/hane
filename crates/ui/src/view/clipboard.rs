@@ -93,6 +93,13 @@ impl EditorView {
         if !self.body_paste_ready() {
             return;
         }
+        // Plain-text mode pastes the text as it is: no image file, no
+        // HTML-to-Markdown conversion and no link wrapping.
+        let mode = if self.plain_text() {
+            PasteMode::PlainText
+        } else {
+            mode
+        };
         self.invalidate_clipboard_job();
         if self.editor().ime().is_some() {
             self.status = Some(COMPOSING_MESSAGE.to_owned());

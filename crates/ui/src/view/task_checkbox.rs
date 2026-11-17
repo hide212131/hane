@@ -62,6 +62,7 @@ impl EditorView {
     /// modes only, so a future mode is not allowed by accident.
     pub(super) fn task_checkbox_toggle_allowed(&self) -> bool {
         matches!(self.editor_mode(), EditorMode::Editing | EditorMode::Reading)
+            && !self.plain_text()
             && self.editor().ime().is_none()
     }
 

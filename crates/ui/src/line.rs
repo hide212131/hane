@@ -23,7 +23,8 @@ use hane_presentation::{
     BlockWindow, DiagramPlan, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap,
     QUOTE_BAR_WIDTH, TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset,
     apply_diagram, block_is_joinable, block_line_context, block_line_span, diagram_display_size,
-    expected_disclosures, present_block_with_table_projection, trailing_blank_lines,
+    expected_disclosures, present_block_plain, present_block_with_table_projection,
+    trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
@@ -53,7 +54,7 @@ fn range_disclosure(
     forced: Option<SourceRange>,
     policy: DisclosurePolicy,
 ) -> Option<SourceRange> {
-    if policy == DisclosurePolicy::Reading {
+    if matches!(policy, DisclosurePolicy::Reading | DisclosurePolicy::Plain) {
         return None;
     }
     let selection = editor.selection().range();
@@ -118,14 +119,18 @@ pub(crate) fn block_fits_sync_join_budget(block: &IndexedBlock, span: &Range<usi
 }
 
 /// Whether caret, selection, composition and find matches open Markdown
-/// markers (`Editing`) or the rendered form is kept closed (`Reading`). It is
-/// derived from `EditorView`'s mode and handed to every presentation and
+/// markers (`Editing`) or the rendered form is kept closed (`Reading`), or
+/// whether nothing is projected at all (`Plain`). It is derived from
+/// `EditorView`'s mode and handed to every presentation and
 /// disclosure computation, so drawing, cache checks and movement agree.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum DisclosurePolicy {
     #[default]
     Editing,
     Reading,
+    /// Plain-text mode (Issue #737): the source lines are shown verbatim, so
+    /// there is nothing to disclose and no structure to collapse.
+    Plain,
 }
 
 /// Borrowed inputs for one [`presented_block`] call.
@@ -182,6 +187,9 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
         line_height,
         disclosure_policy,
     } = request;
+    if disclosure_policy == DisclosurePolicy::Plain {
+        return presented_block_plain(editor, block, visible, line_height);
+    }
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
@@ -222,6 +230,58 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
     ))
 }
 
+/// Plain-text presentation of the lines of `block` that reach `visible`: the
+/// source of each physical line verbatim, with no joined parse, list, fence,
+/// table or diagram handling and no disclosure.
+fn presented_block_plain(
+    editor: &Editor,
+    block: &IndexedBlock,
+    visible: &Range<usize>,
+    line_height: f32,
+) -> Option<VisualBlock> {
+    let document = editor.document();
+    let span = block_line_span(document, block)?;
+    let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
+    let block_range = block.source_range;
+    let rows = render
+        .clone()
+        .map(|line| {
+            let range = document.line_range(LineId(line)).ok()?;
+            let range = SourceRange::new(
+                range.start.0.max(block_range.start.0),
+                range.end.0.min(block_range.end.0),
+            );
+            Some((line, range, document.text(range).unwrap_or_default()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let lines = rows
+        .iter()
+        .map(|(line, range, text)| BlockLine {
+            line: *line,
+            range: *range,
+            text,
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    Some(present_block_plain(
+        block,
+        document.revision(),
+        &BlockWindow {
+            trailing_blank_lines: 0,
+            span,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
+            render,
+            joined: None,
+            block_disclosure: None,
+        },
+        line_height,
+    ))
+}
+
 /// [`presented_block`], showing the block as a rendered diagram when `diagram`
 /// is given.
 ///
@@ -234,7 +294,8 @@ pub(crate) fn presented_block_with_diagram(
     request: BlockPresentationRequest<'_>,
     diagram: Option<&DiagramPlan>,
 ) -> Option<VisualBlock> {
-    let Some(plan) = diagram else {
+    let Some(plan) = diagram.filter(|_| request.disclosure_policy != DisclosurePolicy::Plain)
+    else {
         return presented_block(request);
     };
     let span = block_line_span(request.editor.document(), request.block)?;
@@ -256,7 +317,7 @@ pub(crate) fn lines_are_disclosed(
     forced: Option<SourceRange>,
     policy: DisclosurePolicy,
 ) -> bool {
-    if policy == DisclosurePolicy::Reading {
+    if matches!(policy, DisclosurePolicy::Reading | DisclosurePolicy::Plain) {
         return false;
     }
     let document = editor.document();
