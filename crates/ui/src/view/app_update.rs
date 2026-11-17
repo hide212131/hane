@@ -1218,6 +1218,7 @@ impl EditorView {
             .children(self.restart_message.clone().map(|message| {
                 div()
                     .id("settings-app-update-restart-message")
+                    .debug_selector(|| "settings-app-update-restart-message".to_owned())
                     .text_color(rgb(self.theme.quote_foreground))
                     .child(message)
             }))
