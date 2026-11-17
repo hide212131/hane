@@ -102,7 +102,11 @@ impl EditorView {
         // Plain-text mode (Issue #737) is its own axis: it projects nothing
         // whether the body is editable or read-only.
         if self.plain_text() {
-            return DisclosurePolicy::Plain;
+            return if self.syntax_highlight() {
+                DisclosurePolicy::PlainHighlighted
+            } else {
+                DisclosurePolicy::Plain
+            };
         }
         match self.editor_mode {
             EditorMode::Editing => DisclosurePolicy::Editing,

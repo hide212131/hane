@@ -55,7 +55,7 @@ pub use display::{
     InlineDisplay, LineContext, LinkTarget, ListAlignment, ListId, ListItemId, ListMarkerKind,
     ListMarkerMetadata, ListOwnerMetadata, ListRowMetadata, ListRowRole,
     ListStructuralPrefixMetadata, ListTaskMetadata, QuoteRowMetadata, StyleKind, StyleRun,
-    TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, block_is_joinable,
+    SyntaxTone, TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, block_is_joinable,
     block_line_context,
     code_line_height,
 };
@@ -66,9 +66,10 @@ pub use layout::{
     VerticalMove, layout_block, line_visual_start,
 };
 pub use projection::{
-    BlockLine, BlockWindow, JoinedParse, block_height_with_disclosure, block_heights,
+    BlockLine, BlockWindow, JoinedParse, PlainCodeBlock, PlainHighlight, PlainHighlightInput,
+    block_height_with_disclosure, block_heights,
     block_heights_with_disclosure, block_line_span, expected_disclosures, parse_joined_block,
-    parse_joined_span, plain_block_height, plain_block_heights, present_block,
+    parse_joined_span, plain_code_line_runs, plain_block_height, plain_block_heights, present_block,
     present_block_plain, present_block_with_list_projection,
     present_block_with_table_projection, present_markdown, present_markdown_with_disclosure,
     present_polished_line, table_delimiter_is_collapsed, trailing_blank_lines,
