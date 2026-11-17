@@ -6224,10 +6224,11 @@ impl EditorView {
                 cx,
                 move |view, _, _, cx| view.confirm_discard_and_close_tab(snapshot, cx),
             )
-            .flex_shrink_0()
+            .w_auto()
+            .flex_none()
             .whitespace_nowrap();
-        let cancel = cancel.flex_shrink_0().whitespace_nowrap();
-        let save_and_close = save_and_close.flex_shrink_0().whitespace_nowrap();
+        let cancel = cancel.w_auto().flex_none().whitespace_nowrap();
+        let save_and_close = save_and_close.w_auto().flex_none().whitespace_nowrap();
         div()
             .id("tab-close-confirm-overlay")
             .debug_selector(|| "tab-close-confirm-overlay".to_owned())
