@@ -859,9 +859,18 @@ mod tests {
         select(&view, cx, 5, 5);
         view.update(cx, |view, cx| view.insert_text("x", cx));
 
-        let (first_reused, first_runs) = present_at(&view, cx, 0);
-        assert!(!first_reused, "the edited block is presented again");
-        assert!(first_runs.iter().any(|runs| !runs.is_empty()));
+        let (_, first_runs) = present_at(&view, cx, 0);
+        let heading_ends: Vec<usize> = first_runs
+            .iter()
+            .flatten()
+            .filter(|run| run.kind == StyleKind::Syntax(hane_presentation::SyntaxTone::Heading))
+            .map(|run| run.visual_range.end.0)
+            .collect();
+        assert!(
+            heading_ends.contains(&6),
+            "the edited block reflects the new text: {heading_ends:?}"
+        );
+        assert!(!heading_ends.contains(&5));
         let (second_reused, second_after) = present_at(&view, cx, second + 1);
         assert!(second_reused, "the other block is reused");
         assert_eq!(second_after, second_runs);

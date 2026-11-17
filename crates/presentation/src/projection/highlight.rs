@@ -545,8 +545,8 @@ mod tests {
     fn task_checkbox_is_structure() {
         for source in ["- [ ] a", "- [x] a"] {
             let displays = displays(source);
-            for index in 2..5 {
-                assert_eq!(displays[index].tone, Some(SyntaxTone::Structure), "{source:?} {index}");
+            for (offset, display) in displays[2..5].iter().enumerate() {
+                assert_eq!(display.tone, Some(SyntaxTone::Structure), "{source:?} {}", offset + 2);
             }
             assert_eq!(displays[6].tone, None, "{source:?}");
         }
