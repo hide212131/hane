@@ -372,6 +372,27 @@ mod tests {
         (view, cx)
     }
 
+    /// `open` over an in-memory state store, for tests that toggle settings
+    /// and must not write the shared `settings.conf`.
+    fn open_isolated<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        source: &str,
+    ) -> (TestView, &'a mut TestCx) {
+        cx.update(crate::actions::register_key_bindings);
+        let source = source.to_owned();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled(&source, "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(900.0), px(700.0)));
+        settle(cx);
+        (view, cx)
+    }
+
     fn block_at(view: &TestView, cx: &mut TestCx, offset: usize) -> IndexedBlock {
         view.read_with(cx, |view, _| {
             view.current_index()
@@ -615,7 +636,7 @@ mod tests {
     #[gpui::test]
     fn plain_text_mode_hides_a_stored_failure_note(cx: &mut gpui::TestAppContext) {
         let source = "```mermaid\npie title x\n  \"a\": 1\n```\n";
-        let (view, cx) = open(cx, source);
+        let (view, cx) = open_isolated(cx, source);
         let block = fence_block(&view, cx, source);
         let visual = presented(&view, cx, block.id).expect("presented");
         view.read_with(cx, |view, _| {

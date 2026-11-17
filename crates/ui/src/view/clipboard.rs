@@ -271,6 +271,33 @@ mod tests {
         (view, cx)
     }
 
+    /// `open_view` over an in-memory state store, for tests that toggle
+    /// settings and must not write the shared `settings.conf`.
+    fn open_view_isolated<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        text: &str,
+    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+        let text = text.to_owned();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled(&text, "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            let handle = view.read(app).focus_handle.clone();
+            window.focus(&handle, app);
+        });
+        cx.run_until_parked();
+        set_test_snapshot(None, false, None);
+        (view, cx)
+    }
+
     fn select(
         view: &gpui::Entity<EditorView>,
         cx: &mut gpui::VisualTestContext,
@@ -763,7 +790,7 @@ mod tests {
     /// Markdown display: nothing is inserted and the Undo history is unchanged.
     #[gpui::test]
     fn switching_to_plain_text_mode_drops_a_running_conversion(cx: &mut gpui::TestAppContext) {
-        let (view, cx) = open_view(cx, "ab\n");
+        let (view, cx) = open_view_isolated(cx, "ab\n");
         select(&view, cx, forward(0, 2));
         set_clipboard(cx, "");
         set_test_snapshot(Some("<b>x</b>"), false, None);
