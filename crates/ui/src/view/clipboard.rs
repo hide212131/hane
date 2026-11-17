@@ -707,7 +707,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let id = view.sessions.active_id();
             let instance = view.document_instance(id).unwrap();
-            view.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+            view.tab_close_confirm = Some(TabCloseConfirm {
+                id,
+                instance,
+                generation: 1,
+            });
             cx.notify();
         });
         cx.run_until_parked();
@@ -725,7 +729,11 @@ mod tests {
         view.update(cx, |view, cx| {
             let id = view.sessions.active_id();
             let instance = view.document_instance(id).unwrap();
-            view.tab_close_confirm = Some(TabCloseConfirm { id, instance });
+            view.tab_close_confirm = Some(TabCloseConfirm {
+                id,
+                instance,
+                generation: 1,
+            });
             cx.notify();
         });
         cx.run_until_parked();
