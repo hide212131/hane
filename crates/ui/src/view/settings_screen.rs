@@ -618,6 +618,17 @@ impl EditorView {
                     view.set_plain_text(*checked, cx);
                 });
             });
+        // Independent of the plain-text switch, so it stays usable while the
+        // Markdown display is shown.
+        let syntax_highlight_view = cx.entity();
+        let syntax_highlight = Checkbox::new("settings-syntax-highlight")
+            .checked(self.syntax_highlight())
+            .label("プレーンテキスト表示で Markdown 記法を色分けする")
+            .on_click(move |checked, _window, app| {
+                syntax_highlight_view.update(app, |view, cx| {
+                    view.set_syntax_highlight(*checked, cx);
+                });
+            });
         let store_error = self.settings_store_error.as_ref().map(|error| {
             div()
                 .id("settings-store-error")
@@ -674,7 +685,11 @@ impl EditorView {
                                     .children(theme_buttons),
                             ),
                     )
-                    .child(card("settings-plain-text-card").child(plain_text)),
+                    .child(
+                        card("settings-plain-text-card")
+                            .child(plain_text)
+                            .child(syntax_highlight),
+                    ),
             )
             .child(
                 div()

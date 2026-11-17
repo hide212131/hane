@@ -86,6 +86,40 @@ impl EditorView {
         true
     }
 
+    /// Whether the plain-text display colors Markdown syntax (Issue #738). An
+    /// axis of its own: the value is kept while the Markdown display is shown.
+    pub(crate) fn syntax_highlight(&self) -> bool {
+        self.settings.syntax_highlight
+    }
+
+    /// Turns syntax coloring on or off. Returns whether it is now the requested
+    /// value. Only `style_runs` of the plain display change, never the text,
+    /// the selection or the history. While the Markdown display is shown the
+    /// value is just stored: nothing visible depends on it.
+    pub(crate) fn set_syntax_highlight(&mut self, on: bool, cx: &mut Context<Self>) -> bool {
+        if self.syntax_highlight() == on {
+            return true;
+        }
+        if self.editor_mode_switch_blocked() {
+            // The marked text is neither committed nor dropped here; the
+            // platform ends it, after which the switch is available again.
+            self.status = Some(MODE_SWITCH_BLOCKED_BY_COMPOSITION.to_owned());
+            cx.notify();
+            return false;
+        }
+        self.settings.syntax_highlight = on;
+        if self.plain_text() {
+            // Bold changes where lines wrap, so the layouts and measured
+            // heights go with the cached presentations.
+            self.cancel_text_selection_autoscroll();
+            self.rebuild_presentation_for_mode_change();
+        }
+        // A failed write keeps the change for this run, like the theme.
+        self.store_settings();
+        cx.notify();
+        true
+    }
+
     /// Whether Tab / Shift+Tab may change the text as plain indentation now.
     fn plain_indent_allowed(&self) -> bool {
         self.plain_text()
@@ -293,6 +327,45 @@ mod tests {
         result
     }
 
+    fn set_highlight(view: &TestView, cx: &mut TestCx, on: bool) -> bool {
+        let result = view.update(cx, |view, cx| view.set_syntax_highlight(on, cx));
+        settle(cx);
+        result
+    }
+
+    /// Every cached line's text and runs, in document order.
+    fn cached_lines(
+        view: &TestView,
+        cx: &mut TestCx,
+    ) -> Vec<(u64, String, Vec<hane_presentation::StyleRun>)> {
+        view.read_with(cx, |view, _| {
+            let mut lines = view
+                .block_cache
+                .values()
+                .flat_map(|block| &block.lines)
+                .map(|line| (line.line_id, line.visual_text.clone(), line.style_runs.clone()))
+                .collect::<Vec<_>>();
+            lines.sort_by_key(|(line_id, _, _)| *line_id);
+            lines
+        })
+    }
+
+    fn runs_of(
+        view: &TestView,
+        cx: &mut TestCx,
+        text: &str,
+    ) -> Option<Vec<hane_presentation::StyleRun>> {
+        cached_lines(view, cx)
+            .into_iter()
+            .find(|(_, line, _)| line == text)
+            .map(|(_, _, runs)| runs)
+    }
+
+    fn has_tone(runs: &[hane_presentation::StyleRun], tone: hane_presentation::SyntaxTone) -> bool {
+        runs.iter()
+            .any(|run| run.kind == StyleKind::Syntax(tone))
+    }
+
     fn text_of(view: &TestView, cx: &mut TestCx) -> String {
         view.read_with(cx, |view, _| {
             let document = view.editor().document();
@@ -482,7 +555,7 @@ mod tests {
             settle(cx);
             view.read_with(cx, |view, _| {
                 assert!(view.plain_text());
-                assert_eq!(view.disclosure_policy(), DisclosurePolicy::Plain);
+                assert!(view.disclosure_policy().is_plain());
             });
         }
     }
@@ -502,6 +575,8 @@ mod tests {
     fn plain_rows_show_source_verbatim(cx: &mut gpui::TestAppContext) {
         let (view, cx) = open_view(cx, MIXED, StateStores::memory());
         assert!(set_plain(&view, cx, true));
+        // Coloring only adds runs; with it off the rows carry none.
+        assert!(set_highlight(&view, cx, false));
         view.read_with(cx, |view, _| {
             let document = view.editor().document();
             let mut rows = 0;
@@ -658,5 +733,214 @@ mod tests {
         select(&view, cx, 0, 4);
         press_tab(&view, cx);
         assert_eq!(text_of(&view, cx), "    a\r\n    b\r\nc");
+    }
+
+    #[gpui::test]
+    fn syntax_highlight_toggle_preserves_document_snapshot(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, MIXED, StateStores::memory());
+        view.update(cx, |view, cx| view.insert_text("x", cx));
+        assert!(set_plain(&view, cx, true));
+        let before = snapshot(&view, cx);
+        let text = text_of(&view, cx);
+        let bold = text.find("bold").unwrap() + 2;
+        let fence = text.find("```rust").unwrap() + 1;
+        for (anchor, active) in [(bold, bold), (3, text.len() - 4), (fence, fence)] {
+            select(&view, cx, anchor, active);
+            for on in [false, true, false, true] {
+                assert!(set_highlight(&view, cx, on));
+                assert_eq!(snapshot(&view, cx), before);
+                assert_eq!(text_of(&view, cx), text);
+                assert_eq!(selection_of(&view, cx), (anchor, active));
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn syntax_highlight_toggle_rebuilds_plain_presentation(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "# Heading\n\ntext\n", StateStores::memory());
+        assert!(set_plain(&view, cx, true));
+        let colored = runs_of(&view, cx, "# Heading").expect("heading row drawn");
+        assert!(!colored.is_empty());
+        assert!(set_highlight(&view, cx, false));
+        assert!(runs_of(&view, cx, "# Heading").expect("redrawn").is_empty());
+        assert!(set_highlight(&view, cx, true));
+        assert_eq!(runs_of(&view, cx, "# Heading").expect("redrawn"), colored);
+    }
+
+    #[gpui::test]
+    fn syntax_highlight_toggle_in_projection_mode_changes_nothing_visible(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, MIXED, StateStores::memory());
+        let blocks = |view: &TestView, cx: &mut TestCx| {
+            view.read_with(cx, |view, _| {
+                let mut blocks = view.block_cache.values().cloned().collect::<Vec<_>>();
+                blocks.sort_by_key(|block| block.source_range.start.0);
+                blocks
+            })
+        };
+        let before = blocks(&view, cx);
+        assert!(!before.is_empty());
+        assert!(set_highlight(&view, cx, false));
+        assert_eq!(blocks(&view, cx), before);
+        view.read_with(cx, |view, _| assert!(!view.syntax_highlight()));
+    }
+
+    #[gpui::test]
+    fn projection_mode_never_emits_syntax_tone(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, MIXED, StateStores::memory());
+        view.read_with(cx, |view, _| assert!(view.syntax_highlight()));
+        for mode in [EditorMode::Editing, EditorMode::Reading] {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| {
+                    assert!(view.set_editor_mode(mode, window, cx));
+                });
+            });
+            settle(cx);
+            let lines = cached_lines(&view, cx);
+            assert!(!lines.is_empty());
+            for (_, text, runs) in lines {
+                assert!(
+                    runs.iter()
+                        .all(|run| !matches!(run.kind, StyleKind::Syntax(_))),
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    fn syntax_highlight_toggle_is_refused_while_composing(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "hello\n", StateStores::memory());
+        view.update(cx, |view, _| {
+            view.editor_mut()
+                .replace_and_mark_text(None, "あ", Some(1..1))
+                .unwrap();
+        });
+        assert!(!set_highlight(&view, cx, false));
+        view.read_with(cx, |view, _| {
+            assert!(view.syntax_highlight());
+            assert!(view.editor().ime().is_some(), "the marked text is kept");
+            assert_eq!(
+                view.status.as_deref(),
+                Some(MODE_SWITCH_BLOCKED_BY_COMPOSITION)
+            );
+        });
+    }
+
+    /// Presents the block at `offset` the way a frame does and reports whether
+    /// the cache was reused, with the lines' runs.
+    fn present_at(
+        view: &TestView,
+        cx: &mut TestCx,
+        offset: usize,
+    ) -> (bool, Vec<Vec<hane_presentation::StyleRun>>) {
+        view.update(cx, |view, _| {
+            let indexed = view.block_at_offset(SourceOffset(offset)).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            let (visual, reused) = view.cached_block(&indexed, &span).unwrap();
+            (
+                reused,
+                visual.lines.iter().map(|line| line.style_runs.clone()).collect(),
+            )
+        })
+    }
+
+    #[gpui::test]
+    fn plain_highlight_edit_reparses_only_edited_block(cx: &mut gpui::TestAppContext) {
+        let source = "# one\n\n# two\n";
+        let second = source.find("# two").unwrap();
+        let (view, cx) = open_view(cx, source, StateStores::memory());
+        assert!(set_plain(&view, cx, true));
+        present_at(&view, cx, 0);
+        let (_, second_runs) = present_at(&view, cx, second);
+        assert!(second_runs.iter().any(|runs| !runs.is_empty()));
+
+        select(&view, cx, 5, 5);
+        view.update(cx, |view, cx| view.insert_text("x", cx));
+
+        let (first_reused, first_runs) = present_at(&view, cx, 0);
+        assert!(!first_reused, "the edited block is presented again");
+        assert!(first_runs.iter().any(|runs| !runs.is_empty()));
+        let (second_reused, second_after) = present_at(&view, cx, second + 1);
+        assert!(second_reused, "the other block is reused");
+        assert_eq!(second_after, second_runs);
+    }
+
+    #[gpui::test]
+    fn plain_highlight_block_cache_is_reused_across_frames(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "# one\n\ntext\n", StateStores::memory());
+        assert!(set_plain(&view, cx, true));
+        let (_, first) = present_at(&view, cx, 0);
+        let (reused, second) = present_at(&view, cx, 0);
+        assert!(reused);
+        assert_eq!(first, second);
+    }
+
+    #[gpui::test]
+    fn plain_highlight_typing_keeps_caret_offset(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "**a", StateStores::memory());
+        assert!(set_plain(&view, cx, true));
+        select(&view, cx, 3, 3);
+        let (_, runs) = present_at(&view, cx, 0);
+        assert!(runs.iter().all(|runs| runs.iter().all(|run| run.kind != StyleKind::Bold)));
+        for expected in [4, 5] {
+            view.update(cx, |view, cx| view.insert_text("*", cx));
+            assert_eq!(selection_of(&view, cx), (expected, expected));
+        }
+        assert_eq!(text_of(&view, cx), "**a**");
+        let (_, runs) = present_at(&view, cx, 0);
+        assert!(runs[0].iter().any(|run| run.kind == StyleKind::Bold));
+    }
+
+    #[gpui::test]
+    fn plain_highlight_over_budget_block_uses_window_parse(cx: &mut gpui::TestAppContext) {
+        let source = "- a\n".repeat(4_097);
+        let (view, cx) = open_view(cx, &source, StateStores::memory());
+        assert!(set_plain(&view, cx, true));
+        view.update(cx, |view, _| {
+            let indexed = view.block_at_offset(SourceOffset(0)).unwrap();
+            let span = block_line_span(view.editor().document(), &indexed).unwrap();
+            assert!(!crate::line::block_fits_sync_join_budget(&indexed, &span));
+            let (visual, _) = view.cached_block(&indexed, &(0..20)).unwrap();
+            assert!(!visual.lines.is_empty());
+            for line in &visual.lines {
+                assert_eq!(line.visual_text, "- a");
+                assert!(has_tone(&line.style_runs, hane_presentation::SyntaxTone::Structure));
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn plain_highlight_survives_theme_change(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, MIXED, StateStores::memory());
+        assert!(set_plain(&view, cx, true));
+        let before = cached_lines(&view, cx);
+        assert!(before.iter().any(|(_, _, runs)| !runs.is_empty()));
+        for preference in [ThemePreference::Dark, ThemePreference::Light] {
+            cx.update(|window, app| {
+                view.update(app, |view, cx| view.set_theme(preference, window, cx));
+            });
+            settle(cx);
+            assert_eq!(cached_lines(&view, cx), before, "{preference:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn settings_checkbox_reflects_syntax_highlight(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let stores = StateStores::memory();
+        let (view, cx) = open_view(cx, "body\n", stores.clone());
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        settle(cx);
+        assert!(view.read_with(cx, |view, _| view.settings_open));
+        // What the checkbox's handler calls, without plain-text mode on.
+        for on in [false, true] {
+            assert!(set_highlight(&view, cx, on));
+            view.read_with(cx, |view, _| assert_eq!(view.syntax_highlight(), on));
+            assert_eq!(stores.settings().load().syntax_highlight, on);
+        }
     }
 }

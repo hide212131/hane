@@ -17,11 +17,14 @@ use gpui::{
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
-use hane_markdown::{FenceHeightProjection, IndexedBlock, ListProjection, TableProjection};
+use hane_markdown::{
+    FenceHeightProjection, IndexedBlock, ListProjection, NodeKind, TableProjection, fence_closes,
+    fence_closing_delimiter, fence_delimiter,
+};
 use hane_presentation::{
     BlockDisplay, BlockKind, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
     BlockWindow, DiagramPlan, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap,
-    QUOTE_BAR_WIDTH, TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset,
+    PlainCodeBlock, PlainHighlightInput, QUOTE_BAR_WIDTH, SyntaxTone, TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset,
     apply_diagram, block_is_joinable, block_line_context, block_line_span, diagram_display_size,
     expected_disclosures, present_block_plain, present_block_with_table_projection,
     trailing_blank_lines,
@@ -54,7 +57,7 @@ fn range_disclosure(
     forced: Option<SourceRange>,
     policy: DisclosurePolicy,
 ) -> Option<SourceRange> {
-    if matches!(policy, DisclosurePolicy::Reading | DisclosurePolicy::Plain) {
+    if policy == DisclosurePolicy::Reading || policy.is_plain() {
         return None;
     }
     let selection = editor.selection().range();
@@ -131,6 +134,17 @@ pub(crate) enum DisclosurePolicy {
     /// Plain-text mode (Issue #737): the source lines are shown verbatim, so
     /// there is nothing to disclose and no structure to collapse.
     Plain,
+    /// [`Self::Plain`] with Markdown syntax coloring (Issue #738). The text,
+    /// source maps, kinds and heights are exactly those of `Plain`; only the
+    /// blocks' `style_runs` differ.
+    PlainHighlighted,
+}
+
+impl DisclosurePolicy {
+    /// Whether the source lines are shown verbatim, colored or not.
+    pub(crate) const fn is_plain(self) -> bool {
+        matches!(self, Self::Plain | Self::PlainHighlighted)
+    }
 }
 
 /// Borrowed inputs for one [`presented_block`] call.
@@ -187,8 +201,14 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
         line_height,
         disclosure_policy,
     } = request;
-    if disclosure_policy == DisclosurePolicy::Plain {
-        return presented_block_plain(editor, block, visible, line_height);
+    if disclosure_policy.is_plain() {
+        return presented_block_plain(
+            editor,
+            block,
+            visible,
+            line_height,
+            disclosure_policy == DisclosurePolicy::PlainHighlighted,
+        );
     }
     let document = editor.document();
     let span = block_line_span(document, block)?;
@@ -233,11 +253,19 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
 /// Plain-text presentation of the lines of `block` that reach `visible`: the
 /// source of each physical line verbatim, with no joined parse, list, fence,
 /// table or diagram handling and no disclosure.
+///
+/// With `syntax_highlight` the lines also get `style_runs` (Issue #738), from
+/// one parse of the block's content lines. A top-level code block is never
+/// parsed: its fence and content lines are classified from its shape alone, so
+/// a huge one costs two extra line reads. A block past the synchronous budget
+/// is classified from the presented lines only, so its coloring may differ from
+/// a whole-block parse; the text is never affected.
 fn presented_block_plain(
     editor: &Editor,
     block: &IndexedBlock,
     visible: &Range<usize>,
     line_height: f32,
+    syntax_highlight: bool,
 ) -> Option<VisualBlock> {
     let document = editor.document();
     let span = block_line_span(document, block)?;
@@ -263,6 +291,56 @@ fn presented_block_plain(
             disclosure: None,
         })
         .collect::<Vec<_>>();
+    let content_end = if syntax_highlight {
+        span.end
+            .saturating_sub(trailing_blank_lines(document, &span))
+    } else {
+        span.end
+    };
+    // Every content line of a block within the synchronous budget, so a
+    // construct that crosses the presented window still resolves.
+    let content_rows = (syntax_highlight
+        && block.kind != NodeKind::CodeBlock
+        && block_fits_sync_join_budget(block, &span))
+    .then(|| {
+        (span.start..content_end)
+            .map(|line| {
+                let range = document.line_range(LineId(line)).ok()?;
+                let range = SourceRange::new(
+                    range.start.0.max(block_range.start.0),
+                    range.end.0.min(block_range.end.0),
+                );
+                Some((line, range, document.text(range).unwrap_or_default()))
+            })
+            .collect::<Option<Vec<_>>>()
+    })
+    .flatten();
+    let content_lines = content_rows
+        .iter()
+        .flatten()
+        .map(|(line, range, text)| BlockLine {
+            line: *line,
+            range: *range,
+            text,
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    let highlight = if !syntax_highlight {
+        None
+    } else if block.kind == NodeKind::CodeBlock {
+        Some(PlainHighlightInput::Code(plain_code_block(
+            editor,
+            block,
+            &span,
+            content_end,
+        )))
+    } else if content_rows.is_some() {
+        Some(PlainHighlightInput::Parse {
+            lines: &content_lines,
+        })
+    } else {
+        Some(PlainHighlightInput::Parse { lines: &lines })
+    };
     Some(present_block_plain(
         block,
         document.revision(),
@@ -279,7 +357,48 @@ fn presented_block_plain(
             block_disclosure: None,
         },
         line_height,
+        highlight.as_ref(),
     ))
+}
+
+/// Shape of a top-level code block for [`present_block_plain`]: its opening
+/// fence line, the line that closes it and where its content ends. Reads at
+/// most two lines, whatever the size of the block.
+fn plain_code_block(
+    editor: &Editor,
+    block: &IndexedBlock,
+    span: &Range<usize>,
+    content_end: usize,
+) -> PlainCodeBlock {
+    let document = editor.document();
+    let block_range = block.source_range;
+    let read = |line: usize| -> Option<String> {
+        let range = document.line_range(LineId(line)).ok()?;
+        let range = SourceRange::new(
+            range.start.0.max(block_range.start.0),
+            range.end.0.min(block_range.end.0),
+        );
+        document.text(range).ok()
+    };
+    let opening_line = span.start.saturating_add(block.leading_content_lines);
+    let opening = (opening_line < span.end)
+        .then(|| read(opening_line))
+        .flatten()
+        .and_then(|text| fence_delimiter(&text).map(|delimiter| (opening_line, delimiter)));
+    let closing_line = content_end
+        .checked_sub(1)
+        .filter(|closing| *closing >= span.start && *closing < span.end)
+        .filter(|closing| Some(*closing) != opening.map(|(line, _)| line))
+        .and_then(|closing| {
+            let (_, opening_delimiter) = opening?;
+            let closing_delimiter = fence_closing_delimiter(&read(closing)?)?;
+            fence_closes(opening_delimiter, closing_delimiter).then_some(closing)
+        });
+    PlainCodeBlock {
+        opening,
+        closing_line,
+        content_end,
+    }
 }
 
 /// [`presented_block`], showing the block as a rendered diagram when `diagram`
@@ -294,8 +413,7 @@ pub(crate) fn presented_block_with_diagram(
     request: BlockPresentationRequest<'_>,
     diagram: Option<&DiagramPlan>,
 ) -> Option<VisualBlock> {
-    let Some(plan) = diagram.filter(|_| request.disclosure_policy != DisclosurePolicy::Plain)
-    else {
+    let Some(plan) = diagram.filter(|_| !request.disclosure_policy.is_plain()) else {
         return presented_block(request);
     };
     let span = block_line_span(request.editor.document(), request.block)?;
@@ -317,7 +435,7 @@ pub(crate) fn lines_are_disclosed(
     forced: Option<SourceRange>,
     policy: DisclosurePolicy,
 ) -> bool {
-    if matches!(policy, DisclosurePolicy::Reading | DisclosurePolicy::Plain) {
+    if policy == DisclosurePolicy::Reading || policy.is_plain() {
         return false;
     }
     let document = editor.document();
@@ -1088,6 +1206,11 @@ pub(crate) fn row_element(
                     .when(segment_shows_code_background(segment), |element| {
                         element.text_bg(rgb(theme.code_background))
                     })
+                    // Before the link color, so a link (hover included) wins if
+                    // both are ever set on one stretch.
+                    .when_some(segment_syntax_tone(segment), |element, tone| {
+                        element.text_color(rgb(syntax_tone_color(&theme, tone)))
+                    })
                     .when(segment.display.link_color, |element| {
                         element.text_color(rgb(link_text_color(theme, segment.link_hover)))
                     })
@@ -1482,6 +1605,31 @@ fn link_text_color(theme: Theme, hovered: bool) -> u32 {
         theme.link_hover_foreground
     } else {
         theme.link_foreground
+    }
+}
+
+/// Foreground for a plain-text syntax role. The one place a role becomes a
+/// color: presentation only names the role.
+pub(crate) const fn syntax_tone_color(theme: &Theme, tone: SyntaxTone) -> u32 {
+    match tone {
+        SyntaxTone::Heading => theme.syntax_heading,
+        SyntaxTone::HeadingMinor => theme.syntax_heading_minor,
+        SyntaxTone::Code => theme.syntax_code,
+        SyntaxTone::Structure => theme.syntax_structure,
+        SyntaxTone::Link => theme.link_foreground,
+        SyntaxTone::Punctuation | SyntaxTone::Quote => theme.quote_foreground,
+    }
+}
+
+/// The syntax role a segment is drawn in. A document-find background (current
+/// or other match) is not readable under the syntax colors, so a stretch it
+/// paints goes back to the body color, as it was before coloring existed; a
+/// selected stretch keeps its color because the selection background wins there.
+fn segment_syntax_tone(segment: &LineSegment) -> Option<SyntaxTone> {
+    if !segment.selected && segment.find_match {
+        None
+    } else {
+        segment.display.tone
     }
 }
 
@@ -1981,6 +2129,160 @@ mod tests {
         assert_eq!(link_text_color(crate::theme::DEFAULT_THEME, true), 0x0066ff);
         assert_eq!(link_text_color(crate::theme::DARK_THEME, false), 0x79b8ff);
         assert_eq!(link_text_color(crate::theme::DARK_THEME, true), 0x40c8ff);
+    }
+
+    #[test]
+    fn syntax_tone_color_maps_every_tone_in_both_themes() {
+        use crate::theme::{DARK_THEME, DEFAULT_THEME};
+        let light = |tone| syntax_tone_color(&DEFAULT_THEME, tone);
+        let dark = |tone| syntax_tone_color(&DARK_THEME, tone);
+        assert_eq!(light(SyntaxTone::Heading), 0x9a3f1c);
+        assert_eq!(light(SyntaxTone::HeadingMinor), 0x7a4a2e);
+        assert_eq!(light(SyntaxTone::Code), 0x2a6b57);
+        assert_eq!(light(SyntaxTone::Structure), 0x9a3f1c);
+        assert_eq!(light(SyntaxTone::Link), 0x2867a9);
+        assert_eq!(light(SyntaxTone::Punctuation), 0x6b6259);
+        assert_eq!(light(SyntaxTone::Quote), 0x6b6259);
+        assert_eq!(dark(SyntaxTone::Heading), 0xf0a36b);
+        assert_eq!(dark(SyntaxTone::HeadingMinor), 0xd9b08c);
+        assert_eq!(dark(SyntaxTone::Code), 0x8fcbb4);
+        assert_eq!(dark(SyntaxTone::Structure), 0xf0a36b);
+        assert_eq!(dark(SyntaxTone::Link), 0x79b8ff);
+        assert_eq!(dark(SyntaxTone::Punctuation), 0xaaa39a);
+        assert_eq!(dark(SyntaxTone::Quote), 0xaaa39a);
+    }
+
+    fn toned_segment(selected: bool, find_match: bool, tone: Option<SyntaxTone>) -> LineSegment {
+        LineSegment {
+            visual_range: 0..1,
+            selected,
+            marked: false,
+            cursor_before: false,
+            find_match,
+            find_current_match: false,
+            display: InlineDisplay {
+                tone,
+                ..InlineDisplay::default()
+            },
+            link_hover: false,
+        }
+    }
+
+    #[test]
+    fn syntax_tone_is_suppressed_on_find_match() {
+        let tone = Some(SyntaxTone::Heading);
+        assert_eq!(segment_syntax_tone(&toned_segment(false, true, tone)), None);
+        assert_eq!(segment_syntax_tone(&toned_segment(true, true, tone)), tone);
+        assert_eq!(segment_syntax_tone(&toned_segment(false, false, tone)), tone);
+        assert_eq!(segment_syntax_tone(&toned_segment(false, false, None)), None);
+    }
+
+    #[test]
+    fn line_segments_split_at_syntax_run_edges() {
+        // `# a`: the marker is Punctuation, the text is Heading and bold.
+        let runs = [
+            style_run(
+                0..2,
+                hane_presentation::StyleKind::Syntax(SyntaxTone::Punctuation),
+            ),
+            style_run(
+                2..3,
+                hane_presentation::StyleKind::Syntax(SyntaxTone::Heading),
+            ),
+            style_run(2..3, hane_presentation::StyleKind::Bold),
+        ];
+        let segments = line_segments(
+            0..3,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &runs,
+            None,
+        );
+        let split = segments
+            .iter()
+            .map(|segment| {
+                (
+                    segment.visual_range.clone(),
+                    segment.display.tone,
+                    segment.display.bold,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            split,
+            vec![
+                (0..2, Some(SyntaxTone::Punctuation), false),
+                (2..3, Some(SyntaxTone::Heading), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn plain_highlight_large_code_block_is_exact() {
+        use hane_presentation::{StyleKind, StyleRun, VisualRange};
+        let content = "let x = 1;";
+        let mut source = String::from("```rust\n");
+        for _ in 0..10_000 {
+            source.push_str(content);
+            source.push('\n');
+        }
+        source.push_str("```\n");
+        let editor = Editor::new(&source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("code block");
+        assert_eq!(block.kind, NodeKind::CodeBlock);
+        let present = |visible: Range<usize>| {
+            presented_block(BlockPresentationRequest {
+                editor: &editor,
+                block: &block,
+                visible: &visible,
+                joined: None,
+                list_projection: None,
+                fence_height_projection: None,
+                table_projection: None,
+                forced_disclosure: None,
+                line_height: DEFAULT_LINE_HEIGHT,
+                disclosure_policy: DisclosurePolicy::PlainHighlighted,
+            })
+            .expect("block presents")
+        };
+        let run = |start: usize, end: usize, tone: SyntaxTone| StyleRun {
+            visual_range: VisualRange::new(start, end),
+            kind: StyleKind::Syntax(tone),
+        };
+
+        // Somewhere in the middle: all content, however far from the fences.
+        let middle = present(5_000..5_010);
+        assert_eq!(middle.lines.len(), 10);
+        for line in &middle.lines {
+            assert_eq!(line.visual_text, content);
+            assert_eq!(line.style_runs, vec![run(0, content.len(), SyntaxTone::Code)]);
+        }
+        // The opening fence: delimiter dimmed, language name a structure color.
+        let top = present(0..2);
+        assert_eq!(
+            top.lines[0].style_runs,
+            vec![
+                run(0, 3, SyntaxTone::Punctuation),
+                run(3, 7, SyntaxTone::Structure)
+            ]
+        );
+        assert_eq!(
+            top.lines[1].style_runs,
+            vec![run(0, content.len(), SyntaxTone::Code)]
+        );
+        // The closing fence, found without reading the lines in between.
+        let end = present(10_001..10_002);
+        assert_eq!(end.lines[0].visual_text, "```");
+        assert_eq!(
+            end.lines[0].style_runs,
+            vec![run(0, 3, SyntaxTone::Punctuation)]
+        );
     }
 
     #[test]

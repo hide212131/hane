@@ -15,6 +15,36 @@ pub enum StyleKind {
     Image,
     Table,
     MarkedText,
+    /// Role of a stretch of plain-text source (Issue #738). Carries no flags
+    /// besides the tone; the UI resolves the tone to a theme color.
+    Syntax(SyntaxTone),
+}
+
+/// Syntax role in the plain-text presentation. A role, not a color — the same
+/// idea as [`BlockTint`]: the UI picks the color from the theme.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyntaxTone {
+    Quote,
+    Heading,
+    HeadingMinor,
+    Link,
+    Code,
+    Punctuation,
+    Structure,
+}
+
+impl SyntaxTone {
+    /// Which role wins when several cover the same text; the larger rank wins.
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Quote => 1,
+            Self::Heading | Self::HeadingMinor => 2,
+            Self::Link => 3,
+            Self::Code => 4,
+            Self::Punctuation => 5,
+            Self::Structure => 6,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,12 +89,26 @@ pub struct InlineDisplay {
     pub underline: bool,
     /// Draw the text in the theme's link color.
     pub link_color: bool,
+    /// Plain-text syntax role the UI maps to a theme color.
+    pub tone: Option<SyntaxTone>,
 }
 
 impl InlineDisplay {
     #[must_use]
     pub const fn union(self, other: Self) -> Self {
+        let tone = match (self.tone, other.tone) {
+            (Some(a), Some(b)) => {
+                if b.rank() > a.rank() {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
+            }
+            (Some(a), None) => Some(a),
+            (None, theirs) => theirs,
+        };
         Self {
+            tone,
             bold: self.bold || other.bold,
             italic: self.italic || other.italic,
             strikethrough: self.strikethrough || other.strikethrough,
@@ -93,8 +137,13 @@ impl StyleKind {
             code_background: false,
             underline: false,
             link_color: false,
+            tone: None,
         };
         match self {
+            Self::Syntax(tone) => InlineDisplay {
+                tone: Some(tone),
+                ..base
+            },
             Self::Bold => InlineDisplay { bold: true, ..base },
             Self::Italic => InlineDisplay {
                 italic: true,
@@ -918,5 +967,78 @@ mod tests {
     #[test]
     fn fenced_code_rows_use_the_normal_line_height() {
         assert_eq!(code_line_height(26.0), 26.0);
+    }
+
+    const ALL_TONES: [SyntaxTone; 7] = [
+        SyntaxTone::Quote,
+        SyntaxTone::Heading,
+        SyntaxTone::HeadingMinor,
+        SyntaxTone::Link,
+        SyntaxTone::Code,
+        SyntaxTone::Punctuation,
+        SyntaxTone::Structure,
+    ];
+
+    #[test]
+    fn syntax_style_sets_only_tone() {
+        for tone in ALL_TONES {
+            let display = StyleKind::Syntax(tone).display();
+            assert_eq!(
+                display,
+                InlineDisplay {
+                    tone: Some(tone),
+                    ..InlineDisplay::default()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn union_keeps_higher_ranked_tone() {
+        for a in ALL_TONES {
+            for b in ALL_TONES {
+                let left = StyleKind::Syntax(a)
+                    .display()
+                    .union(StyleKind::Syntax(b).display());
+                let right = StyleKind::Syntax(b)
+                    .display()
+                    .union(StyleKind::Syntax(a).display());
+                let expected = if b.rank() > a.rank() { b } else { a };
+                assert_eq!(left.tone, Some(expected), "{a:?} then {b:?}");
+                if a.rank() != b.rank() {
+                    assert_eq!(right.tone, Some(expected), "{b:?} then {a:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn union_keeps_flags_with_tone() {
+        let display = InlineDisplay::for_styles([
+            StyleKind::Bold,
+            StyleKind::Syntax(SyntaxTone::Heading),
+        ]);
+        assert!(display.bold);
+        assert_eq!(display.tone, Some(SyntaxTone::Heading));
+        let none = StyleKind::Bold.display().union(InlineDisplay::default());
+        assert!(none.bold);
+        assert_eq!(none.tone, None);
+    }
+
+    #[test]
+    fn existing_style_kinds_have_no_tone() {
+        for kind in [
+            StyleKind::Bold,
+            StyleKind::Italic,
+            StyleKind::Strikethrough,
+            StyleKind::InlineCode,
+            StyleKind::CodeBlock,
+            StyleKind::Link,
+            StyleKind::Image,
+            StyleKind::Table,
+            StyleKind::MarkedText,
+        ] {
+            assert_eq!(kind.display().tone, None, "{kind:?}");
+        }
     }
 }

@@ -275,6 +275,101 @@ mod tests {
         });
     }
 
+    /// Presents the first block of `source` in plain-text mode, with or without
+    /// syntax coloring.
+    fn plain_line(source: &str, highlighted: bool) -> VisualLine {
+        let editor = Editor::new(source);
+        let index = BlockIndex::from_buffer(editor.document());
+        let block = index.blocks().next().expect("one block");
+        let visual = presented_block(BlockPresentationRequest {
+            editor: &editor,
+            block: &block,
+            visible: &(0..usize::MAX),
+            joined: None,
+            list_projection: None,
+            fence_height_projection: None,
+            table_projection: None,
+            forced_disclosure: None,
+            line_height: DEFAULT_LINE_HEIGHT,
+            disclosure_policy: if highlighted {
+                DisclosurePolicy::PlainHighlighted
+            } else {
+                DisclosurePolicy::Plain
+            },
+        })
+        .expect("block presents");
+        visual.lines[0].clone()
+    }
+
+    #[gpui::test]
+    fn plain_highlight_bold_reaches_shape_runs(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+
+        cx.update(|window, _| {
+            let shaper = WindowShaper::new(window, 1.0);
+            let line = plain_line("# 見出し **b**", true);
+            let range_of = |needle: &str| {
+                let start = line.visual_text.find(needle).expect("needle present");
+                start..start + needle.len()
+            };
+            let family = shaper.style.font().family;
+
+            let text = shaper.runs(&line, &range_of("見出し"));
+            assert!(!text.is_empty());
+            assert!(text.iter().all(|run| run.font.weight == FontWeight::BOLD));
+            let marker = shaper.runs(&line, &range_of("# "));
+            assert!(marker.iter().all(|run| run.font.weight != FontWeight::BOLD));
+            let all = shaper.runs(&line, &(0..line.visual_text.len()));
+            assert!(all.iter().all(|run| run.font.family == family));
+        });
+    }
+
+    #[gpui::test]
+    fn plain_highlight_does_not_move_color_only_glyphs(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+
+        cx.update(|window, _| {
+            let shaper = WindowShaper::new(window, 1.0);
+            for source in ["a `b` c", "- a"] {
+                let plain = plain_line(source, false);
+                let colored = plain_line(source, true);
+                assert!(!colored.style_runs.is_empty(), "{source:?} gets colored");
+                assert_eq!(plain.visual_text, colored.visual_text);
+                let len = plain.visual_text.len();
+                for offset in 0..=len {
+                    if !source.is_char_boundary(offset) {
+                        continue;
+                    }
+                    let before = shaper.x_for_offset(&plain, 0..len, offset);
+                    let after = shaper.x_for_offset(&colored, 0..len, offset);
+                    assert!(
+                        (before - after).abs() < 0.01,
+                        "{source:?} offset {offset}: {before} vs {after}"
+                    );
+                }
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn plain_heading_caret_x_matches_painted_text(cx: &mut gpui::TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, cx| EditorView::new("", "Untitled", cx));
+
+        cx.update(|window, _| {
+            let shaper = WindowShaper::new(window, 1.0);
+            let source = "# 見出し";
+            let line = plain_line(source, true);
+            let len = line.visual_text.len();
+            for offset in 0..=len {
+                if !source.is_char_boundary(offset) {
+                    continue;
+                }
+                let x = shaper.x_for_offset(&line, 0..len, offset);
+                assert_eq!(shaper.offset_for_x(&line, 0..len, x), offset, "offset {offset}");
+            }
+        });
+    }
+
     #[gpui::test]
     fn disclosed_table_header_uses_the_same_semibold_metrics_as_painted_text(
         cx: &mut gpui::TestAppContext,

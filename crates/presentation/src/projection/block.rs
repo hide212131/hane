@@ -1,4 +1,5 @@
 use super::*;
+use super::highlight::{PlainCodeBlock, PlainHighlight, PlainHighlightInput, plain_code_line_runs};
 use crate::display::{block_display_kind, block_is_joinable, block_line_context};
 
 pub fn block_line_span(document: &RopeBuffer, block: &IndexedBlock) -> Option<Range<usize>> {
@@ -140,14 +141,32 @@ pub fn plain_block_height(
 /// Nothing is hidden, converted or disclosed: every line is the raw source of
 /// its physical line (without the line ending) through an identity source map,
 /// and the block is [`BlockKind::Unsupported`] so layout takes the ordinary text
-/// path even for a table. `style_runs` stay empty; this is the single place a
-/// source highlighter can attach styling later.
+/// path even for a table. `style_runs` stay empty unless `highlight` asks for
+/// syntax coloring (Issue #738); that is the only thing it changes, so the text,
+/// source maps, kinds and heights are identical with and without it.
 pub fn present_block_plain(
     block: &IndexedBlock,
     revision: Revision,
     window: &BlockWindow<'_>,
     line_height: f32,
+    highlight: Option<&PlainHighlightInput<'_>>,
 ) -> VisualBlock {
+    enum Prepared {
+        Off,
+        Parsed(PlainHighlight),
+        Code(PlainCodeBlock),
+    }
+    let prepared = match highlight {
+        Some(PlainHighlightInput::Parse { lines }) if !lines.is_empty() => {
+            let joined = parse_joined_block(lines, revision);
+            Prepared::Parsed(PlainHighlight::from_parse(
+                &joined.parsed,
+                &joined.joined_source,
+            ))
+        }
+        Some(PlainHighlightInput::Code(code)) => Prepared::Code(*code),
+        Some(PlainHighlightInput::Parse { .. }) | None => Prepared::Off,
+    };
     let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
     for line in window
         .lines
@@ -164,6 +183,25 @@ pub fn present_block_plain(
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
         }
+        // The runs are cut by the line's content range, which is only known
+        // once the line ending is gone.
+        let mut runs = match &prepared {
+            Prepared::Off => Vec::new(),
+            Prepared::Parsed(parsed) => parsed.style_runs_for_line(SourceRange::new(
+                line.range.start.0,
+                line.range.start.0 + presented.visual_text.len(),
+            )),
+            Prepared::Code(code) => plain_code_line_runs(code, line.line, &presented.visual_text),
+        };
+        let text = &presented.visual_text;
+        runs.retain(|run| {
+            let (start, end) = (run.visual_range.start.0, run.visual_range.end.0);
+            start < end
+                && end <= text.len()
+                && text.is_char_boundary(start)
+                && text.is_char_boundary(end)
+        });
+        presented.style_runs = runs;
         lines.push(presented);
     }
     let lines_before = lines.first().map_or(0, |line| {

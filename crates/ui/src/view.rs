@@ -5417,13 +5417,15 @@ fn neighbor_block_window_from(
                 .ime()
                 .map(|ime| ime.current_range)
                 .or_else(|| Some(editor.selection().range())),
-            DisclosurePolicy::Reading | DisclosurePolicy::Plain => None,
+            DisclosurePolicy::Reading
+            | DisclosurePolicy::Plain
+            | DisclosurePolicy::PlainHighlighted => None,
         };
         // Preserve tiled trailing blank lines as navigable rows. Only fall
         // back to the table's last formal row when the physical last line is
         // itself a collapsed delimiter (the header-only table edge case).
         // Plain-text mode collapses nothing, so every physical line is a row.
-        let hidden_delimiter_is_last_line = policy != DisclosurePolicy::Plain
+        let hidden_delimiter_is_last_line = !policy.is_plain()
             && index
             .and_then(|index| index.table_projection(&indexed))
             .and_then(|projection| {

@@ -36,6 +36,14 @@ pub(crate) struct Theme {
     /// Foreground of the link under the pointer. Only the colour changes.
     pub link_hover_foreground: u32,
     pub quote_foreground: u32,
+    /// Plain-text syntax colors (Issue #738): H1 and H2 text.
+    pub syntax_heading: u32,
+    /// H3 to H6 text.
+    pub syntax_heading_minor: u32,
+    /// Inline code and code block content.
+    pub syntax_code: u32,
+    /// List markers, quote markers, task checkboxes and fence language names.
+    pub syntax_structure: u32,
     pub media_background: u32,
     pub table_background: u32,
     pub table_header_background: u32,
@@ -69,6 +77,10 @@ pub(crate) const DEFAULT_THEME: Theme = Theme {
     link_foreground: 0x2867a9,
     link_hover_foreground: 0x0066ff,
     quote_foreground: 0x6b6259,
+    syntax_heading: 0x9a3f1c,
+    syntax_heading_minor: 0x7a4a2e,
+    syntax_code: 0x2a6b57,
+    syntax_structure: 0x9a3f1c,
     media_background: 0xf3f0eb,
     table_background: 0xf5f2ed,
     table_header_background: 0xe9e4dc,
@@ -102,6 +114,10 @@ pub(crate) const DARK_THEME: Theme = Theme {
     link_foreground: 0x79b8ff,
     link_hover_foreground: 0x40c8ff,
     quote_foreground: 0xaaa39a,
+    syntax_heading: 0xf0a36b,
+    syntax_heading_minor: 0xd9b08c,
+    syntax_code: 0x8fcbb4,
+    syntax_structure: 0xf0a36b,
     media_background: 0x292a2d,
     table_background: 0x27282b,
     table_header_background: 0x34363a,
@@ -170,6 +186,47 @@ mod tests {
         ThemePreference::Dark,
         ThemePreference::System,
     ];
+
+    /// WCAG 2.x relative luminance of a `0xRRGGBB` color.
+    fn luminance(rgb: u32) -> f64 {
+        let channel = |shift: u32| {
+            let value = f64::from((rgb >> shift) & 0xff) / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
+    }
+
+    fn contrast(a: u32, b: u32) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    #[test]
+    fn syntax_colors_keep_contrast() {
+        use crate::line::syntax_tone_color;
+        use hane_presentation::SyntaxTone;
+        for theme in [DEFAULT_THEME, DARK_THEME] {
+            for tone in [
+                SyntaxTone::Quote,
+                SyntaxTone::Heading,
+                SyntaxTone::HeadingMinor,
+                SyntaxTone::Link,
+                SyntaxTone::Code,
+                SyntaxTone::Punctuation,
+                SyntaxTone::Structure,
+            ] {
+                let color = syntax_tone_color(&theme, tone);
+                let on_background = contrast(color, theme.editor_background);
+                let on_selection = contrast(color, theme.selection_background);
+                assert!(on_background >= 4.5, "{tone:?} on background: {on_background}");
+                assert!(on_selection >= 3.0, "{tone:?} on selection: {on_selection}");
+            }
+        }
+    }
 
     #[test]
     fn resolves_dark_matches_explicit_preferences() {

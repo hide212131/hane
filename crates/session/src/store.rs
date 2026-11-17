@@ -78,6 +78,10 @@ pub struct Settings {
     /// projection (`plain_text_mode` key, Issue #737). A missing or invalid
     /// value means `false`.
     pub plain_text_mode: bool,
+    /// Whether the plain-text display colors Markdown syntax
+    /// (`syntax_highlight` key, Issue #738). Independent of
+    /// `plain_text_mode`. A missing or invalid value means `true`.
+    pub syntax_highlight: bool,
 }
 
 impl Default for Settings {
@@ -90,6 +94,7 @@ impl Default for Settings {
             network: NetworkConfig::default(),
             auto_update_check: true,
             plain_text_mode: false,
+            syntax_highlight: true,
         }
     }
 }
@@ -475,12 +480,13 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
             settings.auto_update_check,
-            settings.plain_text_mode
+            settings.plain_text_mode,
+            settings.syntax_highlight
         );
         if let Some(folder) = &settings.default_folder {
             contents.push_str("default_folder=");
@@ -527,6 +533,8 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.auto_update_check = value == "true";
                 } else if let Some(value) = line.strip_prefix("plain_text_mode=") {
                     settings.plain_text_mode = value == "true";
+                } else if let Some(value) = line.strip_prefix("syntax_highlight=") {
+                    settings.syntax_highlight = value != "false";
                 }
             }
             settings.network = parse_network_config(network);
@@ -884,6 +892,7 @@ mod tests {
             network: NetworkConfig::default(),
             auto_update_check: false,
             plain_text_mode: true,
+            syntax_highlight: false,
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -1092,6 +1101,7 @@ mod tests {
                     network: NetworkConfig::default(),
                     auto_update_check: true,
                     plain_text_mode: false,
+                    syntax_highlight: true,
                 })
                 .unwrap();
         }
@@ -1162,6 +1172,39 @@ mod tests {
         for value in ["yes", "", "TRUE", "1"] {
             let loaded = load_after_writing(&format!("plain_text_mode={value}\n"));
             assert!(!loaded.plain_text_mode, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn syntax_highlight_survives_a_store_reload() {
+        let root = temporary_directory("state-syntax-highlight-round-trip");
+        let store = FileStateStore::at(&root);
+        for enabled in [false, true] {
+            let settings = Settings {
+                syntax_highlight: enabled,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+            assert!(text.contains(&format!("syntax_highlight={enabled}\n")));
+            let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+            assert_eq!(loaded.syntax_highlight, enabled);
+            assert_eq!(loaded, settings);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn missing_syntax_highlight_key_defaults_to_true() {
+        let loaded = load_after_writing("autosave=false\ntheme=dark\n");
+        assert!(loaded.syntax_highlight);
+    }
+
+    #[test]
+    fn unknown_syntax_highlight_value_defaults_to_true() {
+        for value in ["maybe", "", "FALSE", "0"] {
+            let loaded = load_after_writing(&format!("syntax_highlight={value}\n"));
+            assert!(loaded.syntax_highlight, "value {value:?}");
         }
     }
 

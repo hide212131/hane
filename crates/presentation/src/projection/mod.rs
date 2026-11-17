@@ -24,6 +24,9 @@ use hane_markdown::{
 use hane_markdown::{BlockId, Confidence};
 use std::ops::Range;
 
+mod highlight;
+pub use highlight::{PlainCodeBlock, PlainHighlight, PlainHighlightInput, plain_code_line_runs};
+
 mod block;
 pub use block::{
     BlockLine, BlockWindow, block_height_with_disclosure, block_heights,
