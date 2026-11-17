@@ -945,11 +945,28 @@ mod tests {
         });
         settle(cx);
         assert!(view.read_with(cx, |view, _| view.settings_open));
-        // What the checkbox's handler calls, without plain-text mode on.
-        for on in [false, true] {
-            assert!(set_highlight(&view, cx, on));
-            view.read_with(cx, |view, _| assert_eq!(view.syntax_highlight(), on));
-            assert_eq!(stores.settings().load().syntax_highlight, on);
+        // The checkbox itself has no debug selector, so aim at it through its
+        // card: it is the last row, inset by the card's border and padding.
+        // Plain-text mode stays off, as the checkbox is usable without it.
+        let plain_before = view.read_with(cx, |view, _| view.plain_text());
+        for _ in 0..2 {
+            let before = view.read_with(cx, |view, _| view.syntax_highlight());
+            let card = cx
+                .debug_bounds("settings-plain-text-card")
+                .expect("the plain-text settings card is laid out");
+            let target = gpui::point(card.left() + px(25.0), card.bottom() - px(24.0));
+            cx.simulate_click(target, gpui::Modifiers::none());
+            settle(cx);
+            let expected = !before;
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.syntax_highlight(), expected);
+                assert_eq!(
+                    view.plain_text(),
+                    plain_before,
+                    "the click must hit the syntax-highlight checkbox only"
+                );
+            });
+            assert_eq!(stores.settings().load().syntax_highlight, expected);
         }
     }
 }
