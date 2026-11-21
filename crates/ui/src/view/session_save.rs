@@ -2,13 +2,16 @@ use super::*;
 
 /// Records that `session`'s file now lives at `path` under a name derived
 /// from `title`. A name derived from Front Matter also records the stem the
-/// file actually got, so a collision-avoiding `… 2` stays tracked.
+/// file actually got, so a collision-avoiding `… 2` stays tracked. A session
+/// that is already tracked (has an `auto_stem`) keeps recording the real stem
+/// even if its Front Matter was removed since.
 fn note_auto_named_at(session: &mut DocumentSession, title: String, path: &Path) {
     let stem = path.file_stem().and_then(|stem| stem.to_str());
-    let has_front_matter =
-        hane_markdown::recognize_front_matter(&session.editor().document().full_text()).is_some();
+    let records_stem = session.auto_stem().is_some()
+        || hane_markdown::recognize_front_matter(&session.editor().document().full_text())
+            .is_some();
     match stem {
-        Some(stem) if has_front_matter => {
+        Some(stem) if records_stem => {
             session.note_auto_named_with_stem(title, stem.to_owned());
         }
         _ => session.note_auto_named(title),
@@ -1207,6 +1210,40 @@ mod tests {
             std::process::id(),
             SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    // Issue #751: a tracked session whose Front Matter was removed still
+    // records the stem it actually got (e.g. a collision-numbered `… 2`).
+    #[test]
+    fn tracked_session_without_front_matter_keeps_recording_real_stem() {
+        let root = rename_test_root("auto-stem-no-front-matter");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("週報.md");
+        std::fs::write(&path, "# 週報\n").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let mut sessions = SessionSet::with_loaded(loaded);
+        let session = sessions.active_mut();
+
+        session.note_auto_named_with_stem("週報".to_owned(), "2026-01-01 週報".to_owned());
+        note_auto_named_at(session, "週報".to_owned(), &root.join("週報 2.md"));
+        assert_eq!(session.auto_stem(), Some("週報 2"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // An untracked note without Front Matter keeps the plain meaning.
+    #[test]
+    fn untracked_session_without_front_matter_records_no_stem() {
+        let root = rename_test_root("auto-stem-untracked");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("週報.md");
+        std::fs::write(&path, "# 週報\n").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let mut sessions = SessionSet::with_loaded(loaded);
+        let session = sessions.active_mut();
+
+        note_auto_named_at(session, "週報".to_owned(), &root.join("週報 2.md"));
+        assert_eq!(session.auto_stem(), None);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Issue #716: a checkbox toggled while reading is saved through the
