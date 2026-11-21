@@ -376,6 +376,10 @@ pub struct DocumentSession {
     /// file opened from disk, or one where the filename has drifted away
     /// from what auto-naming last set it to.
     auto_title: Option<String>,
+    /// The stem the file actually received when its name was derived from
+    /// Front Matter, which can differ from `auto_title` after a collision
+    /// (`… 2`). `None` for H1-only names, which compare against `auto_title`.
+    auto_stem: Option<String>,
     /// What the last accepted background check said about the disk.
     external: ExternalState,
     check_sequence: u64,
@@ -421,6 +425,7 @@ impl DocumentSession {
             pending_save: None,
             view: SessionViewState::default(),
             auto_title: None,
+            auto_stem: None,
             external: ExternalState::InSync,
             check_sequence: 0,
             saves_completed: 0,
@@ -505,6 +510,7 @@ impl DocumentSession {
         self.pending_save = None;
         self.view = SessionViewState::default();
         self.auto_title = None;
+        self.auto_stem = None;
         self.reset_external_tracking();
     }
 
@@ -529,6 +535,20 @@ impl DocumentSession {
     /// marks a session auto-managed for a name it does not have.
     pub fn note_auto_named(&mut self, title: String) {
         self.auto_title = Some(title);
+        self.auto_stem = None;
+    }
+
+    /// Like [`Self::note_auto_named`], for a name derived from Front Matter:
+    /// also records the `stem` the file actually received, which a collision
+    /// may have made differ from the derived `title`.
+    pub fn note_auto_named_with_stem(&mut self, title: String, stem: String) {
+        self.auto_title = Some(title);
+        self.auto_stem = Some(stem);
+    }
+
+    /// The stem the file actually received for a Front Matter derived name.
+    pub fn auto_stem(&self) -> Option<&str> {
+        self.auto_stem.as_deref()
     }
 
     /// Stops auto-managing this session's filename: the current name has
@@ -537,6 +557,7 @@ impl DocumentSession {
     /// must not resume renaming it.
     pub fn stop_auto_naming(&mut self) {
         self.auto_title = None;
+        self.auto_stem = None;
     }
 
     /// Records that the document was edited. Arms a fresh autosave window and

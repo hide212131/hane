@@ -1,5 +1,20 @@
 use super::*;
 
+/// Records that `session`'s file now lives at `path` under a name derived
+/// from `title`. A name derived from Front Matter also records the stem the
+/// file actually got, so a collision-avoiding `… 2` stays tracked.
+fn note_auto_named_at(session: &mut DocumentSession, title: String, path: &Path) {
+    let stem = path.file_stem().and_then(|stem| stem.to_str());
+    let has_front_matter =
+        hane_markdown::recognize_front_matter(&session.editor().document().full_text()).is_some();
+    match stem {
+        Some(stem) if has_front_matter => {
+            session.note_auto_named_with_stem(title, stem.to_owned());
+        }
+        _ => session.note_auto_named(title),
+    }
+}
+
 impl EditorView {
     /// Arms the debounce timer for the active session. Each call invalidates the
     /// timer armed by the previous keystroke, so a burst of typing produces one
@@ -285,12 +300,17 @@ impl EditorView {
             return; // superseded by a later keystroke or a document replacement
         }
         let text = session.editor().document().full_text();
-        let extracted = extract_h1_title(&text);
+        let extracted = derive_title_stem(&text);
         let current_stem = session
             .path()
             .and_then(Path::file_stem)
             .and_then(|stem| stem.to_str());
-        let action = decide_title_sync(session.auto_title(), current_stem, extracted.as_deref());
+        let action = decide_title_sync_tracked(
+            session.auto_title(),
+            session.auto_stem(),
+            current_stem,
+            extracted.as_deref(),
+        );
         match action {
             TitleSyncAction::None => {}
             TitleSyncAction::StopTracking => {
@@ -580,7 +600,7 @@ impl EditorView {
             });
             if applied {
                 if let Some(session) = self.sessions.get_mut(id) {
-                    session.note_auto_named(title);
+                    note_auto_named_at(session, title, &target);
                 }
                 if let Some(folder) = self.work_folder.as_mut() {
                     folder.rename(&from, &target);
@@ -647,7 +667,7 @@ impl EditorView {
         if let Some(title) = self.title_sync_pending.remove(&id)
             && let Some(session) = self.sessions.get_mut(id)
         {
-            session.note_auto_named(title);
+            note_auto_named_at(session, title, path);
         }
         // Every landed write is indexed, not only a title-sync first write:
         // a Save As into the work folder lands a path the tree has never

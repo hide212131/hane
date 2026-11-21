@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 hane-document.workspace = true
 hane-editor.workspace = true
+hane-markdown.workspace = true
 hane-network.workspace = true
 icu_normalizer.workspace = true
 libc.workspace = true
@@ -16,5 +17,4 @@ grep-regex.workspace = true
 grep-searcher.workspace = true
 
 [dev-dependencies]
-hane-markdown.workspace = true
 hane-presentation.workspace = true

@@ -6,6 +6,8 @@
 //! without a work folder. The I/O (probing for a name collision, writing the
 //! rename) belongs to the caller.
 
+use hane_markdown::{FrontMatterDateState, recognize_front_matter};
+
 const MAX_TITLE_CHARS: usize = 100;
 
 /// Extracts the document's title: the first ATX level-1 heading (`# Title`),
@@ -14,6 +16,47 @@ const MAX_TITLE_CHARS: usize = 100;
 /// document has no such heading, or its text is blank once trimmed.
 #[must_use]
 pub fn extract_h1_title(text: &str) -> Option<String> {
+    extract_h1_from(body_after_front_matter(text))
+}
+
+/// The document text with any leading Front Matter block removed, so its
+/// metadata lines (a YAML `# comment`, a fence-looking line) are never read
+/// as headings. A document without recognized Front Matter is returned whole.
+fn body_after_front_matter(text: &str) -> &str {
+    match recognize_front_matter(text) {
+        Some(front_matter) => &text[front_matter.range.end.0..],
+        None => text,
+    }
+}
+
+/// Derives the filename stem (no extension) the document wants: the
+/// sanitized first body H1, prefixed with `YYYY-MM-DD_` when Front Matter
+/// carries exactly one valid `date`. `None` when there is no usable H1, so
+/// nothing is created or renamed. The whole stem stays within the usual
+/// title length limit, the date prefix included.
+#[must_use]
+pub fn derive_title_stem(text: &str) -> Option<String> {
+    let front_matter = recognize_front_matter(text);
+    let body = front_matter
+        .as_ref()
+        .map_or(text, |front_matter| &text[front_matter.range.end.0..]);
+    let h1 = extract_h1_from(body)?;
+    let date = front_matter.and_then(|front_matter| match front_matter.metadata.date {
+        FrontMatterDateState::Valid(date) => Some(date.text()),
+        _ => None,
+    });
+    match date {
+        Some(date) => {
+            let prefix = format!("{date}_");
+            let limit = MAX_TITLE_CHARS.saturating_sub(prefix.chars().count());
+            let title = sanitize_title_limited(&h1, limit)?;
+            Some(format!("{prefix}{title}"))
+        }
+        None => sanitize_title(&h1),
+    }
+}
+
+fn extract_h1_from(text: &str) -> Option<String> {
     let mut in_fence: Option<&str> = None;
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -89,6 +132,10 @@ fn strip_trailing_atx_close(content: &str) -> &str {
 /// are touched.
 #[must_use]
 pub fn sanitize_title(title: &str) -> Option<String> {
+    sanitize_title_limited(title, MAX_TITLE_CHARS)
+}
+
+fn sanitize_title_limited(title: &str, max_chars: usize) -> Option<String> {
     let replaced: String = title
         .trim()
         .chars()
@@ -101,7 +148,7 @@ pub fn sanitize_title(title: &str) -> Option<String> {
         })
         .collect();
     let collapsed = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let truncated = truncate_chars(&collapsed, MAX_TITLE_CHARS);
+    let truncated = truncate_chars(&collapsed, max_chars);
     let trimmed = truncated.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
         return None;
@@ -183,6 +230,20 @@ pub fn decide_title_sync(
     current_stem: Option<&str>,
     extracted_title: Option<&str>,
 ) -> TitleSyncAction {
+    decide_title_sync_tracked(auto_title, None, current_stem, extracted_title)
+}
+
+/// Like [`decide_title_sync`], for a session that may also remember the stem
+/// its file actually got (`confirmed_stem`). Front Matter notes record it so a
+/// collision-avoiding name (`… 2`) still counts as the tracked name: an
+/// unchanged derived candidate keeps that name, and a changed one renames.
+#[must_use]
+pub fn decide_title_sync_tracked(
+    auto_title: Option<&str>,
+    confirmed_stem: Option<&str>,
+    current_stem: Option<&str>,
+    extracted_title: Option<&str>,
+) -> TitleSyncAction {
     // A vanished H1 must not delete or rename away the current file: the
     // note keeps its last real name until a new valid H1 replaces it.
     let Some(sanitized) = extracted_title.and_then(sanitize_title) else {
@@ -192,10 +253,11 @@ pub fn decide_title_sync(
         (None, _) => TitleSyncAction::CreateNamed(sanitized),
         (Some(_), None) => TitleSyncAction::None,
         (Some(stem), Some(tracked)) => {
-            let tracked_stem = sanitize_title(tracked).unwrap_or_default();
+            let derived = sanitize_title(tracked).unwrap_or_default();
+            let tracked_stem = confirmed_stem.unwrap_or(&derived);
             if stem != tracked_stem {
                 TitleSyncAction::StopTracking
-            } else if sanitized == stem {
+            } else if sanitized == stem || (confirmed_stem.is_some() && sanitized == derived) {
                 TitleSyncAction::None
             } else {
                 TitleSyncAction::Rename(sanitized)
@@ -338,6 +400,68 @@ mod tests {
             Some("LangChain4j Agent"),
         );
         assert_eq!(action, TitleSyncAction::StopTracking);
+    }
+
+    #[test]
+    fn front_matter_title_sync_uses_body_h1_and_date() {
+        let body = "```\n# サンプル\n```\n\n# 週報\n";
+        let doc = |header: &str| format!("---\n# 誤タイトル\n{header}---\n\n{body}");
+        assert_eq!(
+            derive_title_stem(&doc("date: 2026-11-21\n")).as_deref(),
+            Some("2026-11-21_週報")
+        );
+        assert_eq!(
+            derive_title_stem(&doc("date: \"2026-11-21\"\n")).as_deref(),
+            Some("2026-11-21_週報")
+        );
+        // Missing, invalid or duplicated dates leave the H1 alone.
+        for header in [
+            "",
+            "date: 2026-02-29\n",
+            "date: 2026-11-21\ndate: 2026-11-22\n",
+        ] {
+            assert_eq!(derive_title_stem(&doc(header)).as_deref(), Some("週報"));
+        }
+        // The YAML comment is not a heading.
+        assert_eq!(extract_h1_title("---\n# 誤タイトル\n---\n"), None);
+        // No usable H1: nothing to create or rename.
+        assert_eq!(derive_title_stem("---\ndate: 2026-11-21\n---\n\n# \n"), None);
+        assert_eq!(derive_title_stem("---\ndate: 2026-11-21\n---\n\n# /\n"), None);
+        // Documents without Front Matter keep the current behavior.
+        assert_eq!(
+            derive_title_stem("# 2026-11-10_week-note\n").as_deref(),
+            Some("2026-11-10_week-note")
+        );
+        // The date prefix counts against the 100 character limit.
+        let long = "あ".repeat(300);
+        let stem = derive_title_stem(&format!("---\ndate: 2026-11-21\n---\n\n# {long}\n")).unwrap();
+        assert_eq!(stem.chars().count(), MAX_TITLE_CHARS);
+        assert!(stem.starts_with("2026-11-21_"));
+        let plain = derive_title_stem(&format!("# {long}\n")).unwrap();
+        assert_eq!(plain.chars().count(), MAX_TITLE_CHARS);
+        // Symbols are sanitized like any other title.
+        assert_eq!(
+            derive_title_stem("---\ndate: 2026-11-21\n---\n# a/b:c\n").as_deref(),
+            Some("2026-11-21_a b c")
+        );
+    }
+
+    #[test]
+    fn a_collision_stem_stays_tracked_until_the_derived_candidate_changes() {
+        let tracked = Some("2026-11-21_週報");
+        let confirmed = Some("2026-11-21_週報 2");
+        assert_eq!(
+            decide_title_sync_tracked(tracked, confirmed, confirmed, tracked),
+            TitleSyncAction::None
+        );
+        assert_eq!(
+            decide_title_sync_tracked(tracked, confirmed, confirmed, Some("2020-01-01_週報")),
+            TitleSyncAction::Rename("2020-01-01_週報".into())
+        );
+        assert_eq!(
+            decide_title_sync_tracked(tracked, confirmed, Some("手動"), tracked),
+            TitleSyncAction::StopTracking
+        );
     }
 
     #[test]

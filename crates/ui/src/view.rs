@@ -80,8 +80,8 @@ use hane_session::{
     OsFileService, OsWorkFolderScanner, RecentFiles, RecoveredDrafts, SaveDecision, SaveFailure,
     SaveIntent, SaveOutcome, SaveTicket, SavedFile, SessionId, SessionSet, SessionViewState,
     Settings, StateStores, ThemePreference, TitleSyncAction, UnsavedChanges, WorkFolder,
-    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, decide_title_sync,
-    extract_h1_title, format_relative_date_label, local_today, run_create_new_job,
+    WorkFolderNode, WorkFolderScanner, WorkFolderSortOrder, decide_title_sync_tracked,
+    derive_title_stem, format_relative_date_label, local_today, run_create_new_job,
     run_save_job, split_file_name_for_badge, stamp_with_sequence, unique_folder_name, unique_markdown_filename,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2756,9 +2756,18 @@ impl EditorView {
         true
     }
 
+    /// The initial text of a new note: Front Matter carrying `today`, then an
+    /// empty H1 the caret waits in. No H1 text yet means no filename yet.
+    fn new_work_folder_note_text(today: CalendarDate) -> String {
+        format!(
+            "---\ndate: \"{:04}-{:02}-{:02}\"\n---\n\n# ",
+            today.year, today.month, today.day
+        )
+    }
+
+    #[cfg(test)]
     fn new_work_folder_note_heading() -> String {
-        let today = local_today();
-        format!("# {:04}-{:02}-{:02}_", today.year, today.month, today.day)
+        Self::new_work_folder_note_text(local_today())
     }
 
     /// Issue #5: starts a brand-new, unnamed note in the current work folder.
@@ -2813,7 +2822,7 @@ impl EditorView {
         self.sessions
             .active_mut()
             .set_view_state(SessionViewState { scroll_y });
-        let heading = Self::new_work_folder_note_heading();
+        let heading = Self::new_work_folder_note_text(local_today());
         let id = self.sessions.open_untitled(&heading, "Untitled");
         self.reveal_file_tab(id);
         self.sessions
@@ -19639,6 +19648,12 @@ mod tests {
         cx.run_until_parked();
     }
 
+    /// The `YYYY-MM-DD_` filename prefix a new note's Front Matter date gives.
+    fn note_title_prefix(heading: &str) -> String {
+        let date = heading.split('"').nth(1).expect("front matter date");
+        format!("{date}_")
+    }
+
     #[gpui::test]
     fn a_new_work_folder_note_starts_with_a_local_date_heading_and_caret_after_it(
         cx: &mut gpui::TestAppContext,
@@ -19678,7 +19693,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
         let heading = EditorView::new_work_folder_note_heading();
-        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let title_prefix = note_title_prefix(&heading);
         let expected_path = root.join(format!("{title_prefix}LangChain4j.md"));
         let expected_title = format!("{title_prefix}LangChain4j");
 
@@ -20090,7 +20105,7 @@ mod tests {
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
         let heading = EditorView::new_work_folder_note_heading();
-        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let title_prefix = note_title_prefix(&heading);
         let expected_path = root.join("dev").join(format!("{title_prefix}GPUI.md"));
 
         let view = gpui::AppContext::new(cx, |cx| {
@@ -20191,7 +20206,7 @@ mod tests {
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
         let heading = EditorView::new_work_folder_note_heading();
-        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let title_prefix = note_title_prefix(&heading);
         let expected_path = root.join("dev").join(format!("{title_prefix}GPUI.md"));
 
         let first = gpui::AppContext::new(cx, |cx| {
@@ -20452,7 +20467,7 @@ mod tests {
         let child = root.join("notes ");
         std::fs::create_dir_all(&child).unwrap();
         let heading = EditorView::new_work_folder_note_heading();
-        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let title_prefix = note_title_prefix(&heading);
         let expected_path = child.join(format!("{title_prefix}GPUI.md"));
         OsDraftStore
             .write(&root, DraftId::generate(), &child, &heading)
@@ -20565,7 +20580,7 @@ mod tests {
         std::fs::create_dir_all(root.join("dev")).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
         let heading = EditorView::new_work_folder_note_heading();
-        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let title_prefix = note_title_prefix(&heading);
         let renamed_path = root
             .join("dev")
             .join(format!("{title_prefix}GPUI Notes.md"));
@@ -20618,7 +20633,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
         let heading = EditorView::new_work_folder_note_heading();
-        let title_prefix = heading.strip_prefix("# ").unwrap();
+        let title_prefix = note_title_prefix(&heading);
         let initial_path = root.join(format!("{title_prefix}LangChain4j.md"));
         let renamed_path = root.join(format!("{title_prefix}LangChain4j Agent.md"));
         let expected_title = format!("{title_prefix}LangChain4j Agent");
@@ -20675,6 +20690,198 @@ mod tests {
             std::fs::read_to_string(&renamed_path).unwrap(),
             format!("{heading}LangChain4j Agent")
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Replaces the new note's Front Matter date value (bytes 11..21 of its
+    /// initial text) with `date` as one edit.
+    fn replace_new_note_date(view: &mut EditorView, date: &str, cx: &mut Context<EditorView>) {
+        view.editor_mut()
+            .set_selection(Selection {
+                anchor: SourceOffset(11),
+                active: SourceOffset(21),
+            })
+            .unwrap();
+        view.editor_mut().insert_text(date).unwrap();
+        view.after_input(cx);
+    }
+
+    fn new_front_matter_view(cx: &mut gpui::TestAppContext) -> gpui::Entity<EditorView> {
+        gpui::AppContext::new(cx, |cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("", "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        })
+    }
+
+    #[test]
+    fn new_note_text_is_front_matter_with_the_date_and_an_empty_h1() {
+        let today = CalendarDate::new(2026, 11, 21).unwrap();
+        assert_eq!(
+            EditorView::new_work_folder_note_text(today),
+            "---\ndate: \"2026-11-21\"\n---\n\n# "
+        );
+        assert_eq!(EditorView::new_work_folder_note_text(today).len(), 30);
+    }
+
+    #[gpui::test]
+    fn new_work_folder_note_starts_with_front_matter(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("fm-new-note");
+        let dev = root.join("dev");
+        std::fs::create_dir_all(&dev).unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let expected = EditorView::new_work_folder_note_heading();
+        let title_prefix = note_title_prefix(&expected);
+        let expected_path = dev.join(format!("{title_prefix}週報.md"));
+
+        let view = new_front_matter_view(cx);
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note_in(Some(dev.clone()), cx);
+            assert_eq!(view.editor().document().full_text(), expected);
+            assert_eq!(
+                view.editor().selection(),
+                Selection::caret(SourceOffset(expected.len()))
+            );
+            let front_matter =
+                hane_markdown::recognize_front_matter(&view.editor().document().full_text())
+                    .expect("the initial text opens with Front Matter");
+            assert_eq!(front_matter.summary(), title_prefix.trim_end_matches('_'));
+            // Today's date alone must not create a file.
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), None);
+        });
+        assert!(!expected_path.exists());
+
+        view.update(cx, |view, cx| {
+            view.editor_mut().insert_text("週報").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(expected_path.as_path()));
+        });
+        assert_eq!(
+            std::fs::read_to_string(&expected_path).unwrap(),
+            format!("{expected}週報")
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn front_matter_date_rename_tracks_collisions_and_latest_edit(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("fm-date-rename");
+        std::fs::create_dir_all(&root).unwrap();
+        let heading = EditorView::new_work_folder_note_heading();
+        let title_prefix = note_title_prefix(&heading);
+        let original = root.join(format!("{title_prefix}週報.md"));
+        std::fs::write(&original, "# 既存\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+        let collided = root.join(format!("{title_prefix}週報 2.md"));
+
+        let view = new_front_matter_view(cx);
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("週報").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(collided.as_path()));
+            assert_eq!(
+                view.active_session().auto_stem(),
+                Some(format!("{title_prefix}週報 2").as_str())
+            );
+        });
+
+        // An edit away from the date follows the rename; two quick edits end
+        // at the last candidate.
+        view.update(cx, |view, cx| {
+            replace_new_note_date(view, "2020-01-02", cx);
+            replace_new_note_date(view, "2020-01-03", cx);
+        });
+        settle_debounce(cx);
+        let renamed = root.join("2020-01-03_週報.md");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(renamed.as_path()));
+        });
+        assert!(!collided.exists());
+        assert_eq!(std::fs::read_to_string(&original).unwrap(), "# 既存\n");
+
+        // Once tracking stops (a manual rename does this), later date edits
+        // leave the file where it is.
+        view.update(cx, |view, cx| {
+            view.sessions.active_mut().stop_auto_naming();
+            replace_new_note_date(view, "2021-05-06", cx);
+        });
+        settle_debounce(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.active_session().path(), Some(renamed.as_path()));
+        });
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[gpui::test]
+    fn front_matter_rename_refreshes_sidebar_badge_and_order(cx: &mut gpui::TestAppContext) {
+        let root = draft_test_root("fm-sidebar");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("2010-06-01_前.md"), "# 前\n").unwrap();
+        std::fs::write(root.join("2030-06-01_後.md"), "# 後\n").unwrap();
+        let work_folder = OsWorkFolderScanner.scan(&root).unwrap();
+
+        let view = new_front_matter_view(cx);
+        view.update(cx, |view, cx| {
+            view.work_folder = Some(work_folder);
+            view.set_sidebar_sort(WorkFolderSortOrder::NameAscending, cx);
+            view.new_work_folder_note(cx);
+            view.editor_mut().insert_text("週報").unwrap();
+            view.after_input(cx);
+        });
+        settle_debounce(cx);
+
+        let names = |view: &EditorView| -> Vec<String> {
+            view.work_folder
+                .as_ref()
+                .unwrap()
+                .children()
+                .iter()
+                .filter_map(|node| match node {
+                    WorkFolderNode::File(entry) => Some(entry.file_name().to_owned()),
+                    WorkFolderNode::Folder(_) => None,
+                })
+                .collect()
+        };
+
+        view.update(cx, |view, cx| replace_new_note_date(view, "2020-01-01", cx));
+        settle_debounce(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                names(view),
+                ["2010-06-01_前.md", "2020-01-01_週報.md", "2030-06-01_後.md"]
+            );
+            let badge = split_file_name_for_badge("2020-01-01_週報.md").unwrap();
+            assert_eq!(badge.date, CalendarDate::new(2020, 1, 1).unwrap());
+        });
+
+        // An invalid date renames to the H1 alone, and the badge disappears.
+        view.update(cx, |view, cx| replace_new_note_date(view, "2020-13-01", cx));
+        settle_debounce(cx);
+        view.read_with(cx, |view, _| {
+            assert!(names(view).contains(&"週報.md".to_owned()));
+            assert!(split_file_name_for_badge("週報.md").is_none());
+        });
+        assert!(root.join("週報.md").exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }
