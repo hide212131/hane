@@ -1277,11 +1277,17 @@ impl BlockIndex {
             (_, FrontMatterHead::Unconfirmed) => true,
             (None, FrontMatterHead::Absent) => false,
             (None, FrontMatterHead::Present(_)) | (Some(_), FrontMatterHead::Absent) => true,
-            (Some(old), FrontMatterHead::Present(_)) => deltas.iter().any(|delta| {
-                let edit = delta.edited_source_range_before;
-                edit.start.0 < old.range.end.0
-                    || (!old.closing_has_line_ending && edit.start.0 <= old.range.end.0)
-            }),
+            // Edits that start at or after the old end leave the old range's
+            // coordinates untouched, so a differing new range means the edit
+            // changed how the closing line ends (e.g. CR becoming CRLF).
+            (Some(old), FrontMatterHead::Present(new)) => {
+                new.range != old.range
+                    || deltas.iter().any(|delta| {
+                        let edit = delta.edited_source_range_before;
+                        edit.start.0 < old.range.end.0
+                            || (!old.closing_has_line_ending && edit.start.0 <= old.range.end.0)
+                    })
+            }
         }
     }
 

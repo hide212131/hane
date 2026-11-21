@@ -230,6 +230,23 @@ fn apply_and_compare(
 }
 
 #[test]
+fn front_matter_index_follows_cr_closing_line_becoming_crlf() {
+    let source = "---\rdate: 2026-11-21\r---\r# H\n\ntext\n";
+    let mut buffer = RopeBuffer::from_text(source);
+    let mut index = BlockIndex::from_buffer(&buffer);
+    assert_eq!(
+        index.front_matter().map(|front_matter| front_matter.range),
+        Some(SourceRange::new(0, 25))
+    );
+
+    apply_and_compare(&mut index, &mut buffer, SourceRange::empty(25), "\n", "cr to crlf");
+    assert_eq!(
+        index.front_matter().map(|front_matter| front_matter.range),
+        Some(SourceRange::new(0, 26))
+    );
+}
+
+#[test]
 fn front_matter_index_reclassifies_after_delimiter_edit() {
     let source = "---\ndate: 2026-11-21\n---\n\n# 本文\n\ntext\n";
     let mut buffer = RopeBuffer::from_text(source);
