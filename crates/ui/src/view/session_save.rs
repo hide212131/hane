@@ -4,10 +4,18 @@ use super::*;
 /// from `title`. A name derived from Front Matter also records the stem the
 /// file actually got, so a collision-avoiding `… 2` stays tracked. A session
 /// that is already tracked (has an `auto_stem`) keeps recording the real stem
-/// even if its Front Matter was removed since.
-fn note_auto_named_at(session: &mut DocumentSession, title: String, path: &Path) {
+/// even if its Front Matter was removed since. `named_with_front_matter` is
+/// whether Front Matter was present when the naming began, so removing it
+/// while the first save is in flight still records the real stem.
+fn note_auto_named_at(
+    session: &mut DocumentSession,
+    title: String,
+    path: &Path,
+    named_with_front_matter: bool,
+) {
     let stem = path.file_stem().and_then(|stem| stem.to_str());
-    let records_stem = session.auto_stem().is_some()
+    let records_stem = named_with_front_matter
+        || session.auto_stem().is_some()
         || hane_markdown::recognize_front_matter(&session.editor().document().full_text())
             .is_some();
     match stem {
@@ -384,6 +392,13 @@ impl EditorView {
         cx: &mut Context<Self>,
     ) {
         let root = target_directory;
+        // Whether Front Matter exists when naming begins decides if the real
+        // stem must be recorded; the document may change before the save
+        // lands, so it is captured here rather than at completion.
+        let named_with_front_matter = self.sessions.get(id).is_some_and(|session| {
+            hane_markdown::recognize_front_matter(&session.editor().document().full_text())
+                .is_some()
+        });
         self.title_sync_in_flight.insert(id);
         // Captured now, before any `await`: a work-folder switch installs a
         // fresh `SessionSet` whose ids restart at the same values the old
@@ -456,6 +471,11 @@ impl EditorView {
                     return;
                 }
                 view.title_sync_pending.insert(id, title.clone());
+                if named_with_front_matter {
+                    view.title_sync_front_matter.insert(id);
+                } else {
+                    view.title_sync_front_matter.remove(&id);
+                }
                 view.save_session(id, SaveIntent::CreateNew(root.join(&candidate)), cx);
             });
         })
@@ -608,7 +628,7 @@ impl EditorView {
             });
             if applied {
                 if let Some(session) = self.sessions.get_mut(id) {
-                    note_auto_named_at(session, title, &target);
+                    note_auto_named_at(session, title, &target, false);
                 }
                 if let Some(folder) = self.work_folder.as_mut() {
                     folder.rename(&from, &target);
@@ -675,7 +695,8 @@ impl EditorView {
         if let Some(title) = self.title_sync_pending.remove(&id)
             && let Some(session) = self.sessions.get_mut(id)
         {
-            note_auto_named_at(session, title, path);
+            let named_with_front_matter = self.title_sync_front_matter.remove(&id);
+            note_auto_named_at(session, title, path, named_with_front_matter);
         }
         // Every landed write is indexed, not only a title-sync first write:
         // a Save As into the work folder lands a path the tree has never
@@ -1230,7 +1251,24 @@ mod tests {
         let session = sessions.active_mut();
 
         session.note_auto_named_with_stem("週報".to_owned(), "2026-01-01 週報".to_owned());
-        note_auto_named_at(session, "週報".to_owned(), &root.join("週報 2.md"));
+        note_auto_named_at(session, "週報".to_owned(), &root.join("週報 2.md"), false);
+        assert_eq!(session.auto_stem(), Some("週報 2"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Issue #751: Front Matter present when naming began but removed while
+    // the first save was in flight still records the real stem.
+    #[test]
+    fn front_matter_removed_during_first_save_records_real_stem() {
+        let root = rename_test_root("auto-stem-removed-in-flight");
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("週報.md");
+        std::fs::write(&path, "# 週報\n").unwrap();
+        let loaded = OsFileService.load(&path).unwrap();
+        let mut sessions = SessionSet::with_loaded(loaded);
+        let session = sessions.active_mut();
+
+        note_auto_named_at(session, "週報".to_owned(), &root.join("週報 2.md"), true);
         assert_eq!(session.auto_stem(), Some("週報 2"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1246,7 +1284,7 @@ mod tests {
         let mut sessions = SessionSet::with_loaded(loaded);
         let session = sessions.active_mut();
 
-        note_auto_named_at(session, "週報".to_owned(), &root.join("週報 2.md"));
+        note_auto_named_at(session, "週報".to_owned(), &root.join("週報 2.md"), false);
         assert_eq!(session.auto_stem(), None);
         let _ = std::fs::remove_dir_all(&root);
     }

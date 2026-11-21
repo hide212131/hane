@@ -1101,6 +1101,10 @@ pub struct EditorView {
     /// can mark the session auto-managed once the write actually lands
     /// rather than when it was merely requested.
     title_sync_pending: HashMap<SessionId, String>,
+    /// Sessions whose Front Matter was present when the first H1-derived
+    /// write was named, so the real stem is recorded even if the Front
+    /// Matter is removed before that write lands.
+    title_sync_front_matter: HashSet<SessionId>,
     /// Sessions with an H1-driven filename probe or rename in flight, so a
     /// second debounce firing before the first completes is skipped instead
     /// of racing it into a duplicate file.

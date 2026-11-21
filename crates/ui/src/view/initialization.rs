@@ -227,6 +227,7 @@ impl EditorView {
             _document_find_enter_interceptor: document_find_enter_interceptor,
             draft_recovery_warning: None,
             title_sync_pending: HashMap::new(),
+            title_sync_front_matter: HashSet::new(),
             title_sync_in_flight: HashSet::new(),
             title_sync_scheduled: HashMap::new(),
             title_sync_deferred: HashSet::new(),
