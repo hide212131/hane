@@ -17,9 +17,94 @@ impl EditorView {
                     return plain_block_heights(document, index, line_height);
                 }
                 let disclosure = self.active_height_disclosure();
-                block_heights_with_disclosure(document, index, line_height, disclosure)
+                if index.front_matter().is_none() {
+                    return block_heights_with_disclosure(document, index, line_height, disclosure);
+                }
+                // Front Matter also opens for the find bar's current match, which
+                // no other block's height follows.
+                let front_matter_disclosure = self.front_matter_disclosure_now();
+                index
+                    .blocks()
+                    .map(|block| {
+                        let active = if block.kind == NodeKind::FrontMatter {
+                            front_matter_disclosure
+                        } else {
+                            disclosure
+                        };
+                        block_height_with_disclosure(document, index, &block, line_height, active)
+                    })
+                    .collect()
             }
         }
+    }
+
+    /// The range that has Front Matter open right now, or `None` while it is the
+    /// one-row summary (see [`front_matter_disclosure`]).
+    pub(super) fn front_matter_disclosure_now(&self) -> Option<SourceRange> {
+        let span = self.current_index()?.front_matter()?.span();
+        front_matter_disclosure(
+            self.editor(),
+            span,
+            self.document_find_current_match(),
+            self.disclosure_policy(),
+        )
+    }
+
+    /// Rows of a collapsed Front Matter block that lie before `physical_line`
+    /// (a line number relative to the block's first line): the lines after the
+    /// opening one up to and including the closing line, none of which draws.
+    pub(super) fn collapsed_front_matter_rows_before(
+        &self,
+        block: &IndexedBlock,
+        physical_line: usize,
+    ) -> usize {
+        if block.kind != NodeKind::FrontMatter || self.front_matter_disclosure_now().is_some() {
+            return 0;
+        }
+        let Some(span) = self
+            .current_index()
+            .and_then(|index| index.front_matter())
+            .map(|front_matter| front_matter.span())
+        else {
+            return 0;
+        };
+        front_matter_lines(self.editor().document(), span)
+            .map_or(0, |lines| physical_line.min(lines.len()).saturating_sub(1))
+    }
+
+    /// Moves Front Matter's height to its open or closed value when the caret,
+    /// a selection, a composition or the find bar's current match crossed its
+    /// boundary since the height was last set. Only that one block changes, so
+    /// this is the whole update; the block's measured height from the other
+    /// state is deliberately not carried over.
+    pub(super) fn sync_front_matter_height(&mut self) {
+        if self.granularity != Granularity::Blocks || self.plain_text() {
+            return;
+        }
+        let expanded = self.front_matter_disclosure_now();
+        let target = {
+            let Some(index) = self.current_index() else {
+                return;
+            };
+            let Some(block) = index
+                .block(0)
+                .filter(|block| block.kind == NodeKind::FrontMatter)
+            else {
+                return;
+            };
+            if expanded.is_some() == self.front_matter_height_expanded {
+                return;
+            }
+            block_height_with_disclosure(
+                self.editor().document(),
+                index,
+                &block,
+                self.line_height(),
+                expanded,
+            )
+        };
+        self.front_matter_height_expanded = expanded.is_some();
+        self.heights.update(0, target);
     }
 
     /// Keeps the active endpoint's structural rows in the height index before
@@ -46,6 +131,7 @@ impl EditorView {
                 return;
             }
         }
+        self.sync_front_matter_height();
         let Some(disclosure) = self.active_height_disclosure() else {
             return;
         };
@@ -539,6 +625,8 @@ impl EditorView {
             .active_height_disclosure()
             .map(|disclosure| (self.editor().document().revision(), disclosure));
         self.last_endpoint_height_disclosure = self.last_applied_height_disclosure;
+        // `heights` was just built from the current state, Front Matter included.
+        self.front_matter_height_expanded = self.front_matter_disclosure_now().is_some();
     }
 
     /// Applies the small splice reported by the incremental block index. The
@@ -568,6 +656,7 @@ impl EditorView {
         };
         let line_height = self.line_height();
         let disclosure = self.active_height_disclosure();
+        let front_matter_disclosure = self.front_matter_disclosure_now();
         let plain = self.plain_text();
         let initial_heights = inserted
             .iter()
@@ -580,10 +669,17 @@ impl EditorView {
                     index,
                     block,
                     line_height,
-                    disclosure,
+                    if block.kind == NodeKind::FrontMatter {
+                        front_matter_disclosure
+                    } else {
+                        disclosure
+                    },
                 )
             })
             .collect::<Vec<_>>();
+        let inserted_front_matter = inserted
+            .iter()
+            .any(|block| block.kind == NodeKind::FrontMatter);
         let next = inserted
             .iter()
             .zip(&initial_heights)
@@ -606,6 +702,9 @@ impl EditorView {
         });
         self.heights.splice(first..old_end, initial_heights);
         self.height_blocks.splice(first..old_end, &next);
+        if inserted_front_matter {
+            self.front_matter_height_expanded = front_matter_disclosure.is_some();
+        }
 
         if let Some((id, old_ordinal, intra)) = old_top {
             let ordinal = rebase_ordinal_after_splice(

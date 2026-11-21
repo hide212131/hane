@@ -279,6 +279,7 @@ impl EditorView {
             last_applied_height_disclosure: None,
             last_endpoint_height_disclosure: None,
             force_height_disclosure_snapshot: false,
+            front_matter_height_expanded: false,
             joined_parse_cache: HashMap::new(),
             joined_parse_jobs: HashMap::new(),
             joined_parse_jobs_running: 0,

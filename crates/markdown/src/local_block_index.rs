@@ -1,5 +1,6 @@
 use crate::block_index::{self, BlockId, Confidence, IndexedBlock};
-use crate::parser::parse_document;
+use crate::front_matter::{FrontMatterHead, front_matter_head};
+use crate::parser::parse_document_with_front_matter;
 use crate::syntax::NodeKind;
 use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 
@@ -7,6 +8,11 @@ use hane_document::{LineId, Revision, RopeBuffer, SourceOffset, SourceRange, Tex
 /// published [`crate::BlockIndex`]. Bounds the fallback so visible parsing never depends
 /// on total document size.
 const LOCAL_BLOCK_LOOKBACK: usize = 2_048;
+
+/// Bytes read past the opening line while looking for Front Matter's closing
+/// line. A document whose block is not confirmed within it is shown as ordinary
+/// Markdown until the formal index arrives.
+const LOCAL_FRONT_MATTER_BUDGET: usize = 256 * 1024;
 
 /// Block boundaries for one viewport, parsed from a bounded window.
 ///
@@ -96,7 +102,19 @@ pub fn local_block_index(buffer: &RopeBuffer, visible: std::ops::Range<usize>) -
     let Ok(text) = buffer.text(window) else {
         return empty(window);
     };
-    let parsed = parse_document(revision, window, &text);
+    // Front Matter belongs to the document start, so only a window that
+    // really begins at byte 0 can hold it. One whose closing line lies below
+    // the window is clipped to it and stays one block.
+    let front_matter = (window.start.0 == 0)
+        .then(|| front_matter_head(buffer, LOCAL_FRONT_MATTER_BUDGET))
+        .and_then(|head| match head {
+            FrontMatterHead::Present(front_matter) => Some(SourceRange::new(
+                0,
+                front_matter.range.end.0.min(window.end.0),
+            )),
+            FrontMatterHead::Absent | FrontMatterHead::Unconfirmed => None,
+        });
+    let parsed = parse_document_with_front_matter(revision, window, &text, front_matter);
     let mut offset = window.start.0;
     let blocks = block_index::tiled_blocks(&parsed.tree, window, &text)
         .into_iter()

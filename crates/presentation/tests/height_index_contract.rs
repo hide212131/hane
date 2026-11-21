@@ -93,6 +93,7 @@ fn single_line_block(
         lines_after: 0,
         zero_height_lines_before: 0,
         zero_height_lines_after: 0,
+        omitted_lines: 0..0,
         line_height: height,
     }
 }

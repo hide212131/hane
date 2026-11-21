@@ -68,11 +68,13 @@ pub use layout::{
 pub use projection::{
     BlockLine, BlockWindow, JoinedParse, PlainCodeBlock, PlainHighlight, PlainHighlightInput,
     block_height_with_disclosure, block_heights,
-    block_heights_with_disclosure, block_line_span, expected_disclosures, parse_joined_block,
+    block_heights_with_disclosure, block_line_span, expected_disclosures,
+    front_matter_line_disclosure, front_matter_lines, front_matter_row_lines, parse_joined_block,
     parse_joined_span, plain_code_line_runs, plain_block_height, plain_block_heights, present_block,
     present_block_plain, present_block_with_list_projection,
-    present_block_with_table_projection, present_markdown, present_markdown_with_disclosure,
-    present_polished_line, table_delimiter_is_collapsed, trailing_blank_lines,
+    present_block_with_table_projection, present_front_matter_block, present_markdown,
+    present_markdown_with_disclosure, present_polished_line, table_delimiter_is_collapsed,
+    trailing_blank_lines,
 };
 // `layout` calls these directly as `crate::...`; keep them reachable crate-wide
 // without adding them to the public API above.

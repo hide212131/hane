@@ -30,7 +30,8 @@ use crate::line::DEFAULT_LINE_HEIGHT;
 use crate::line::{
     BODY_FONT_SIZE, BlockPresentationRequest, CARET_MODE_BADGE_HEIGHT, DisclosurePolicy,
     block_element, block_fits_sync_join_budget, expected_block_disclosures,
-    presented_block_with_diagram, row_element,
+    front_matter_block_is_current, front_matter_disclosure, presented_block_with_diagram,
+    row_element,
 };
 #[cfg(test)]
 use crate::line::presented_block;
@@ -60,7 +61,7 @@ use hane_document::{
 use hane_editor::{Editor, EditorCommand, InputMeasurement, Selection};
 use hane_markdown::{
     BlockId, BlockIndex, BlockIndexState, BlockIndexUpdate, FenceHeightProjection, IndexSource,
-    IndexedBlock, ListEditIntent, ListEditPlanResult, ListProjection, MarkdownEditPlan,
+    IndexedBlock, ListEditIntent, ListEditPlanResult, ListProjection, MarkdownEditPlan, NodeKind,
     PublishOutcome, SourceSelection, TableProjection, local_block_index, plan_list_edit,
 };
 use hane_metrics::FrameMetrics;
@@ -69,8 +70,9 @@ use hane_presentation::{ListRowRole, StyleKind, VisualOffset};
 use hane_presentation::{
     BlockKind, BlockLayout, HeightIndex, JoinedParse, LineShaper, MarkerEdge, VerticalMove, Visibility,
     VisualBlock, VisualLine, block_height_with_disclosure, block_heights_with_disclosure,
-    block_is_joinable, block_line_span, code_line_height, layout_block, parse_joined_span,
-    plain_block_height, plain_block_heights, table_delimiter_is_collapsed, trailing_blank_lines,
+    block_is_joinable, block_line_span, code_line_height, front_matter_lines, layout_block,
+    parse_joined_span, plain_block_height, plain_block_heights, table_delimiter_is_collapsed,
+    trailing_blank_lines,
 };
 use hane_session::{
     CalendarDate, CloseDecision, DocumentSession, DraftId, DraftStore, FileEvent,
@@ -1294,6 +1296,11 @@ pub struct EditorView {
     /// flight. In that case both the old and new disclosures may be empty, so
     /// the ordinary disclosure comparison cannot request another snapshot.
     force_height_disclosure_snapshot: bool,
+    /// Whether the height index currently holds Front Matter's block (always
+    /// block 0) at its expanded height. Opening and closing it changes only that
+    /// one height, so this is what tells `sync_front_matter_height` whether the
+    /// caret, selection, composition or find match moved across the boundary.
+    front_matter_height_expanded: bool,
     /// Whole-span parse of a joinable block too large for `presented_block` to
     /// read and reparse synchronously on every viewport miss (see
     /// `block_fits_sync_join_budget`), keyed like `block_cache`. Populated by
@@ -2618,6 +2625,7 @@ impl EditorView {
         self.last_applied_height_disclosure = None;
         self.last_endpoint_height_disclosure = None;
         self.force_height_disclosure_snapshot = false;
+        self.front_matter_height_expanded = false;
         // A `BlockId` is only unique within the document it was assigned by;
         // a cached whole-span parse keyed by one could otherwise be reused
         // for an unrelated block in whatever document replaced it.
@@ -4078,6 +4086,9 @@ impl EditorView {
         {
             return RowClick::OpenLink(destination);
         }
+        // Read before the click changes anything: opening Front Matter replaces
+        // the row this press landed on.
+        let on_front_matter_summary = self.line_is_front_matter_summary(line);
         let selection = if modifiers.shift {
             Selection {
                 anchor: self.editor().selection().anchor,
@@ -4089,11 +4100,28 @@ impl EditorView {
         if let Err(error) = self.editor_mut().set_selection(selection) {
             self.report_error("mouse selection", error);
         } else {
-            self.text_selection_drag = true;
+            // The summary opens under the pointer, so a few pixels of travel
+            // would otherwise drag a selection across source the user never
+            // aimed at. The press lands on the anchor and stays a click.
+            self.text_selection_drag = !on_front_matter_summary;
             self.status = None;
             self.after_input(cx);
         }
         RowClick::Edit
+    }
+
+    /// Whether the row drawn for physical `line` is a collapsed Front Matter
+    /// summary.
+    fn line_is_front_matter_summary(&self, line: usize) -> bool {
+        self.line_owners
+            .get(&line)
+            .and_then(|(block, _)| self.block_cache.get(block))
+            .is_some_and(|visual| {
+                visual
+                    .lines
+                    .iter()
+                    .any(|row| row.line_id as usize == line && row.kind == BlockKind::FrontMatter)
+            })
     }
 
     fn on_row_mouse_move(
@@ -4576,6 +4604,16 @@ impl EditorView {
                 window_end = window_end.max(first_body_line.map_or(line + 1, |line| line + 1));
             }
         }
+        // A collapsed Front Matter omits the lines between its summary row and
+        // the body, so reaching the summary costs nothing however long the
+        // metadata is. Keep it in the window: a step up from the blank line
+        // after the block must find it.
+        if indexed.kind == NodeKind::FrontMatter
+            && !self.plain_text()
+            && let Some(span) = block_line_span(self.editor().document(), &indexed)
+        {
+            window_start = window_start.min(span.start);
+        }
         let window = window_start..window_end;
         let diagram = self.diagram_plan_for(&indexed);
         let plain = self.plain_text();
@@ -5039,7 +5077,9 @@ impl EditorView {
             })
             .filter(|_| delimiter_line.is_some_and(|delimiter| delimiter < physical_line))
             .map_or(0, |_| 1);
-        physical_line.saturating_sub(collapsed_fence_rows + collapsed_table_delimiter)
+        let collapsed_front_matter = self.collapsed_front_matter_rows_before(block, physical_line);
+        physical_line
+            .saturating_sub(collapsed_fence_rows + collapsed_table_delimiter + collapsed_front_matter)
     }
 
     /// Inverts [`Self::visible_line_prefix`] for a visual row count. The
@@ -5401,6 +5441,29 @@ impl EditorView {
     /// selection or IME actually sits on, and invalidate the cache every frame
     /// the caret sits inside an active multi-line paragraph.
     fn disclosures_are_current(&self, indexed: &IndexedBlock, block: &VisualBlock) -> bool {
+        if indexed.kind == NodeKind::FrontMatter {
+            // Its presented lines are not one run (a summary row, then the body
+            // lines after the omitted metadata), so the run-based comparison
+            // below does not apply. The block index supplies the exact range.
+            let Some(span) = self
+                .current_index()
+                .and_then(|index| index.front_matter())
+                .map(|front_matter| front_matter.span())
+            else {
+                return false;
+            };
+            let Some(lines) = front_matter_lines(self.editor().document(), span) else {
+                return false;
+            };
+            return front_matter_block_is_current(
+                self.editor(),
+                span,
+                &lines,
+                block,
+                self.document_find_current_match(),
+                self.disclosure_policy(),
+            );
+        }
         let render = block.span.start + block.lines_before
             ..block.span.start + block.lines_before + block.lines.len();
         let Some(expected) = expected_block_disclosures(
@@ -5490,7 +5553,23 @@ fn neighbor_block_window_from(
                 .then_some(())
             })
             .is_some();
-        let line = if hidden_delimiter_is_last_line {
+        // A collapsed Front Matter ends in omitted lines; the row the caret can
+        // enter is its summary, on the opening line. The caret that steps onto
+        // it then lands on the summary's anchor.
+        let front_matter_summary_line = (!policy.is_plain()
+            && indexed.kind == NodeKind::FrontMatter)
+            .then(|| {
+                let span = index?.front_matter()?.span();
+                (!disclosure.is_some_and(|active| span.is_disclosed_by(active)))
+                    .then(|| front_matter_lines(document, span))
+                    .flatten()
+                    .filter(|lines| last_line < lines.end)
+                    .map(|lines| lines.start)
+            })
+            .flatten();
+        let line = if let Some(summary) = front_matter_summary_line {
+            summary
+        } else if hidden_delimiter_is_last_line {
             index
                 .and_then(|index| index.table_projection(&indexed))
                 .and_then(|projection| projection.rows.last())
@@ -25378,6 +25457,208 @@ mod tests {
             view.read_with(cx, |view, _| view.editor().selection()),
             Selection::caret(SourceOffset(6))
         );
+    }
+
+    /// Installs the formal block index (so the Front Matter block and its exact
+    /// range are known) and the heights built from it, then draws a frame.
+    fn publish_front_matter_index(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) {
+        view.update(cx, |view, cx| {
+            let document = view.editor().document().clone();
+            view.block_index
+                .publish(BlockIndex::from_buffer(&document), IndexSource::Formal, &document);
+            let heights = HeightIndex::new(view.item_heights());
+            view.install_heights(Granularity::Blocks, heights);
+            cx.notify();
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+    }
+
+    fn place_front_matter_caret(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        offset: SourceOffset,
+    ) {
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(offset))
+                .unwrap();
+            view.after_input(cx);
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+    }
+
+    /// Kind of the first drawn row: `FrontMatter` while it is the summary.
+    fn front_matter_row_kind(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<BlockKind> {
+        view.read_with(cx, |view, _| view.rendered_line(0).map(|line| line.kind))
+    }
+
+    fn front_matter_selection(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Selection {
+        view.read_with(cx, |view, _| view.editor().selection())
+    }
+
+    /// Everything opening and closing Front Matter must leave alone.
+    fn front_matter_document_state(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (Revision, String, bool, bool, bool) {
+        view.read_with(cx, |view, _| {
+            (
+                view.editor().document().revision(),
+                view.editor().document().full_text(),
+                view.sessions.active().is_dirty(),
+                view.editor().can_undo(),
+                view.editor().can_redo(),
+            )
+        })
+    }
+
+    // Issue #751: a collapsed Front Matter summary has one fixed source anchor.
+    // A press on its glyphs or in the space to its right, and a step up from the
+    // body with `↑` or `Shift+↑`, all land there; the block then opens around
+    // the caret without touching the document, and closes again once the caret
+    // leaves it.
+    #[gpui::test]
+    fn front_matter_click_and_up_expand_at_the_same_source_offset(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = "---\ndate: 2026-11-21\ntitle: メモ\n---\n\n本文の最初の段落\n\n次の段落\n";
+        let anchor = SourceOffset(text.find("2026-11-21").unwrap());
+        let blank = SourceOffset(text.find("---\n\n").unwrap() + 4);
+        let body = SourceOffset(text.find("本文").unwrap());
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+        publish_front_matter_index(&view, cx);
+
+        place_front_matter_caret(&view, cx, body);
+        let untouched = front_matter_document_state(&view, cx);
+        assert_eq!(
+            front_matter_row_kind(&view, cx),
+            Some(BlockKind::FrontMatter)
+        );
+        let line_height = view.read_with(cx, |view, _| view.line_height());
+        let closed_height = view.read_with(cx, |view, _| view.heights.height(0));
+        assert!(
+            closed_height.is_some_and(|height| (height - 2.0 * line_height).abs() < 0.5),
+            "one summary row plus the blank line: {closed_height:?}"
+        );
+
+        // Mouse: a press on a glyph and one in the space to the right of the
+        // text resolve to the anchor, and the release changes nothing.
+        for target in ["glyph", "margin"] {
+            place_front_matter_caret(&view, cx, body);
+            assert_eq!(
+                front_matter_row_kind(&view, cx),
+                Some(BlockKind::FrontMatter),
+                "{target}"
+            );
+            let bounds = cx.debug_bounds("row-0-0").expect("summary row painted");
+            let padding = view.read_with(cx, |view, _| view.theme.line_horizontal_padding);
+            let x = if target == "glyph" {
+                f32::from(bounds.origin.x) + padding + 6.0
+            } else {
+                f32::from(bounds.origin.x) + f32::from(bounds.size.width) - 4.0
+            };
+            let at = point(px(x), bounds.center().y);
+            cx.simulate_mouse_down(at, MouseButton::Left, gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(
+                front_matter_selection(&view, cx),
+                Selection::caret(anchor),
+                "{target}: press"
+            );
+            cx.simulate_mouse_up(at, MouseButton::Left, gpui::Modifiers::none());
+            cx.run_until_parked();
+            assert_eq!(
+                front_matter_selection(&view, cx),
+                Selection::caret(anchor),
+                "{target}: release"
+            );
+            // The block is open: its first row is the opening delimiter's own
+            // source and the caret's row shows the date line.
+            assert_ne!(
+                front_matter_row_kind(&view, cx),
+                Some(BlockKind::FrontMatter)
+            );
+            assert_eq!(
+                view.read_with(cx, |view, _| view
+                    .rendered_line(1)
+                    .map(|line| line.visual_text)),
+                Some("date: 2026-11-21".to_owned()),
+                "{target}"
+            );
+            assert_eq!(front_matter_document_state(&view, cx), untouched, "{target}");
+        }
+
+        // Keyboard: `↑` from the body goes to the blank line after the block,
+        // then onto the summary's anchor.
+        place_front_matter_caret(&view, cx, body);
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(front_matter_selection(&view, cx), Selection::caret(blank));
+        assert_eq!(
+            front_matter_row_kind(&view, cx),
+            Some(BlockKind::FrontMatter)
+        );
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(front_matter_selection(&view, cx), Selection::caret(anchor));
+        assert_ne!(
+            front_matter_row_kind(&view, cx),
+            Some(BlockKind::FrontMatter)
+        );
+        assert_eq!(front_matter_document_state(&view, cx), untouched);
+
+        // `↓` through the open block and out of it closes it again at the
+        // one-row height.
+        for _ in 0..3 {
+            cx.simulate_keystrokes("down");
+            cx.run_until_parked();
+        }
+        assert_eq!(front_matter_selection(&view, cx), Selection::caret(blank));
+        assert_eq!(
+            front_matter_row_kind(&view, cx),
+            Some(BlockKind::FrontMatter)
+        );
+        let reclosed_height = view.read_with(cx, |view, _| view.heights.height(0));
+        assert!(
+            reclosed_height.is_some_and(|height| (height - 2.0 * line_height).abs() < 0.5),
+            "the open height is not carried over: {reclosed_height:?}"
+        );
+
+        // `Shift+↑` keeps the selection's anchor and moves its active end onto
+        // the same source anchor.
+        place_front_matter_caret(&view, cx, body);
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        assert_eq!(
+            front_matter_selection(&view, cx),
+            Selection {
+                anchor: body,
+                active: blank
+            }
+        );
+        cx.simulate_keystrokes("shift-up");
+        cx.run_until_parked();
+        assert_eq!(
+            front_matter_selection(&view, cx),
+            Selection {
+                anchor: body,
+                active: anchor
+            }
+        );
+        assert_eq!(front_matter_document_state(&view, cx), untouched);
     }
 
     #[gpui::test]

@@ -32,6 +32,7 @@ mod block_index;
 mod block_store;
 mod clipboard;
 mod fence_height;
+mod front_matter;
 mod link_insertion;
 mod list_editing;
 mod list_projection;
@@ -51,6 +52,10 @@ pub use clipboard::{
     MAX_MARKDOWN_BYTES, html_to_markdown, html_to_markdown_with_limits, html_to_plain_text,
 };
 pub use fence_height::FenceHeightProjection;
+pub use front_matter::{
+    FrontMatter, FrontMatterDate, FrontMatterDateState, FrontMatterEntry, FrontMatterHead,
+    FrontMatterMetadata, FrontMatterSpan, front_matter_head, recognize_front_matter,
+};
 pub use link_insertion::{
     LinkInsertionPlan, LinkInsertionRefusal, clipboard_http_url, plan_link_insertion,
 };
@@ -70,7 +75,7 @@ pub use markers::{
     has_delimiter_markers, is_table_delimiter,
 };
 pub use mermaid::{MermaidFence, mermaid_fence};
-pub use parser::parse_document;
+pub use parser::{parse_document, parse_document_with_front_matter, parse_full_document};
 pub use syntax::{
     LinkParse, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind, TableAlignment,
     TableParse, TaskMarkerParse, links_intersecting,

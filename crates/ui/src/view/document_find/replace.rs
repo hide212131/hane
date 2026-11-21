@@ -964,6 +964,155 @@ mod tests {
         view.read_with(cx, |view, _| view.document_replace_info_text())
     }
 
+    /// The first block's cached presentation: its kind and first row.
+    fn front_matter_first_row(
+        view: &Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<(hane_presentation::BlockKind, String)> {
+        view.read_with(cx, |view, _| {
+            view.block_cache
+                .values()
+                .find(|block| block.kind == hane_presentation::BlockKind::FrontMatter)
+                .and_then(|block| block.lines.first())
+                .map(|line| (line.kind, line.visual_text.clone()))
+        })
+    }
+
+    fn place_caret_for_front_matter(
+        view: &Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+        offset: usize,
+    ) {
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(offset)))
+                .unwrap();
+            view.after_input(cx);
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+    }
+
+    // Issue #751: the metadata lines the summary leaves out are still ordinary
+    // document text. Search, replace-all, select-all/copy and the plain-text
+    // display all read the same source the summary hides.
+    #[gpui::test]
+    fn front_matter_find_replace_copy_and_plain_mode_share_source(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        // `  - foo item` is metadata the summary does not show.
+        let source =
+            "---\ndate: 2026-11-21\ntitle: foo\nitems:\n  - foo item\n---\n\n# 見出し foo\n";
+        // Display settings are kept in memory, never in the user's settings file.
+        let stores = hane_session::StateStores::memory();
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                hane_session::SessionSet::with_untitled(source, "Untitled"),
+                std::sync::Arc::new(hane_session::OsFileService),
+                stores,
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        // Focus the body the way a click into the document does.
+        let point = cx
+            .debug_bounds("row-0-0")
+            .expect("first row painted")
+            .center();
+        cx.simulate_mouse_down(point, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+
+        // With the caret in the body, the metadata is one summary row.
+        place_caret_for_front_matter(&view, cx, source.find("# 見出し").unwrap());
+        assert_eq!(
+            front_matter_first_row(&view, cx),
+            Some((
+                hane_presentation::BlockKind::FrontMatter,
+                "2026-11-21 · title: foo".to_owned()
+            ))
+        );
+
+        // Select all opens the source; copy hands over exactly the source.
+        cx.simulate_keystrokes("secondary-a");
+        cx.run_until_parked();
+        assert_eq!(
+            front_matter_first_row(&view, cx).map(|(kind, _)| kind),
+            Some(hane_presentation::BlockKind::Unsupported)
+        );
+        cx.simulate_keystrokes("secondary-c");
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(source.to_owned())
+        );
+        assert_eq!(text(&view, cx), source);
+        view.read_with(cx, |view, _| assert!(!view.sessions.active().is_dirty()));
+
+        // Replace-all reaches the line the summary omits, as one Undo step.
+        open_find(&view, cx, "foo", "baz");
+        replace_all(&view, cx);
+        assert_eq!(text(&view, cx), source.replace("foo", "baz"));
+        view.update(cx, |view, cx| view.dispatch(EditorCommand::Undo, cx));
+        assert_eq!(text(&view, cx), source);
+
+        // Plain-text mode, with and without coloring, shows every source row
+        // and keeps the caret on the same source byte.
+        let caret = source.find("foo item").unwrap();
+        place_caret_for_front_matter(&view, cx, caret);
+        let before = view.read_with(cx, |view, _| {
+            (
+                view.editor().selection(),
+                view.editor().document().revision(),
+            )
+        });
+        for (plain, highlight) in [(true, false), (true, true), (false, true)] {
+            view.update(cx, |view, cx| {
+                if view.plain_text() != plain {
+                    assert!(view.set_plain_text(plain, cx));
+                }
+                if view.syntax_highlight() != highlight {
+                    assert!(view.set_syntax_highlight(highlight, cx));
+                }
+            });
+            cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    (
+                        view.editor().selection(),
+                        view.editor().document().revision()
+                    ),
+                    before
+                );
+                let document = view.editor().document();
+                let mut ids = Vec::new();
+                for visual in view.block_cache.values() {
+                    for line in &visual.lines {
+                        let range = document
+                            .line_range(hane_document::LineId(line.line_id as usize))
+                            .unwrap();
+                        let line_text = document.text(range).unwrap();
+                        if plain {
+                            assert_eq!(line.visual_text, line_text.trim_end_matches(['\r', '\n']));
+                        }
+                        // The six metadata lines never take Markdown coloring.
+                        if line.line_id < 6 {
+                            assert!(line.style_runs.is_empty(), "line {}", line.line_id);
+                            assert_eq!(line.kind, hane_presentation::BlockKind::Unsupported);
+                        }
+                        ids.push(line.line_id);
+                    }
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                if plain {
+                    assert_eq!(ids, (0..document.line_count() as u64).collect::<Vec<_>>());
+                }
+            });
+        }
+    }
+
     #[gpui::test]
     fn replace_all_is_one_undo_step_and_reports_the_changed_count(cx: &mut gpui::TestAppContext) {
         cx.update(crate::actions::register_key_bindings);

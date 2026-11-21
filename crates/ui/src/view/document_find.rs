@@ -668,6 +668,9 @@ impl EditorView {
         };
         // 中央表示の固定描画窓が残ると、遠い検索一致の行が描画されない。
         self.cancel_center_caret();
+        // A match inside Front Matter opens it; its height must be the open
+        // height before the scroll target is computed.
+        self.sync_front_matter_height();
         self.scroll_source_offset_into_view(range.start);
         self.pending_find_visibility_after_layout = true;
     }

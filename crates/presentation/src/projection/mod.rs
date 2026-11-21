@@ -15,7 +15,8 @@ use hane_document::{Bias, Revision, RopeBuffer, SourceOffset, SourceRange, TextB
 #[cfg(test)]
 use hane_document::RevisionDelta;
 use hane_markdown::{
-    BlockIndex, FenceDelimiter, FenceMarkerEdge, IndexedBlock, ListProjection, ListProjectionItem,
+    BlockIndex, FenceDelimiter, FenceMarkerEdge, FrontMatter, FrontMatterSpan, IndexedBlock,
+    ListProjection, ListProjectionItem,
     ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
     TableAlignment, TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
     has_delimiter_markers, is_table_delimiter, links_intersecting, parse_document, task_glyph,
@@ -30,9 +31,10 @@ pub use highlight::{PlainCodeBlock, PlainHighlight, PlainHighlightInput, plain_c
 mod block;
 pub use block::{
     BlockLine, BlockWindow, block_height_with_disclosure, block_heights,
-    block_heights_with_disclosure, block_line_span, expected_disclosures, plain_block_height,
+    block_heights_with_disclosure, block_line_span, expected_disclosures,
+    front_matter_line_disclosure, front_matter_lines, front_matter_row_lines, plain_block_height,
     plain_block_heights, present_block, present_block_plain, present_block_with_list_projection,
-    present_block_with_table_projection, trailing_blank_lines,
+    present_block_with_table_projection, present_front_matter_block, trailing_blank_lines,
 };
 
 fn present_plain(line_id: u64, revision: Revision, range: SourceRange, source: &str) -> VisualLine {

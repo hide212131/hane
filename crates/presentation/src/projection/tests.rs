@@ -1116,6 +1116,7 @@ fn average_line_height_ignores_collapsed_fence_rows() {
         lines_after: 0,
         zero_height_lines_before: 0,
         zero_height_lines_after: 0,
+        omitted_lines: 0..0,
         line_height: 26.0,
     };
     let layout = layout_block(&block, 400.0, &testing::FixedAdvanceShaper::default());
