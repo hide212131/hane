@@ -213,6 +213,9 @@ pub enum TitleSyncAction {
     /// The current filename no longer matches what auto-management last
     /// derived it from, so the note must stop being auto-managed.
     StopTracking,
+    /// The current filename already matches the new candidate, but the
+    /// tracking record holds an older one: record this candidate.
+    UpdateTracking(String),
     /// Nothing to do.
     None,
 }
@@ -257,8 +260,14 @@ pub fn decide_title_sync_tracked(
             let tracked_stem = confirmed_stem.unwrap_or(&derived);
             if stem != tracked_stem {
                 TitleSyncAction::StopTracking
-            } else if sanitized == stem || (confirmed_stem.is_some() && sanitized == derived) {
+            } else if sanitized == derived {
                 TitleSyncAction::None
+            } else if sanitized == stem {
+                // The file already carries the new candidate (e.g. the H1 was
+                // edited to the collision name), but the record still names
+                // the old candidate: refresh it so a later change back can
+                // rename instead of matching a stale candidate.
+                TitleSyncAction::UpdateTracking(sanitized)
             } else {
                 TitleSyncAction::Rename(sanitized)
             }
@@ -462,6 +471,34 @@ mod tests {
             decide_title_sync_tracked(tracked, confirmed, Some("手動"), tracked),
             TitleSyncAction::StopTracking
         );
+    }
+
+    #[test]
+    fn a_collision_name_typed_into_the_h1_refreshes_the_tracked_candidate() {
+        // `Title` collided and the file became `Title 2`.
+        let action = decide_title_sync_tracked(
+            Some("Title"),
+            Some("Title 2"),
+            Some("Title 2"),
+            Some("Title 2"),
+        );
+        assert_eq!(action, TitleSyncAction::UpdateTracking("Title 2".into()));
+        // After the record is refreshed, changing the H1 back renames.
+        let action = decide_title_sync_tracked(
+            Some("Title 2"),
+            Some("Title 2"),
+            Some("Title 2"),
+            Some("Title"),
+        );
+        assert_eq!(action, TitleSyncAction::Rename("Title".into()));
+        // An unchanged candidate keeps the collision name.
+        let action = decide_title_sync_tracked(
+            Some("Title"),
+            Some("Title 2"),
+            Some("Title 2"),
+            Some("Title"),
+        );
+        assert_eq!(action, TitleSyncAction::None);
     }
 
     #[test]

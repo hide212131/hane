@@ -321,6 +321,11 @@ impl EditorView {
                     session.stop_auto_naming();
                 }
             }
+            TitleSyncAction::UpdateTracking(title) => {
+                if let Some(session) = self.sessions.get_mut(id) {
+                    session.note_auto_named(title);
+                }
+            }
             TitleSyncAction::CreateNamed(title) => {
                 // The folder this note was started in, if it was started
                 // from a selected sidebar folder; otherwise the work folder
