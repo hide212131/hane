@@ -1214,6 +1214,24 @@ impl BlockIndex {
                 let invalidated = self.len() - window_first;
                 return finish(self, reparsed_bytes, window_first, 0, 0, invalidated, false);
             };
+            // A full build gives the blank lines after Front Matter to block 0.
+            // A window that starts right after it and opens with blank lines
+            // (an inserted newline, however many) would give them to the body
+            // block instead, so those edits take the full rebuild. Bodies whose
+            // first line is content keep the incremental path.
+            if window_first == 1
+                && self.front_matter.is_some()
+                && markdown_lines(&text)
+                    .next()
+                    .is_some_and(|line| line.trim().is_empty())
+            {
+                let replaced = self.len();
+                let rebuilt = Self::build(revision, &buffer.full_text());
+                let bytes = rebuilt.covered_bytes();
+                let inserted = rebuilt.len();
+                *self = rebuilt;
+                return finish(self, bytes, 0, replaced, inserted, 0, true);
+            }
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
             let blocks = tiled_blocks(&parsed.tree, window, &text);

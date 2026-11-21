@@ -230,6 +230,17 @@ fn apply_and_compare(
 }
 
 #[test]
+fn front_matter_index_gives_inserted_blank_lines_after_it_to_the_front_matter() {
+    let mut buffer = RopeBuffer::from_text("---\na: b\n---\n# H\n\ntext\n");
+    let mut index = BlockIndex::from_buffer(&buffer);
+
+    apply_and_compare(&mut index, &mut buffer, SourceRange::empty(13), "\n", "one blank line");
+    apply_and_compare(&mut index, &mut buffer, SourceRange::empty(13), "\n\n", "two blank lines");
+    // An edit that leaves the body's first line as content stays comparable.
+    apply_and_compare(&mut index, &mut buffer, SourceRange::empty(19), "x", "body edit");
+}
+
+#[test]
 fn front_matter_index_keeps_line_count_when_body_is_deleted() {
     let mut buffer = RopeBuffer::from_text("---\na: b\n---\n# H\n");
     let mut index = BlockIndex::from_buffer(&buffer);
