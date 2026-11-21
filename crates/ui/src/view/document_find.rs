@@ -550,6 +550,9 @@ impl EditorView {
         self.reset_document_replace_for_close();
         self.cancel_document_find_work();
         self.pending_find_visibility_after_layout = false;
+        // 現在一致で展開されていた Front Matter は要約表示へ戻るため、
+        // 記録済みの高さと開示状態を即座に同期する。変化がなければ何もしない。
+        self.sync_front_matter_height();
         window.focus(&self.focus_handle, cx);
         cx.notify();
         true
