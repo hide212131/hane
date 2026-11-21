@@ -74,6 +74,7 @@ impl EditorView {
         if let Some(disclosure) = disclosure {
             self.last_background_height_disclosure = Some((revision, disclosure));
         }
+        let front_matter_disclosure = self.front_matter_disclosure_now();
         let snapshot = self.editor().document().clone();
         cx.spawn(async move |view, cx| {
             cx.background_executor()
@@ -112,12 +113,27 @@ impl EditorView {
                     let heights = if plain {
                         HeightIndex::new(plain_block_heights(&snapshot, &index, line_height))
                     } else {
-                        HeightIndex::new(block_heights_with_disclosure(
-                            &snapshot,
-                            &index,
-                            line_height,
-                            disclosure,
-                        ))
+                        // Front Matter's height follows the find bar's current
+                        // match too, which no other block's height does.
+                        HeightIndex::new(
+                            index
+                                .blocks()
+                                .map(|block| {
+                                    let active = if block.kind == NodeKind::FrontMatter {
+                                        front_matter_disclosure
+                                    } else {
+                                        disclosure
+                                    };
+                                    block_height_with_disclosure(
+                                        &snapshot,
+                                        &index,
+                                        &block,
+                                        line_height,
+                                        active,
+                                    )
+                                })
+                                .collect::<Vec<_>>(),
+                        )
                     };
                     (index, heights)
                 })
@@ -182,7 +198,9 @@ impl EditorView {
                 let (granularity, len) = view.desired_layout();
                 let snapshot_disclosure_is_current = view.editor().document().revision()
                     == revision
-                    && view.active_height_disclosure() == disclosure;
+                    && view.active_height_disclosure() == disclosure
+                    && view.front_matter_disclosure_now().is_some()
+                        == front_matter_disclosure.is_some();
                 if snapshot_disclosure_is_current
                     && granularity == Granularity::Blocks
                     && len == heights.len()
