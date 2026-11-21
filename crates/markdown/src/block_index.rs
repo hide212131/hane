@@ -1456,7 +1456,13 @@ impl BlockIndex {
             // above, keeping the tiling intact; with no block above, the document
             // holds no block at all.
             let bytes: usize = existing.iter().map(|(_, _, _, length)| length).sum();
-            let lines: usize = existing.iter().map(|(_, entry, _, _)| entry.lines).sum();
+            // An emptied window holds no lines; the stale counts of the blocks
+            // it replaced must not move to the block above.
+            let lines: usize = if bytes == 0 {
+                0
+            } else {
+                existing.iter().map(|(_, entry, _, _)| entry.lines).sum()
+            };
             self.store.splice(window.clone(), &[]);
             if window.start > 0 {
                 let above = window.start - 1;

@@ -230,6 +230,14 @@ fn apply_and_compare(
 }
 
 #[test]
+fn front_matter_index_keeps_line_count_when_body_is_deleted() {
+    let mut buffer = RopeBuffer::from_text("---\na: b\n---\n# H\n");
+    let mut index = BlockIndex::from_buffer(&buffer);
+
+    apply_and_compare(&mut index, &mut buffer, SourceRange::new(13, 17), "", "delete body");
+}
+
+#[test]
 fn front_matter_index_follows_cr_closing_line_becoming_crlf() {
     let source = "---\rdate: 2026-11-21\r---\r# H\n\ntext\n";
     let mut buffer = RopeBuffer::from_text(source);
