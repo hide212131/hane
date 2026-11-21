@@ -236,6 +236,10 @@ pub enum BlockKind {
     /// in the block as [`BlockKind::CodeBlock`] rows of zero height; see
     /// [`crate::apply_diagram`].
     Diagram,
+    /// The one-row summary of a collapsed Front Matter block. The row is
+    /// synthesized text that never wraps; its source map points at a single
+    /// source anchor rather than at the metadata bytes.
+    FrontMatter,
     /// A source line whose Markdown construct has no specialized presenter yet, or
     /// whose marker derivation failed to tile the source range. Rendered verbatim
     /// as plain text so the source is never lost through the raw-source fallback.
@@ -411,6 +415,8 @@ pub enum BlockSurface {
     Code,
     Table,
     Media,
+    /// The faint fill behind a collapsed Front Matter summary.
+    Metadata,
 }
 
 /// Foreground role for a block.
@@ -480,6 +486,11 @@ impl BlockKind {
             },
             Self::Image | Self::Diagram => BlockDisplay {
                 surface: BlockSurface::Media,
+                ..BlockDisplay::default()
+            },
+            Self::FrontMatter => BlockDisplay {
+                surface: BlockSurface::Metadata,
+                tint: BlockTint::Muted,
                 ..BlockDisplay::default()
             },
             Self::Paragraph
@@ -688,6 +699,11 @@ pub struct VisualBlock {
     /// source-line mapping stay exact while their layout footprint disappears.
     pub zero_height_lines_before: usize,
     pub zero_height_lines_after: usize,
+    /// Document lines (absolute) that were deliberately not presented because
+    /// the block shows them as nothing: a collapsed Front Matter's lines after
+    /// its summary row. Empty for every other block. They count as decided, not
+    /// missing, so a cached block still covers a window that touches them.
+    pub omitted_lines: Range<usize>,
     /// Height a non-collapsed clipped line stands in for.
     pub line_height: f32,
 }
@@ -795,10 +811,32 @@ impl VisualBlock {
     /// True when the presented run already covers `lines`, so a cached block can
     /// be drawn for that viewport without presenting anything again.
     pub fn covers(&self, lines: &Range<usize>) -> bool {
+        let wanted = lines.start.max(self.span.start)..lines.end.min(self.span.end);
+        if wanted.is_empty() {
+            return true;
+        }
+        if !self.omitted_lines.is_empty() {
+            // The presented lines are not one contiguous run: a line is
+            // covered when it was presented or deliberately omitted.
+            let mut line = wanted.start;
+            while line < wanted.end {
+                if self.omitted_lines.contains(&line) {
+                    line = self.omitted_lines.end;
+                } else if self
+                    .lines
+                    .binary_search_by_key(&(line as u64), |presented| presented.line_id)
+                    .is_ok()
+                {
+                    line += 1;
+                } else {
+                    return false;
+                }
+            }
+            return true;
+        }
         let presented = self.span.start + self.lines_before
             ..self.span.start + self.lines_before + self.lines.len();
-        let wanted = lines.start.max(self.span.start)..lines.end.min(self.span.end);
-        wanted.is_empty() || (presented.start <= wanted.start && wanted.end <= presented.end)
+        presented.start <= wanted.start && wanted.end <= presented.end
     }
 
     /// Moves the block and every line in it onto `current`. Returns false when a
@@ -899,6 +937,10 @@ pub(super) const fn syntax_display(kind: NodeKind) -> SyntaxDisplay {
         NodeKind::Rule => SyntaxDisplay {
             indexed_block: BlockKind::Rule,
             node_block: Some(BlockKind::Rule),
+            ..default
+        },
+        NodeKind::FrontMatter => SyntaxDisplay {
+            indexed_block: BlockKind::FrontMatter,
             ..default
         },
         NodeKind::Strong => SyntaxDisplay {

@@ -18,15 +18,17 @@ use gpui::{
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
 use hane_markdown::{
-    FenceHeightProjection, IndexedBlock, ListProjection, NodeKind, TableProjection, fence_closes,
-    fence_closing_delimiter, fence_delimiter,
+    FenceHeightProjection, FrontMatter, FrontMatterHead, FrontMatterSpan, IndexedBlock,
+    ListProjection, NodeKind, TableProjection, fence_closes, fence_closing_delimiter,
+    fence_delimiter, front_matter_head,
 };
 use hane_presentation::{
     BlockDisplay, BlockKind, BlockLayout, BlockLine, BlockSurface, BlockTint, BlockWeight,
     BlockWindow, DiagramPlan, InlineDisplay, JoinedParse, LayoutLine, LineContext, LineWrap,
     PlainCodeBlock, PlainHighlightInput, QUOTE_BAR_WIDTH, SyntaxTone, TableCellDisplay, TableRowDisplay, VisualBlock, VisualLine, VisualOffset,
     apply_diagram, block_is_joinable, block_line_context, block_line_span, diagram_display_size,
-    expected_disclosures, present_block_plain, present_block_with_table_projection,
+    expected_disclosures, front_matter_line_disclosure, front_matter_lines, front_matter_row_lines,
+    present_block_plain, present_block_with_table_projection, present_front_matter_block,
     trailing_blank_lines,
 };
 use hane_session::ResourceResolver;
@@ -213,6 +215,24 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
+    if block.kind == NodeKind::FrontMatter {
+        return match front_matter_context(editor, block) {
+            Some((front_matter, lines)) => presented_front_matter(
+                editor,
+                block,
+                &span,
+                render,
+                &front_matter,
+                lines,
+                forced_disclosure,
+                disclosure_policy,
+                line_height,
+            ),
+            // The head no longer reads as Front Matter (an index that is about
+            // to be replaced): show the source rather than guess a structure.
+            None => presented_block_plain(editor, block, visible, line_height, false),
+        };
+    }
     let ctx = block_context(
         editor,
         block,
@@ -250,6 +270,128 @@ pub(crate) fn presented_block(request: BlockPresentationRequest<'_>) -> Option<V
     ))
 }
 
+/// Front Matter of `block`, read from the document head, with the physical lines
+/// it covers. `None` when the head does not hold a complete Front Matter.
+fn front_matter_context(
+    editor: &Editor,
+    block: &IndexedBlock,
+) -> Option<(FrontMatter, Range<usize>)> {
+    if block.kind != NodeKind::FrontMatter {
+        return None;
+    }
+    let FrontMatterHead::Present(front_matter) = front_matter_head(editor.document(), usize::MAX)
+    else {
+        return None;
+    };
+    let lines = front_matter_lines(editor.document(), front_matter.span())?;
+    Some((front_matter, lines))
+}
+
+/// The range that opens Front Matter's source, or `None` while it stays one
+/// summary row: the composition range, a selection, or the caret when it
+/// belongs to the block (see [`FrontMatterSpan::is_disclosed_by`]), or the
+/// document-find bar's current match when it touches the block. Reading and
+/// plain-text modes never open it.
+pub(crate) fn front_matter_disclosure(
+    editor: &Editor,
+    span: FrontMatterSpan,
+    forced: Option<SourceRange>,
+    policy: DisclosurePolicy,
+) -> Option<SourceRange> {
+    if policy != DisclosurePolicy::Editing {
+        return None;
+    }
+    let selection = editor.selection().range();
+    editor
+        .ime()
+        .map(|ime| ime.current_range)
+        .filter(|range| span.is_disclosed_by(*range))
+        .or_else(|| span.is_disclosed_by(selection).then_some(selection))
+        .or_else(|| forced.filter(|forced| span.range.intersects(*forced)))
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "Front Matter presentation threads the same borrowed inputs as a block request"
+)]
+fn presented_front_matter(
+    editor: &Editor,
+    block: &IndexedBlock,
+    span: &Range<usize>,
+    render: Range<usize>,
+    front_matter: &FrontMatter,
+    lines: Range<usize>,
+    forced_disclosure: Option<SourceRange>,
+    policy: DisclosurePolicy,
+    line_height: f32,
+) -> Option<VisualBlock> {
+    let document = editor.document();
+    let block_disclosure =
+        front_matter_disclosure(editor, front_matter.span(), forced_disclosure, policy);
+    let rows = front_matter_row_lines(&lines, span, &render, block_disclosure.is_some());
+    let block_range = block.source_range;
+    let texts = rows
+        .iter()
+        .map(|line| {
+            let range = document.line_range(LineId(*line)).ok()?;
+            let range = SourceRange::new(
+                range.start.0.max(block_range.start.0),
+                range.end.0.min(block_range.end.0),
+            );
+            Some((*line, range, document.text(range).unwrap_or_default()))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let block_lines = texts
+        .iter()
+        .map(|(line, range, text)| BlockLine {
+            line: *line,
+            range: *range,
+            text,
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    Some(present_front_matter_block(
+        block,
+        document.revision(),
+        &BlockWindow {
+            trailing_blank_lines: 0,
+            span: span.clone(),
+            lines: &block_lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
+            render,
+            joined: None,
+            block_disclosure,
+        },
+        line_height,
+        front_matter,
+        lines,
+    ))
+}
+
+/// Whether a cached presentation of Front Matter still shows what the caret,
+/// selection, composition and find match say it should: the same open or closed
+/// state, and on every presented line the disclosure a fresh presentation would
+/// give it. `span` and `lines` come from the current block index, so the check
+/// never reads the metadata itself.
+pub(crate) fn front_matter_block_is_current(
+    editor: &Editor,
+    span: FrontMatterSpan,
+    lines: &Range<usize>,
+    visual: &VisualBlock,
+    forced_disclosure: Option<SourceRange>,
+    policy: DisclosurePolicy,
+) -> bool {
+    let disclosure = front_matter_disclosure(editor, span, forced_disclosure, policy);
+    visual.omitted_lines.is_empty() == disclosure.is_some()
+        && visual.lines.iter().all(|line| {
+            line.disclosure
+                == front_matter_line_disclosure(line.line_id as usize, lines, disclosure)
+        })
+}
+
 /// Plain-text presentation of the lines of `block` that reach `visible`: the
 /// source of each physical line verbatim, with no joined parse, list, fence,
 /// table or diagram handling and no disclosure.
@@ -267,6 +409,9 @@ fn presented_block_plain(
     line_height: f32,
     syntax_highlight: bool,
 ) -> Option<VisualBlock> {
+    // Front Matter is metadata source: Markdown coloring of a `# comment` or a
+    // `---` line there would claim a structure it does not have.
+    let syntax_highlight = syntax_highlight && block.kind != NodeKind::FrontMatter;
     let document = editor.document();
     let span = block_line_span(document, block)?;
     let render = span.start.max(visible.start)..span.end.min(visible.end).max(span.start);
@@ -764,6 +909,7 @@ fn surface_color(surface: BlockSurface, theme: Theme) -> Option<u32> {
         BlockSurface::Code => Some(theme.code_block_background),
         BlockSurface::Table => Some(theme.table_background),
         BlockSurface::Media => Some(theme.media_background),
+        BlockSurface::Metadata => Some(theme.table_background),
     }
 }
 
@@ -1236,6 +1382,11 @@ pub(crate) fn row_element(
             // The row already holds exactly what fits: any further wrapping here
             // would put text where no layout row accounts for it.
             .whitespace_nowrap()
+            // A collapsed Front Matter summary never wraps; what does not fit
+            // the column is clipped at its edge.
+            .when(line.kind == BlockKind::FrontMatter, |element| {
+                element.overflow_hidden()
+            })
             .pl(px(theme.line_horizontal_padding + row.text_x_origin))
             .pr(px(theme.line_horizontal_padding)),
         display,

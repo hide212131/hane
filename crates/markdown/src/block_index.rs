@@ -23,7 +23,9 @@
 //!   not touch.
 
 use crate::block_store::BlockStore;
+use crate::front_matter::{FrontMatter, FrontMatterHead, front_matter_head, recognize_front_matter};
 use crate::list_projection::ListProjectionMarkers;
+use crate::parser::parse_document_with_front_matter;
 use crate::{
     FenceHeightProjection, ListEditProjection, ListProjection, ListProjectionItem,
     ListProjectionList, ListProjectionPrefix, ListProjectionRow, ListProjectionTask,
@@ -888,6 +890,11 @@ pub struct BlockIndex {
     /// Formal table metadata; cleared by incremental edits and repopulated by
     /// the next formal parse so stale alignment cannot reach the renderer.
     table_projections: HashMap<BlockId, TableProjection>,
+    /// The document's Front Matter, which is always block 0 when present. Kept
+    /// with its exact range because block 0's tile also owns the blank lines and
+    /// reference definitions that follow the closing line. Incremental updates
+    /// leave it alone only for edits wholly after it; any other edit rebuilds.
+    front_matter: Option<FrontMatter>,
     /// First ordinal of the conservatively invalidated tail, if any. Invalidation
     /// always covers a suffix, so one ordinal answers "is this block provisional"
     /// in constant time instead of writing a flag into every affected block.
@@ -899,7 +906,13 @@ impl BlockIndex {
     /// cost is proportional to the document.
     pub fn build(revision: Revision, source: &str) -> Self {
         let range = SourceRange::new(0, source.len());
-        let parsed = parse_document(revision, range, source);
+        let front_matter = recognize_front_matter(source);
+        let parsed = parse_document_with_front_matter(
+            revision,
+            range,
+            source,
+            front_matter.as_ref().map(|front_matter| front_matter.range),
+        );
         let blocks = tiled_blocks(&parsed.tree, range, source);
         let list_projections = build_list_projections(&parsed, &blocks, range, source);
         let table_projections = build_table_projections(&parsed, &blocks, range, source);
@@ -934,8 +947,14 @@ impl BlockIndex {
             list_projections,
             fence_height_projections,
             table_projections,
+            front_matter,
             provisional_from: None,
         }
+    }
+
+    /// The document's Front Matter as of this index's revision.
+    pub fn front_matter(&self) -> Option<&FrontMatter> {
+        self.front_matter.as_ref()
     }
 
     pub fn from_buffer(buffer: &RopeBuffer) -> Self {
@@ -1043,6 +1062,10 @@ impl BlockIndex {
             return None;
         }
         let block = self.block_at(offset)?;
+        // Front Matter is metadata source, never a list.
+        if block.kind == NodeKind::FrontMatter {
+            return None;
+        }
         let source = buffer.text(block.source_range).ok()?;
         let parsed = parse_document(buffer.revision(), block.source_range, &source);
         Some(build_list_edit_projection(&parsed, &source))
@@ -1137,7 +1160,27 @@ impl BlockIndex {
             return finish(self, bytes, 0, 0, blocks, 0, true);
         }
 
-        let Some((dirty_first, dirty_last)) = self.absorb_edits(deltas, revision) else {
+        // Front Matter is decided by the document head: a delimiter edit, an
+        // edit inside the block, or a new closing line anywhere below an
+        // opening one can create, move or remove it. Those cases are rebuilt
+        // from the whole document rather than resynchronized against the old
+        // tail. Edits wholly after the block, and every edit of a document with
+        // no opening line, keep the incremental path.
+        if self.front_matter_may_have_changed(buffer, deltas) {
+            let replaced = self.len();
+            let rebuilt = Self::build(revision, &buffer.full_text());
+            let bytes = rebuilt.covered_bytes();
+            let inserted = rebuilt.len();
+            *self = rebuilt;
+            return finish(self, bytes, 0, replaced, inserted, 0, true);
+        }
+
+        let dirty = self.absorb_edits(deltas, revision);
+        // Block 0 of a Front Matter document is the metadata plus the blank
+        // lines after it. An edit there is not a Markdown window.
+        let Some((dirty_first, dirty_last)) =
+            dirty.filter(|(first, _)| self.front_matter.is_none() || *first > 0)
+        else {
             let replaced = self.len();
             let rebuilt = Self::build(revision, &buffer.full_text());
             let bytes = rebuilt.covered_bytes();
@@ -1148,8 +1191,11 @@ impl BlockIndex {
 
         // The block before the dirty run joins the window: an edit can merge its
         // block with the one above (a deleted blank line, a new setext
-        // underline), and that merge reaches at most one block back.
-        let window_first = dirty_first.saturating_sub(1);
+        // underline), and that merge reaches at most one block back. Front
+        // Matter never merges with Markdown, so its block stays out of the window.
+        let window_first = dirty_first
+            .saturating_sub(1)
+            .max(usize::from(self.front_matter.is_some()));
         let mut window_last = (dirty_last + 1).min(self.len() - 1);
         let mut reparsed_bytes = 0;
         loop {
@@ -1168,6 +1214,24 @@ impl BlockIndex {
                 let invalidated = self.len() - window_first;
                 return finish(self, reparsed_bytes, window_first, 0, 0, invalidated, false);
             };
+            // A full build gives the blank lines after Front Matter to block 0.
+            // A window that starts right after it and opens with blank lines
+            // (an inserted newline, however many) would give them to the body
+            // block instead, so those edits take the full rebuild. Bodies whose
+            // first line is content keep the incremental path.
+            if window_first == 1
+                && self.front_matter.is_some()
+                && markdown_lines(&text)
+                    .next()
+                    .is_some_and(|line| line.trim().is_empty())
+            {
+                let replaced = self.len();
+                let rebuilt = Self::build(revision, &buffer.full_text());
+                let bytes = rebuilt.covered_bytes();
+                let inserted = rebuilt.len();
+                *self = rebuilt;
+                return finish(self, bytes, 0, replaced, inserted, 0, true);
+            }
             reparsed_bytes += window.len_bytes();
             let parsed = parse_document(revision, window, &text);
             let blocks = tiled_blocks(&parsed.tree, window, &text);
@@ -1218,6 +1282,30 @@ impl BlockIndex {
                 invalidated,
                 resynchronized,
             );
+        }
+    }
+
+    /// Whether `deltas` can have created, moved, edited or removed Front Matter
+    /// relative to what this index holds.
+    fn front_matter_may_have_changed(&self, buffer: &RopeBuffer, deltas: &[RevisionDelta]) -> bool {
+        match (
+            &self.front_matter,
+            front_matter_head(buffer, RESYNC_BYTE_BUDGET),
+        ) {
+            (_, FrontMatterHead::Unconfirmed) => true,
+            (None, FrontMatterHead::Absent) => false,
+            (None, FrontMatterHead::Present(_)) | (Some(_), FrontMatterHead::Absent) => true,
+            // Edits that start at or after the old end leave the old range's
+            // coordinates untouched, so a differing new range means the edit
+            // changed how the closing line ends (e.g. CR becoming CRLF).
+            (Some(old), FrontMatterHead::Present(new)) => {
+                new.range != old.range
+                    || deltas.iter().any(|delta| {
+                        let edit = delta.edited_source_range_before;
+                        edit.start.0 < old.range.end.0
+                            || (!old.closing_has_line_ending && edit.start.0 <= old.range.end.0)
+                    })
+            }
         }
     }
 
@@ -1386,7 +1474,13 @@ impl BlockIndex {
             // above, keeping the tiling intact; with no block above, the document
             // holds no block at all.
             let bytes: usize = existing.iter().map(|(_, _, _, length)| length).sum();
-            let lines: usize = existing.iter().map(|(_, entry, _, _)| entry.lines).sum();
+            // An emptied window holds no lines; the stale counts of the blocks
+            // it replaced must not move to the block above.
+            let lines: usize = if bytes == 0 {
+                0
+            } else {
+                existing.iter().map(|(_, entry, _, _)| entry.lines).sum()
+            };
             self.store.splice(window.clone(), &[]);
             if window.start > 0 {
                 let above = window.start - 1;

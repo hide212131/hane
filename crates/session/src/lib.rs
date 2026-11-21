@@ -55,8 +55,8 @@ pub use identity::{
     Fingerprinter, lexical_canonical,
 };
 pub use naming::{
-    TitleSyncAction, decide_title_sync, extract_h1_title, unique_folder_name,
-    unique_markdown_filename,
+    TitleSyncAction, decide_title_sync, decide_title_sync_tracked, derive_title_stem,
+    extract_h1_title, unique_folder_name, unique_markdown_filename,
 };
 pub use pins::{
     FilePinStore, MemoryPinStore, PinError, PinKind, PinRepository, PinSnapshot, PinUpdate,

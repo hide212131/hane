@@ -1,3 +1,4 @@
+use crate::front_matter::recognize_front_matter;
 use crate::markers::{
     ParsedCodeSpan, absolute_range, code_padding, derive_markers, line_break_padding,
     list_structural_prefixes, task_markers,
@@ -57,6 +58,7 @@ fn node_kind_for_tag(tag: &Tag) -> NodeKind {
 fn build_tree(
     source_range: SourceRange,
     source: &str,
+    front_matter: Option<SourceRange>,
 ) -> (
     MarkdownTree,
     Vec<ParsedCodeSpan>,
@@ -93,8 +95,18 @@ fn build_tree(
         nodes[parent.0].children.push(id);
         id
     }
-    for (event, relative_range) in Parser::new_ext(source, parser_options()).into_offset_iter() {
-        let range = absolute_range(source_range.start.0, relative_range);
+    // Front Matter is one childless leaf; only the text after it is Markdown,
+    // so nothing inside it can produce a heading, rule, list, reference
+    // definition or fence. The body's events are offset back into the slice.
+    let body_start = front_matter.map_or(0, |range| {
+        range.end.0.saturating_sub(source_range.start.0).min(source.len())
+    });
+    if let Some(range) = front_matter {
+        push(&mut nodes, &open, NodeKind::FrontMatter, range);
+    }
+    let body = source.get(body_start..).unwrap_or_default();
+    for (event, relative_range) in Parser::new_ext(body, parser_options()).into_offset_iter() {
+        let range = absolute_range(source_range.start.0 + body_start, relative_range);
         match event {
             Event::Start(tag) => {
                 let id = push(&mut nodes, &open, node_kind_for_tag(&tag), range);
@@ -505,13 +517,43 @@ fn is_external_http_url(url: &str) -> bool {
 /// Parses a source slice into a node tree and retains the byte range of every
 /// node. The returned offsets are absolute within the document, even for a local
 /// slice.
+///
+/// This never recognizes Front Matter: a slice may start at byte 0 without being
+/// the whole document, and its end is then not the document's end. Callers
+/// holding the whole document use [`parse_full_document`]; callers parsing a
+/// window of a document whose Front Matter is already verified use
+/// [`parse_document_with_front_matter`].
 pub fn parse_document(
     revision: Revision,
     source_range: SourceRange,
     source: &str,
 ) -> MarkdownParse {
+    parse_document_with_front_matter(revision, source_range, source, None)
+}
+
+/// Parses a whole document, recognizing Front Matter at byte 0.
+pub fn parse_full_document(revision: Revision, source: &str) -> MarkdownParse {
+    let front_matter = recognize_front_matter(source).map(|front_matter| front_matter.range);
+    parse_document_with_front_matter(
+        revision,
+        SourceRange::new(0, source.len()),
+        source,
+        front_matter,
+    )
+}
+
+/// Parses `source`, treating `front_matter` as an already verified Front Matter
+/// range at the start of the slice. The range becomes the first child of the
+/// root and only the text after it is parsed as Markdown.
+pub fn parse_document_with_front_matter(
+    revision: Revision,
+    source_range: SourceRange,
+    source: &str,
+    front_matter: Option<SourceRange>,
+) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
-    let (tree, codes, table_parses, links) = build_tree(source_range, source);
+    debug_assert!(front_matter.is_none_or(|range| range.start == source_range.start));
+    let (tree, codes, table_parses, links) = build_tree(source_range, source, front_matter);
     let markers = derive_markers(&tree, source_range, source);
     let code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);

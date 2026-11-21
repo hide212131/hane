@@ -550,6 +550,9 @@ impl EditorView {
         self.reset_document_replace_for_close();
         self.cancel_document_find_work();
         self.pending_find_visibility_after_layout = false;
+        // 現在一致で展開されていた Front Matter は要約表示へ戻るため、
+        // 記録済みの高さと開示状態を即座に同期する。変化がなければ何もしない。
+        self.sync_front_matter_height();
         window.focus(&self.focus_handle, cx);
         cx.notify();
         true
@@ -668,6 +671,9 @@ impl EditorView {
         };
         // 中央表示の固定描画窓が残ると、遠い検索一致の行が描画されない。
         self.cancel_center_caret();
+        // A match inside Front Matter opens it; its height must be the open
+        // height before the scroll target is computed.
+        self.sync_front_matter_height();
         self.scroll_source_offset_into_view(range.start);
         self.pending_find_visibility_after_layout = true;
     }
@@ -735,6 +741,9 @@ impl EditorView {
                 self.document_find.current = None;
             }
         }
+        // 一致が消えた場合、Front Matter が一致により展開されていたなら
+        // 要約表示へ戻る高さを即座に反映する。変化がなければ何もしない。
+        self.sync_front_matter_height();
         cx.notify();
     }
 

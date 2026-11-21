@@ -1859,7 +1859,8 @@ fn fragment_boundaries(
     let len = line.visual_text.len();
     // An image row is drawn as a picture, not as text: it has one row whatever
     // its alt text measures.
-    if width <= 0.0 || line.image.is_some() {
+    // A collapsed Front Matter summary is one row at any width; the UI clips it.
+    if width <= 0.0 || line.image.is_some() || line.kind == BlockKind::FrontMatter {
         return vec![0, len];
     }
     let first_width =

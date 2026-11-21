@@ -13,6 +13,10 @@ use std::sync::Arc;
 pub enum NodeKind {
     /// Synthetic root spanning the whole parsed source range.
     Document,
+    /// The metadata block opening the document: both `---` delimiter lines and
+    /// everything between them, as one childless leaf. Its interior is never
+    /// parsed as Markdown. See [`crate::FrontMatter`].
+    FrontMatter,
     Paragraph,
     Heading(u8),
     CodeBlock,
@@ -68,6 +72,7 @@ impl NodeKind {
         matches!(
             self,
             Self::Document
+                | Self::FrontMatter
                 | Self::Paragraph
                 | Self::Heading(_)
                 | Self::CodeBlock

@@ -88,7 +88,9 @@ pub fn block_height_with_disclosure(
         .table_projection(block)
         .filter(|projection| table_delimiter_is_collapsed(projection, disclosure))
         .map_or(0, |_| 1);
-    let collapsed = collapsed_fence_rows + collapsed_table_delimiter;
+    let collapsed = collapsed_fence_rows
+        + collapsed_table_delimiter
+        + collapsed_front_matter_rows(document, index, block, disclosure);
     let trailing_empty_lines = if block_is_final {
         block_line_span(document, block)
             .map_or(0, |span| span.len().saturating_sub(block.line_count))
@@ -221,6 +223,7 @@ pub fn present_block_plain(
         lines_after,
         zero_height_lines_before: 0,
         zero_height_lines_after: 0,
+        omitted_lines: 0..0,
         line_height,
     }
 }
@@ -619,8 +622,194 @@ pub fn present_block_with_table_projection(
         lines_after,
         zero_height_lines_before,
         zero_height_lines_after,
+        omitted_lines: 0..0,
         line_height,
     }
+}
+
+/// Physical lines Front Matter covers, from its opening line through its closing
+/// line. The block's tile may continue past it over blank lines and reference
+/// definitions; those are ordinary body lines and are not in this range.
+pub fn front_matter_lines(
+    document: &RopeBuffer,
+    front_matter: FrontMatterSpan,
+) -> Option<Range<usize>> {
+    let first = document.line_for_offset(front_matter.range.start).ok()?;
+    let last = document
+        .line_for_offset(SourceOffset(front_matter.range.end.0.checked_sub(1)?))
+        .ok()?;
+    Some(first.0..last.0 + 1)
+}
+
+/// The document lines of a Front Matter block that are presented for `render`,
+/// in order. Expanded, that is every line; collapsed, the summary row on the
+/// opening line and the body lines after the closing line. The lines between
+/// are neither read nor presented.
+pub fn front_matter_row_lines(
+    front_matter_lines: &Range<usize>,
+    span: &Range<usize>,
+    render: &Range<usize>,
+    expanded: bool,
+) -> Vec<usize> {
+    let render = render.start.max(span.start)..render.end.min(span.end);
+    if render.start >= render.end {
+        return Vec::new();
+    }
+    if expanded {
+        return render.collect();
+    }
+    let mut lines = Vec::new();
+    if render.contains(&front_matter_lines.start) {
+        lines.push(front_matter_lines.start);
+    }
+    lines.extend(render.start.max(front_matter_lines.end)..render.end);
+    lines
+}
+
+/// The disclosure a presented Front Matter block gives `line`: its lines carry
+/// the block-wide disclosure while it is expanded; the body lines after it carry
+/// none.
+pub fn front_matter_line_disclosure(
+    line: usize,
+    front_matter_lines: &Range<usize>,
+    block_disclosure: Option<SourceRange>,
+) -> Option<SourceRange> {
+    front_matter_lines
+        .contains(&line)
+        .then_some(block_disclosure)
+        .flatten()
+}
+
+/// Presents a Front Matter block. `window.block_disclosure` decides the state:
+/// `Some` shows every metadata line as plain source (no heading, rule, list or
+/// link decoration), `None` shows one summary row and omits the lines up to and
+/// including the closing delimiter. `window.lines` must be the lines named by
+/// [`front_matter_row_lines`]; `front_matter_lines` is [`front_matter_lines`].
+pub fn present_front_matter_block(
+    block: &IndexedBlock,
+    revision: Revision,
+    window: &BlockWindow<'_>,
+    line_height: f32,
+    front_matter: &FrontMatter,
+    front_matter_lines: Range<usize>,
+) -> VisualBlock {
+    let expanded = window.block_disclosure.is_some();
+    let omitted = if expanded {
+        0..0
+    } else {
+        front_matter_lines.start + 1..front_matter_lines.end
+    };
+    let summary = front_matter.summary();
+    let anchor = front_matter.anchor();
+    let mut lines = Vec::with_capacity(window.render.len().min(window.lines.len()));
+    for line in window
+        .lines
+        .iter()
+        .filter(|line| window.render.contains(&line.line) && !omitted.contains(&line.line))
+    {
+        let mut presented = if !expanded && line.line == front_matter_lines.start {
+            VisualLine {
+                line_id: line.line as u64,
+                source_range: line.range,
+                revision,
+                visual_text: summary.clone(),
+                style_runs: Vec::new(),
+                links: Vec::new(),
+                kind: BlockKind::FrontMatter,
+                // One synthesized segment: any visual position, including the
+                // glyphs, the separators and the end of the row, resolves to
+                // the same zero-length source anchor.
+                source_map: SourceMap {
+                    segments: vec![MappingSegment {
+                        source_range: SourceRange::empty(anchor.0),
+                        visual_range: VisualRange::new(0, summary.len()),
+                        visibility: Visibility::Synthesized,
+                        marker_edge: None,
+                    }],
+                },
+                estimated_height: estimated_height(BlockKind::FrontMatter, line_height),
+                measured_height: None,
+                invalid: false,
+                context: LineContext::Normal,
+                disclosure: None,
+                image: None,
+                list: None,
+                quote: None,
+                quote_marker_visual_ranges: Vec::new(),
+                quote_marker_source_ranges: Vec::new(),
+                table_row: None,
+                table_header: false,
+            }
+        } else if front_matter_lines.contains(&line.line) {
+            let mut raw = present_raw_source(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+            );
+            raw.disclosure = window.block_disclosure;
+            raw
+        } else {
+            let mut plain = present_plain(line.line as u64, revision, line.range, line.text);
+            plain.estimated_height = estimated_height(BlockKind::Paragraph, line_height);
+            plain
+        };
+        while presented.visual_text.ends_with(['\r', '\n']) {
+            presented.visual_text.pop();
+        }
+        lines.push(presented);
+    }
+    let lines_before = lines.first().map_or(0, |line| {
+        (line.line_id as usize).saturating_sub(window.span.start)
+    });
+    let lines_after = window.span.len().saturating_sub(lines_before + lines.len());
+    // Every omitted line is either above the first presented line or below it
+    // (counted in `lines_after`, including those between two presented lines).
+    let first_presented_line = window.span.start.saturating_add(lines_before);
+    let zero_height_lines_before = omitted
+        .end
+        .min(first_presented_line)
+        .saturating_sub(omitted.start.min(first_presented_line));
+    let zero_height_lines_after = omitted.len().saturating_sub(zero_height_lines_before);
+    VisualBlock {
+        id: block.id,
+        kind: block_display_kind(block.kind),
+        source_range: block.source_range,
+        revision,
+        confidence: block.confidence,
+        span: window.span.clone(),
+        lines,
+        table_projection: None,
+        lines_before,
+        lines_after,
+        zero_height_lines_before,
+        zero_height_lines_after,
+        omitted_lines: omitted,
+        line_height,
+    }
+}
+
+/// Rows a collapsed Front Matter block does not draw: everything between its
+/// summary row and the body, or zero while the caret, a selection, a
+/// composition or the current find match has it expanded (`disclosure` is that
+/// range) and for every other block.
+fn collapsed_front_matter_rows(
+    document: &RopeBuffer,
+    index: &BlockIndex,
+    block: &IndexedBlock,
+    disclosure: Option<SourceRange>,
+) -> usize {
+    if block.kind != NodeKind::FrontMatter {
+        return 0;
+    }
+    let Some(span) = index.front_matter().map(FrontMatter::span) else {
+        return 0;
+    };
+    if disclosure.is_some_and(|active| span.is_disclosed_by(active)) {
+        return 0;
+    }
+    front_matter_lines(document, span).map_or(0, |lines| lines.len().saturating_sub(1))
 }
 
 fn run_uses_shared_parse(run_len: usize, joined: Option<&JoinedParse>) -> bool {
