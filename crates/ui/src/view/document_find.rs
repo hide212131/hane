@@ -738,6 +738,9 @@ impl EditorView {
                 self.document_find.current = None;
             }
         }
+        // 一致が消えた場合、Front Matter が一致により展開されていたなら
+        // 要約表示へ戻る高さを即座に反映する。変化がなければ何もしない。
+        self.sync_front_matter_height();
         cx.notify();
     }
 
