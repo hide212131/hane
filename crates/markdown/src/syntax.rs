@@ -1,4 +1,4 @@
-use crate::FenceMarkerEdge;
+use crate::{FenceMarkerEdge, HtmlElement};
 use hane_document::{Revision, SourceRange};
 use std::sync::Arc;
 
@@ -340,4 +340,9 @@ pub struct MarkdownParse {
     /// [`NodeKind::SoftBreak`] — so kept separate from `markers` the same way
     /// `code_padding` is, while still hidden from rendered presentation.
     pub line_break_padding: Vec<SourceRange>,
+    /// Verified allow-listed inline HTML pairs (`b`, `i`, `s`, `code`, `a` and
+    /// their aliases), sorted by start. Each element's two tags are also in
+    /// `markers`, and a valid `<a>` is also in `links`. Anything not listed
+    /// here stays ordinary visible source.
+    pub html_elements: Vec<HtmlElement>,
 }

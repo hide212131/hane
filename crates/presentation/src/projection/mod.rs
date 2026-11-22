@@ -15,8 +15,8 @@ use hane_document::{Bias, Revision, RopeBuffer, SourceOffset, SourceRange, TextB
 #[cfg(test)]
 use hane_document::RevisionDelta;
 use hane_markdown::{
-    BlockIndex, FenceDelimiter, FenceMarkerEdge, FrontMatter, FrontMatterSpan, IndexedBlock,
-    ListProjection, ListProjectionItem,
+    BlockIndex, FenceDelimiter, FenceMarkerEdge, FrontMatter, FrontMatterSpan, HtmlKind,
+    HtmlTagEdge, IndexedBlock, ListProjection, ListProjectionItem,
     ListProjectionPrefix, MarkdownNode, MarkdownParse, MarkdownTree, NodeId, NodeKind,
     TableAlignment, TableProjection, fence_closes, fence_closing_delimiter, fence_delimiter,
     has_delimiter_markers, is_table_delimiter, links_intersecting, parse_document, task_glyph,
@@ -417,6 +417,12 @@ fn marker_is_disclosed(
             .node(owner)
             .is_some_and(|item| list_item_range_touches(&parsed.tree, owner, item, disclosure));
     }
+    // An allow-listed HTML tag discloses with its whole element, so a caret,
+    // selection, composition or find match touching the element opens both of
+    // its tags and every enclosing element's, like Markdown delimiters do.
+    if let Some((element, _)) = parsed.html_tag_owner(marker.range) {
+        return range_touches(element.range, disclosure);
+    }
     let marker = marker.range;
     if range_touches(marker, disclosure) {
         return true;
@@ -475,6 +481,12 @@ fn marker_edge(
         || planned.global_list_item.is_some()
     {
         return Some(MarkerEdge::Opening);
+    }
+    if let Some((_, edge)) = parsed.html_tag_owner(planned.range) {
+        return Some(match edge {
+            HtmlTagEdge::Opening => MarkerEdge::Opening,
+            HtmlTagEdge::Closing => MarkerEdge::Closing,
+        });
     }
     let marker = planned.range;
     nodes.intersecting(marker).into_iter().find_map(|id| {
@@ -975,6 +987,13 @@ fn present_markdown_from_parse(
         }
         projected_markers.sort_by_key(|marker| (marker.range.start, marker.range.end));
     }
+    // A parse that sees only part of its block cannot tell whether an HTML
+    // pair sits in a top-level paragraph or inside a list, quote or table, so
+    // its tags stay ordinary source until a whole-block parse confirms them.
+    let html_enabled = shared.local_bare != LocalBareLinks::Withheld;
+    if !html_enabled && !parsed.html_elements.is_empty() {
+        projected_markers.retain(|marker| parsed.html_tag_owner(marker.range).is_none());
+    }
     let markers_on_line = projected_markers.as_slice();
     let mut quote_owner = None;
     let mut quote_depth = 0;
@@ -1237,6 +1256,9 @@ fn present_markdown_from_parse(
                 && !(formal_code_block == Some(false) && matches!(node.kind, NodeKind::CodeBlock))
         })
         .filter(|node| has_delimiter_markers(node.kind))
+        // The content of an HTML `<code>` element is literal: Markdown inside
+        // it is neither hidden nor styled.
+        .filter(|node| !parsed.html_literal_contains(node.source_range))
         .filter_map(|span| {
             let style = syntax_display(span.kind).inline_style?;
             let clipped = SourceRange {
@@ -1255,6 +1277,39 @@ fn present_markdown_from_parse(
             })
         })
         .collect::<Vec<_>>();
+    if html_enabled && formal_code_block != Some(true) {
+        for element in parsed
+            .html_elements
+            .iter()
+            .take_while(|element| element.range.start < range.end)
+        {
+            let Some(style) = html_style(element.kind) else {
+                continue;
+            };
+            let clipped = SourceRange {
+                start: element.range.start.max(range.start),
+                end: element.range.end.min(range.end),
+            };
+            if clipped.start >= clipped.end {
+                continue;
+            }
+            let (Some(start), Some(end)) = (
+                source_map.source_to_visual(clipped.start, Bias::After),
+                source_map.source_to_visual(clipped.end, Bias::Before),
+            ) else {
+                continue;
+            };
+            if start.visual_offset.0 < end.visual_offset.0 {
+                style_runs.push(StyleRun {
+                    visual_range: VisualRange {
+                        start: start.visual_offset,
+                        end: end.visual_offset,
+                    },
+                    kind: style,
+                });
+            }
+        }
+    }
     if formal_code_block == Some(true)
         && !style_runs
             .iter()
@@ -1304,6 +1359,12 @@ fn present_markdown_from_parse(
                     .tree
                     .node(link.node)
                     .is_some_and(|node| node.kind == NodeKind::Text)
+                    // An HTML `<a>` link is owned by its opening tag's node.
+                    || (html_enabled
+                        && parsed
+                            .tree
+                            .node(link.node)
+                            .is_some_and(|node| node.kind == NodeKind::InlineHtml))
                     || nodes.iter().any(|id| **id == link.node)
             })
             .filter(|link| local_bare_link_is_trusted(shared, link))
@@ -1402,6 +1463,18 @@ fn present_markdown_from_parse(
         quote_marker_source_ranges,
         table_row: None,
         table_header: false,
+    }
+}
+
+/// The inline style an allow-listed HTML element shares with its Markdown
+/// equivalent. A link has none of its own: its style comes from its target.
+const fn html_style(kind: HtmlKind) -> Option<StyleKind> {
+    match kind {
+        HtmlKind::Bold => Some(StyleKind::Bold),
+        HtmlKind::Italic => Some(StyleKind::Italic),
+        HtmlKind::Strikethrough => Some(StyleKind::Strikethrough),
+        HtmlKind::Code => Some(StyleKind::InlineCode),
+        HtmlKind::Link => None,
     }
 }
 
