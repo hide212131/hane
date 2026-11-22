@@ -30,6 +30,46 @@ pub(super) struct LinkViewState {
     instance: Option<String>,
 }
 
+/// Where an inserted text is now, or why that cannot be said: the history of
+/// the document must reach back to the insertion, no edit may have touched the
+/// text since, and exactly the inserted text must still be there.
+fn link_resolve_range(
+    record: &RangeRecord,
+    document: &RopeBuffer,
+) -> Result<SourceRange, LinkError> {
+    let inserted = Revision(record.inserted_revision);
+    let tracked = if document.revision() == inserted {
+        record.range
+    } else {
+        let deltas = document
+            .deltas_since(inserted)
+            .map_err(|_| LinkError::not_applied(ErrorCode::RangeUnverifiable))?;
+        hane_link::track::track_range(record.range, &deltas)
+            .map_err(|_| LinkError::not_applied(ErrorCode::RangeChanged))?
+    };
+    let changed = || LinkError::not_applied(ErrorCode::RangeChanged);
+    document.validate_range(tracked).map_err(|_| changed())?;
+    let text = document.text(tracked).map_err(|_| changed())?;
+    if text != record.text {
+        return Err(changed());
+    }
+    Ok(tracked)
+}
+
+fn link_replace_result(
+    document_id: &str,
+    revision: u64,
+    range: SourceRange,
+    undo_mode: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "documentId": document_id,
+        "revision": revision.to_string(),
+        "range": { "startByte": range.start.0, "endByte": range.end.0 },
+        "undoMode": undo_mode,
+    })
+}
+
 /// A window the link may address, by the native handle the client captured.
 pub struct LinkWindow {
     /// The native window handle (`HWND` on Windows).
@@ -138,8 +178,7 @@ impl EditorView {
         match request {
             HostRequest::ContextGet(params) => self.link_context_get(params, call, window),
             HostRequest::Insert(params) => self.link_insert(params, call, window, cx),
-            // Replacements arrive with H-4.
-            HostRequest::Replace(_) => Err(LinkError::not_applied(ErrorCode::InvalidRequest)),
+            HostRequest::Replace(params) => self.link_replace(params, call, window, cx),
         }
     }
 
@@ -271,6 +310,100 @@ impl EditorView {
         }))
     }
 
+    /// `edit.replace`: swaps the text an earlier `edit.insert` put in for a
+    /// refined version, but only if exactly that text is still where it was put.
+    /// The client names the insertion by its handle and never gives coordinates.
+    fn link_replace(
+        &mut self,
+        params: &hane_link::message::ReplaceParams,
+        call: &LinkCall<'_>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> LinkResult {
+        // The window must only be able to take the edit; it need not be the
+        // foreground one, and the focus may be anywhere.
+        self.link_check_target(window, false)?;
+        let document_id = self.link_document_id(call);
+        if params.document_id != document_id {
+            return Err(LinkError::not_applied(ErrorCode::StaleTarget));
+        }
+        let Some(record) = self
+            .link
+            .handles
+            .get(&params.range_handle, call.now)
+            .cloned()
+        else {
+            // Unknown, expired and used-up handles look the same to the client.
+            return Err(LinkError::not_applied(ErrorCode::RangeExpired));
+        };
+        if record.window != call.window_id || record.document_id != document_id {
+            return Err(LinkError::not_applied(ErrorCode::StaleTarget));
+        }
+        if params.inserted_revision != record.inserted_revision.to_string()
+            || params.expected_text_hash != record.text_hash
+        {
+            return Err(LinkError::not_applied(ErrorCode::RangeChanged));
+        }
+        let session = self.sessions.active();
+        let editor = session.editor();
+        let range = link_resolve_range(&record, editor.document())?;
+        if params.replacement == record.text {
+            // Nothing to change: the handle is used up all the same.
+            let revision = session.revision().0;
+            self.link.handles.consume(&params.range_handle);
+            return Ok(link_replace_result(&document_id, revision, range, "none"));
+        }
+        let selection = editor.selection();
+        let (anchor, active) = hane_link::selection::map_selection(
+            (selection.anchor.0, selection.active.0),
+            range,
+            &params.replacement,
+        );
+        let selection_after = Selection {
+            anchor: SourceOffset(anchor),
+            active: SourceOffset(active),
+        };
+        // Right after the insertion, with its Undo step still the newest: fold
+        // the replacement into that step, so one Undo removes the utterance.
+        // Otherwise it is an Undo step of its own, after whatever came between.
+        let amendable = session.revision().0 == record.inserted_revision
+            && editor.can_amend_history_entry(
+                record.history_entry,
+                range.start.0,
+                range.len_bytes(),
+            );
+        let amended = if amendable {
+            self.editor_mut()
+                .replace_range_amending(
+                    record.history_entry,
+                    range,
+                    &params.replacement,
+                    selection_after,
+                )
+                .map_err(|_| LinkError::not_applied(ErrorCode::Internal))?
+        } else {
+            None
+        };
+        let (summary, undo_mode) = match amended {
+            Some(summary) => (summary, "merged"),
+            None => (
+                self.editor_mut()
+                    .replace_range_recorded(range, &params.replacement, selection_after)
+                    .map_err(|_| LinkError::not_applied(ErrorCode::Internal))?,
+                "separate",
+            ),
+        };
+        self.link.handles.consume(&params.range_handle);
+        self.status = None;
+        self.after_input(cx);
+        Ok(link_replace_result(
+            &document_id,
+            summary.revision_after.0,
+            summary.range_after,
+            undo_mode,
+        ))
+    }
+
     /// `context.get`: the text around the caret, the title and Front Matter of
     /// the target tab, all of one revision of one document.
     fn link_context_get(
@@ -310,7 +443,25 @@ impl EditorView {
         let pending: Vec<_> = params
             .pending_range_handles
             .iter()
-            .map(|handle| serde_json::json!({ "handle": handle, "status": "untrackable" }))
+            .map(|handle| {
+                let tracked = self
+                    .link
+                    .handles
+                    .get(handle, call.now)
+                    .filter(|record| {
+                        record.window == call.window_id && record.document_id == document_id
+                    })
+                    .and_then(|record| link_resolve_range(record, document).ok());
+                match tracked {
+                    Some(range) => serde_json::json!({
+                        "handle": handle,
+                        "status": "tracked",
+                        "startByte": range.start.0,
+                        "endByte": range.end.0,
+                    }),
+                    None => serde_json::json!({ "handle": handle, "status": "untrackable" }),
+                }
+            })
             .collect();
         let mut result = serde_json::json!({
             "documentId": document_id,
@@ -1221,6 +1372,612 @@ mod tests {
         // Calls from another service instance start from nothing.
         cx.update(|_, app| view.update(app, |view, _| view.link_sync_instance("another-instance")));
         assert_eq!(view.read_with(cx, |view, _| view.link.handles.len()), 0);
+    }
+
+    /// What an `edit.insert` answered with, to name the insertion later.
+    #[derive(Clone)]
+    struct Inserted {
+        document_id: String,
+        handle: String,
+        revision: String,
+        hash: String,
+        start: usize,
+        end: usize,
+    }
+
+    impl Rig {
+        /// Reads, then inserts `text` at the caret.
+        fn insert_here(
+            &mut self,
+            cx: &mut gpui::VisualTestContext,
+            operation: &str,
+            text: &str,
+        ) -> Inserted {
+            let read = self.read(cx);
+            let reply = self.insert(cx, &read, operation, text);
+            let result = &reply["result"];
+            assert!(result.get("rangeHandle").is_some(), "{reply}");
+            Inserted {
+                document_id: result["documentId"].as_str().unwrap().to_owned(),
+                handle: result["rangeHandle"].as_str().unwrap().to_owned(),
+                revision: result["insertedRevision"].as_str().unwrap().to_owned(),
+                hash: result["expectedTextHash"].as_str().unwrap().to_owned(),
+                start: result["range"]["startByte"].as_u64().unwrap() as usize,
+                end: result["range"]["endByte"].as_u64().unwrap() as usize,
+            }
+        }
+
+        fn replace_params(
+            &self,
+            inserted: &Inserted,
+            operation: &str,
+            replacement: &str,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "operationId": operation,
+                "deadlineTick": (self.link.clock.now_ms() + 60_000).to_string(),
+                "hwnd": HWND,
+                "documentId": inserted.document_id,
+                "rangeHandle": inserted.handle,
+                "insertedRevision": inserted.revision,
+                "expectedTextHash": inserted.hash,
+                "replacement": replacement,
+            })
+        }
+
+        fn replace(
+            &mut self,
+            cx: &mut gpui::VisualTestContext,
+            inserted: &Inserted,
+            operation: &str,
+            replacement: &str,
+        ) -> serde_json::Value {
+            let params = self.replace_params(inserted, operation, replacement);
+            self.request(cx, "edit.replace", params)
+        }
+    }
+
+    fn type_text(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext, text: &str) {
+        cx.update(|_, app| view.update(app, |view, cx| view.insert_text(text, cx)));
+    }
+
+    fn redo(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|_, app| view.update(app, |view, cx| view.dispatch(EditorCommand::Redo, cx)));
+    }
+
+    fn history_depth(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) -> usize {
+        // Undo until nothing is left, counting, then redo it all back.
+        let mut steps = 0;
+        while view.read_with(cx, |view, _| view.editor().can_undo()) {
+            undo(view, cx);
+            steps += 1;
+        }
+        for _ in 0..steps {
+            redo(view, cx);
+        }
+        steps
+    }
+
+    #[gpui::test]
+    fn replace_right_after_the_insertion_merges_into_one_undo_step(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("前後", "Untitled"));
+        let mut rig = Rig::start("replace-merged", handle);
+        set_caret(&view, cx, "前".len());
+        let inserted = rig.insert_here(cx, "op-1", "えーと原文です");
+        let reply = rig.replace(cx, &inserted, "op-2", "整えた文です。");
+        let result = &reply["result"];
+        assert_eq!(result["undoMode"], "merged");
+        assert_eq!(text_of(&view, cx), "前整えた文です。後");
+        let end = "前整えた文です。".len();
+        assert_eq!(
+            result["range"],
+            serde_json::json!({"startByte": "前".len(), "endByte": end})
+        );
+        assert_eq!(
+            selection_of(&view, cx),
+            (end, end),
+            "the caret follows the new end"
+        );
+        let revision = view.read_with(cx, |view, _| view.active_session().revision().0);
+        assert_eq!(result["revision"], revision.to_string());
+        // One Undo takes the whole utterance away, as if the user had typed it once.
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "前後");
+        assert_eq!(selection_of(&view, cx), ("前".len(), "前".len()));
+        assert!(!view.read_with(cx, |view, _| view.editor().can_undo()));
+        // And Redo brings the refined text back, not the raw one.
+        redo(&view, cx);
+        assert_eq!(text_of(&view, cx), "前整えた文です。後");
+        assert_eq!(selection_of(&view, cx), (end, end));
+    }
+
+    #[gpui::test]
+    fn a_used_handle_cannot_be_used_again_and_a_stranger_is_expired(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-consumed", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        assert!(
+            rig.replace(cx, &inserted, "op-2", "整文")
+                .get("result")
+                .is_some()
+        );
+        let again = rig.replace(cx, &inserted, "op-3", "別の整文");
+        assert_eq!(error_code(&again), "RANGE_EXPIRED");
+        assert_eq!(again["error"]["effect"], "not_applied");
+        assert_eq!(text_of(&view, cx), "整文");
+        let stranger = Inserted {
+            handle: "f".repeat(32),
+            ..inserted
+        };
+        assert_eq!(
+            error_code(&rig.replace(cx, &stranger, "op-4", "x")),
+            "RANGE_EXPIRED"
+        );
+    }
+
+    #[gpui::test]
+    fn an_expired_handle_is_refused_and_leaves_the_text(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-expired", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        // The same request, 120 seconds later.
+        let params = rig.replace_params(&inserted, "op-2", "整文");
+        let HostRequest::Replace(params) =
+            HostRequest::parse("edit.replace", params).unwrap().unwrap()
+        else {
+            panic!("a replacement");
+        };
+        let later = LinkCall {
+            instance_id: &rig.instance,
+            window_id: 1,
+            now: Instant::now() + Duration::from_secs(121),
+        };
+        let reply = cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                view.link_execute(&HostRequest::Replace(params.clone()), &later, window, cx)
+            })
+        });
+        assert_eq!(reply, Err(LinkError::not_applied(ErrorCode::RangeExpired)));
+        assert_eq!(text_of(&view, cx), "原文");
+    }
+
+    #[gpui::test]
+    fn typing_after_the_insertion_leaves_the_range_alone_and_the_replacement_is_its_own_undo_step(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-after", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        type_text(&view, cx, "ab");
+        let reply = rig.replace(cx, &inserted, "op-2", "整文です");
+        assert_eq!(reply["result"]["undoMode"], "separate");
+        assert_eq!(text_of(&view, cx), "整文ですab");
+        let end = "整文です".len() + 2;
+        assert_eq!(
+            selection_of(&view, cx),
+            (end, end),
+            "the caret keeps its place after the text"
+        );
+        // Three independent steps, newest first: the replacement, the typing, the insertion.
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "原文ab");
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "原文");
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "");
+    }
+
+    #[gpui::test]
+    fn typing_at_the_start_of_the_range_moves_it_and_the_replacement_still_applies(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-start", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        set_caret(&view, cx, inserted.start);
+        type_text(&view, cx, ">>");
+        let reply = rig.replace(cx, &inserted, "op-2", "整文");
+        assert_eq!(reply["result"]["undoMode"], "separate");
+        assert_eq!(text_of(&view, cx), ">>整文");
+        assert_eq!(
+            reply["result"]["range"],
+            serde_json::json!({"startByte": 2, "endByte": 2 + "整文".len()})
+        );
+    }
+
+    #[gpui::test]
+    fn an_edit_before_the_range_shifts_it(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("本文", "Untitled"));
+        let mut rig = Rig::start("replace-shift", handle);
+        set_caret(&view, cx, "本文".len());
+        let inserted = rig.insert_here(cx, "op-1", "🙂原文");
+        set_caret(&view, cx, 0);
+        type_text(&view, cx, "冒頭\r\n");
+        assert!(
+            rig.replace(cx, &inserted, "op-2", "🙂整文")
+                .get("result")
+                .is_some()
+        );
+        assert_eq!(text_of(&view, cx), "冒頭\r\n本文🙂整文");
+    }
+
+    #[gpui::test]
+    fn an_edit_inside_the_range_is_refused_even_if_the_text_comes_back(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-inside", handle);
+        let inserted = rig.insert_here(cx, "op-1", "あいう");
+        set_caret(&view, cx, "あ".len());
+        type_text(&view, cx, "x");
+        let reply = rig.replace(cx, &inserted, "op-2", "整文");
+        assert_eq!(error_code(&reply), "RANGE_CHANGED");
+        assert_eq!(text_of(&view, cx), "あxいう");
+        // Deleting the stray character restores the text, but the edit was made.
+        cx.update(|_, app| {
+            view.update(app, |view, cx| view.dispatch(EditorCommand::Backspace, cx))
+        });
+        assert_eq!(text_of(&view, cx), "あいう");
+        let reply = rig.replace(cx, &inserted, "op-3", "整文");
+        assert_eq!(error_code(&reply), "RANGE_CHANGED");
+        assert_eq!(reply["error"]["effect"], "not_applied");
+        assert_eq!(text_of(&view, cx), "あいう");
+    }
+
+    #[gpui::test]
+    fn deleting_or_replacing_over_the_range_is_refused(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-overlap", handle);
+        let inserted = rig.insert_here(cx, "op-1", "あいう");
+        // Select the tail of the range and the text after it, then type over it.
+        type_text(&view, cx, "後");
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset("あ".len() * 2),
+                        active: SourceOffset("あいう後".len()),
+                    })
+                    .unwrap();
+            });
+        });
+        type_text(&view, cx, "Z");
+        assert_eq!(text_of(&view, cx), "あいZ");
+        assert_eq!(
+            error_code(&rig.replace(cx, &inserted, "op-2", "整文")),
+            "RANGE_CHANGED"
+        );
+        assert_eq!(text_of(&view, cx), "あいZ");
+    }
+
+    #[gpui::test]
+    fn undoing_the_insertion_makes_the_handle_useless_even_after_redo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-undo", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        undo(&view, cx);
+        assert_eq!(
+            error_code(&rig.replace(cx, &inserted, "op-2", "整文")),
+            "RANGE_CHANGED"
+        );
+        redo(&view, cx);
+        assert_eq!(text_of(&view, cx), "原文");
+        assert_eq!(
+            error_code(&rig.replace(cx, &inserted, "op-3", "整文")),
+            "RANGE_CHANGED"
+        );
+        assert_eq!(text_of(&view, cx), "原文");
+    }
+
+    #[gpui::test]
+    fn a_mismatching_hash_or_revision_is_refused(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-expectations", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        let wrong_hash = Inserted {
+            hash: hane_link::auth::sha256_hex(b"other"),
+            ..inserted.clone()
+        };
+        assert_eq!(
+            error_code(&rig.replace(cx, &wrong_hash, "op-2", "x")),
+            "RANGE_CHANGED"
+        );
+        let wrong_revision = Inserted {
+            revision: "999999".to_owned(),
+            ..inserted.clone()
+        };
+        assert_eq!(
+            error_code(&rig.replace(cx, &wrong_revision, "op-3", "x")),
+            "RANGE_CHANGED"
+        );
+        assert_eq!(text_of(&view, cx), "原文");
+        // The handle was not used up by the refusals.
+        assert!(
+            rig.replace(cx, &inserted, "op-4", "整文")
+                .get("result")
+                .is_some()
+        );
+    }
+
+    #[gpui::test]
+    fn a_replacement_equal_to_the_inserted_text_changes_nothing_and_uses_the_handle_up(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-same", handle);
+        let inserted = rig.insert_here(cx, "op-1", "同じ文");
+        let revision = view.read_with(cx, |view, _| view.active_session().revision().0);
+        let reply = rig.replace(cx, &inserted, "op-2", "同じ文");
+        assert_eq!(reply["result"]["undoMode"], "none", "{reply}");
+        assert_eq!(
+            reply["result"]["range"],
+            serde_json::json!({"startByte": 0, "endByte": "同じ文".len()})
+        );
+        assert_eq!(reply["result"]["revision"], revision.to_string());
+        assert_eq!(text_of(&view, cx), "同じ文");
+        // No revision, no Undo step: the one Undo still removes the insertion.
+        assert_eq!(
+            view.read_with(cx, |view, _| view.active_session().revision().0),
+            revision
+        );
+        assert_eq!(history_depth(&view, cx), 1);
+        assert_eq!(
+            error_code(&rig.replace(cx, &inserted, "op-3", "別")),
+            "RANGE_EXPIRED"
+        );
+    }
+
+    #[gpui::test]
+    fn a_replacement_is_refused_for_another_tab_and_after_the_document_was_replaced(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-target", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        let first = view.read_with(cx, |view, _| view.active_session().id());
+        let second = cx.update(|_, app| {
+            view.update(app, |view, _| view.sessions.open_untitled("other", "Other"))
+        });
+        cx.update(|_, app| view.update(app, |view, cx| view.activate_session(second, cx)));
+        assert_eq!(
+            error_code(&rig.replace(cx, &inserted, "op-2", "整文")),
+            "STALE_TARGET"
+        );
+        assert_eq!(text_of(&view, cx), "other");
+        cx.update(|_, app| view.update(app, |view, cx| view.activate_session(first, cx)));
+        // The tab's document is replaced (an external reload adopts new content).
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                view.sessions.active_mut().adopt(hane_session::LoadedFile {
+                    document: RopeBuffer::from_text("原文"),
+                    identity: hane_session::FileIdentity::lexical("/notes/a.md"),
+                    stamp: None,
+                    fingerprint: None,
+                });
+            })
+        });
+        assert_eq!(
+            error_code(&rig.replace(cx, &inserted, "op-3", "整文")),
+            "STALE_TARGET"
+        );
+        assert_eq!(text_of(&view, cx), "原文");
+    }
+
+    #[gpui::test]
+    fn a_replacement_does_not_need_the_foreground_but_does_not_commit_a_composition(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-focus", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        // The user is working elsewhere in the window: the focus left the body.
+        cx.update(|window, app| {
+            let other = view.read(app).settings_focus_handle.clone();
+            window.focus(&other, app);
+        });
+        cx.run_until_parked();
+        let selection_before = selection_of(&view, cx);
+        // A pending composition blocks it before anything changes.
+        cx.update(|window, app| {
+            let focus = view.read(app).focus_handle.clone();
+            window.focus(&focus, app);
+        });
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                view.editor_mut()
+                    .replace_and_mark_text(None, "に", Some(1..1))
+                    .unwrap();
+            });
+        });
+        let composing = text_of(&view, cx);
+        let refused = rig.replace(cx, &inserted, "op-2", "整文");
+        assert_eq!(error_code(&refused), "BUSY");
+        assert_eq!(text_of(&view, cx), composing);
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+        cx.update(|_, app| view.update(app, |view, _| view.editor_mut().commit_composition()));
+        cx.update(|window, app| {
+            let other = view.read(app).settings_focus_handle.clone();
+            window.focus(&other, app);
+        });
+        cx.run_until_parked();
+        let reply = rig.replace(cx, &inserted, "op-3", "整文");
+        // The composition was committed by the user above, so the range now has
+        // text typed after it: still outside, and still a valid replacement.
+        assert!(reply.get("result").is_some(), "{reply}");
+        let _ = selection_before;
+    }
+
+    #[gpui::test]
+    fn a_replacement_in_reading_mode_is_refused(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-reading", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        cx.update(|_, app| view.update(app, |view, _| view.editor_mode = EditorMode::Reading));
+        assert_eq!(
+            error_code(&rig.replace(cx, &inserted, "op-2", "整文")),
+            "NOT_EDITABLE"
+        );
+        cx.update(|_, app| view.update(app, |view, _| view.editor_mode = EditorMode::Editing));
+        assert_eq!(text_of(&view, cx), "原文");
+    }
+
+    #[gpui::test]
+    fn a_caret_inside_the_range_keeps_its_distance_and_is_clamped_to_the_new_end(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-caret", handle);
+        let inserted = rig.insert_here(cx, "op-1", "あいうえお");
+        // The user clicked between 'う' and 'え'.
+        set_caret(&view, cx, "あいう".len());
+        assert!(
+            rig.replace(cx, &inserted, "op-2", "かきくけこさし")
+                .get("result")
+                .is_some()
+        );
+        assert_eq!(selection_of(&view, cx), ("かきく".len(), "かきく".len()));
+        // Another utterance, caret near its end, replaced by something shorter.
+        let inserted = rig.insert_here(cx, "op-3", "さしすせそ");
+        let start = inserted.start;
+        set_caret(&view, cx, start + "さしすせ".len());
+        assert!(
+            rig.replace(cx, &inserted, "op-4", "ab")
+                .get("result")
+                .is_some()
+        );
+        assert_eq!(
+            selection_of(&view, cx),
+            (start + "ab".len(), start + "ab".len()),
+            "past the new end goes to the end"
+        );
+    }
+
+    #[gpui::test]
+    fn a_selection_through_the_range_keeps_its_outer_end_and_direction(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("頭", "Untitled"));
+        let mut rig = Rig::start("replace-selection", handle);
+        set_caret(&view, cx, "頭".len());
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        type_text(&view, cx, "末");
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset("頭原文末".len()),
+                        active: SourceOffset(0),
+                    })
+                    .unwrap();
+            });
+        });
+        assert!(
+            rig.replace(cx, &inserted, "op-2", "整えた文")
+                .get("result")
+                .is_some()
+        );
+        assert_eq!(text_of(&view, cx), "頭整えた文末");
+        assert_eq!(selection_of(&view, cx), ("頭整えた文末".len(), 0));
+    }
+
+    #[gpui::test]
+    fn a_history_that_no_longer_reaches_the_insertion_is_unverifiable(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("replace-unverifiable", handle);
+        let inserted = rig.insert_here(cx, "op-1", "原文");
+        // More edits after the range than the document remembers.
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                for _ in 0..4_200 {
+                    view.editor_mut().insert_text("x").unwrap();
+                }
+            })
+        });
+        let reply = rig.replace(cx, &inserted, "op-2", "整文");
+        assert_eq!(error_code(&reply), "RANGE_UNVERIFIABLE");
+        assert_eq!(reply["error"]["effect"], "not_applied");
+        assert!(text_of(&view, cx).starts_with("原文x"));
+    }
+
+    #[gpui::test]
+    fn two_pending_utterances_are_replaced_independently_in_either_order(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        for newest_first in [false, true] {
+            let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+            let mut rig = Rig::start("replace-two", handle);
+            let first = rig.insert_here(cx, "op-1", "一つ目の原文");
+            let second = rig.insert_here(cx, "op-2", "二つ目の原文");
+            assert_eq!(text_of(&view, cx), "一つ目の原文二つ目の原文");
+            let order = if newest_first {
+                [
+                    (&second, "二つ目の整文", "op-3"),
+                    (&first, "一つ目の整文", "op-4"),
+                ]
+            } else {
+                [
+                    (&first, "一つ目の整文", "op-3"),
+                    (&second, "二つ目の整文", "op-4"),
+                ]
+            };
+            let mut modes = Vec::new();
+            for (inserted, replacement, operation) in order {
+                let reply = rig.replace(cx, inserted, operation, replacement);
+                assert!(reply.get("result").is_some(), "{reply}");
+                modes.push(reply["result"]["undoMode"].as_str().unwrap().to_owned());
+            }
+            assert_eq!(text_of(&view, cx), "一つ目の整文二つ目の整文");
+            // Only an insertion that is still the newest Undo step can merge.
+            assert_eq!(
+                modes,
+                if newest_first {
+                    ["merged", "separate"]
+                } else {
+                    ["separate", "separate"]
+                }
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn context_get_reports_where_pending_insertions_are_now(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("pending-ranges", handle);
+        let first = rig.insert_here(cx, "op-1", "一つ目");
+        let second = rig.insert_here(cx, "op-2", "二つ目");
+        // Text typed in front moves both ranges.
+        set_caret(&view, cx, 0);
+        type_text(&view, cx, "前");
+        let reply = rig.context(
+            cx,
+            serde_json::json!({"pendingRangeHandles": [first.handle, second.handle]}),
+        );
+        let pending = reply["result"]["pendingRanges"].as_array().unwrap().clone();
+        let shift = "前".len();
+        assert_eq!(pending[0]["handle"], first.handle);
+        assert_eq!(pending[0]["status"], "tracked");
+        assert_eq!(pending[0]["startByte"], first.start + shift);
+        assert_eq!(pending[0]["endByte"], first.end + shift);
+        assert_eq!(pending[1]["startByte"], second.start + shift);
+        // An edit inside one of them, and a handle nobody issued.
+        set_caret(&view, cx, shift + "一".len());
+        type_text(&view, cx, "!");
+        let reply = rig.context(
+            cx,
+            serde_json::json!({"pendingRangeHandles": [first.handle, second.handle]}),
+        );
+        let pending = reply["result"]["pendingRanges"].as_array().unwrap().clone();
+        assert_eq!(pending[0]["status"], "untrackable");
+        assert_eq!(pending[1]["status"], "tracked");
+        let reply = rig.context(
+            cx,
+            serde_json::json!({"pendingRangeHandles": ["0".repeat(32)]}),
+        );
+        assert_eq!(reply["result"]["pendingRanges"][0]["status"], "untrackable");
     }
 
     #[gpui::test]
