@@ -230,3 +230,24 @@ whisparrot 側の解釈部が前提にする形式を正とし、Hane 側を合�
 - `cargo test --no-fail-fast`（全ターゲット、ワークスペース全体）: **合格 3,559 件・失敗 0 件**（`hane-link` lib 73、`hane-ui` lib 1,301 を含む）。
 - 失敗が 0 件のため、`origin/main` との切り分けは対象なし（「ブランチで失敗し main で成功」したテストはない）。なお上の「失敗の内訳」にある `hane-ui` の 112 件の失敗は、今回の実行環境では再現せず全て合格した。当時の失敗は環境依存だったと考えられる（原因は未調査）。
 - 注意: 整形は `rustfmt` をファイル単位で確認した。ワークスペース全体への `cargo fmt --all` は無関係な差分を大量に生むため行わず、連携まわりの変更だけをコミットしている。
+
+## Windows CI 修正
+
+PR #764 の Windows CI が `crates/app/src/whisparrot_link.rs`（`#[cfg(target_os = "windows")]` でのみコンパイルされるモジュール）でコンパイルエラーになっていた。macOS ではこのモジュールが対象外のため、macOS CI では検出できなかった。動作仕様（H-1〜H-4）は変えていない。
+
+### 原因
+
+実際に使われる GPUI は crates.io の `gpui-pre 0.3.6`（`vendor/gpui` は workspace から除外された別物）。
+
+1. `window.window_handle().ok()?`（E0599）: `Window` には GPUI の固有メソッド `window_handle() -> AnyWindowHandle` があり、固有メソッドはトレイトメソッドより優先される。`HasWindowHandle::window_handle`（`Result` を返す）は import していても呼ばれず、`AnyWindowHandle` に `ok` が無いと言われた。未使用 import 警告 `HasWindowHandle` も同じ原因。プラットフォーム差ではなく名前解決の問題。
+2. `cx.update(...).is_err()`（E0599）: `AsyncApp::update` は `gpui-pre 0.3.6` では `Result` ではなく値 `R`（ここでは `()`）を直接返す。
+
+### 修正
+
+1. `HasWindowHandle::window_handle(window).ok()?` と完全修飾で呼ぶ。トレイトを使うので警告も解消する。
+2. `cx.update(...)` の戻り値判定を除いた。`AsyncApp::update` は失敗しないため、終了処理中に届いた要求は従来どおり UI で処理されず、受信側の channel が閉じればループは終わる。
+
+### 検証
+
+- `cargo test --no-fail-fast`（macOS）: 合格 3,559 件・失敗 0 件。`rustfmt --check` も問題なし。
+- `cargo check --target x86_64-pc-windows-msvc`: この環境に Windows ターゲット（`core`）が無く、`rustup` も無いため実行できなかった（導入は見送り）。Windows のコンパイル確認は PR の Windows CI に委ねる。修正は上記 2 つの API をソース（`gpui-pre-0.3.6/src/window.rs`、`app/async_context.rs`）で突き合わせて行った。

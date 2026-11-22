@@ -58,7 +58,9 @@ impl LinkSetup {
 /// The native handle of a GPUI window.
 fn hwnd_of(window: &Window) -> Option<i64> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    match window.window_handle().ok()?.as_raw() {
+    // `Window` has its own `window_handle()` returning a GPUI handle, which
+    // shadows the trait method, so the trait is named explicitly.
+    match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get() as i64),
         _ => None,
     }
@@ -94,13 +96,9 @@ pub fn start(cx: &mut App, handle: gpui::WindowHandle<EditorView>, setup: LinkSe
             while let Ok(call) = calls.recv().await {
                 let windows = Rc::clone(&windows);
                 let clock = Arc::clone(&clock);
-                if cx
-                    .update(move |app| run_link_call(&windows.borrow(), &*clock, call, app))
-                    .is_err()
-                {
-                    // The application is shutting down.
-                    break;
-                }
+                // `AsyncApp::update` cannot fail in this GPUI; a call that
+                // arrives while the app is shutting down is simply dropped.
+                cx.update(move |app| run_link_call(&windows.borrow(), &*clock, call, app));
             }
         }
     })
