@@ -148,6 +148,7 @@ mod sidebar_filter;
 mod sidebar_pins;
 mod task_checkbox;
 mod viewport;
+use sidebar::display_file_name;
 #[cfg(test)]
 use sidebar::{flatten_filtered_work_folder_tree, flatten_work_folder_tree};
 
@@ -261,11 +262,15 @@ const SIDEBAR_SCROLLBAR_THUMB_WIDTH: f32 = 3.0;
 /// recent wheel/trackpad scroll or thumb drag before it fades back out.
 const SIDEBAR_SCROLLBAR_HIDE_DELAY: Duration = Duration::from_millis(600);
 
+/// The tab title for a file name: the trailing `.md` extension and any date in
+/// the name are omitted, matching the sidebar row. A name that would be empty
+/// without its date keeps the date so the tab stays identifiable.
 fn file_tab_display_name(name: &str) -> String {
-    name.strip_suffix(".md")
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or(name)
-        .to_owned()
+    let stem = display_file_name(name);
+    match split_file_name_for_badge(stem).map(|badge| badge.remainder()) {
+        Some(remainder) if !remainder.is_empty() => remainder,
+        _ => stem.to_owned(),
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6767,6 +6772,24 @@ mod tests {
         #[cfg(not(feature = "instrument"))]
         {
             ()
+        }
+    }
+
+    #[test]
+    fn file_tab_display_name_omits_extension_and_date() {
+        let cases = [
+            ("2026-11-22_テスト.md", "テスト"),
+            ("週報_2026-1-2_下書き.md", "週報 下書き"),
+            ("週報_2026-11-22.md", "週報"),
+            ("20261122_テスト.md", "テスト"),
+            ("2026-02-30_テスト.md", "2026-02-30_テスト"),
+            ("テスト.md", "テスト"),
+            ("2026-11-22.md", "2026-11-22"),
+            ("2026-11-22_テスト.MD", "テスト"),
+            (".md", ".md"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(file_tab_display_name(input), expected, "input: {input}");
         }
     }
 

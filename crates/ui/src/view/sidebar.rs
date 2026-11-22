@@ -2199,7 +2199,7 @@ fn work_folder_root_display_name(root: &Path) -> String {
 /// (ASCII case-insensitive, matching what the work folder accepts) is
 /// omitted. Display only — the real file name and path are untouched. A name
 /// that is nothing but the extension is kept as is so the row is never blank.
-fn display_file_name(file_name: &str) -> &str {
+pub(super) fn display_file_name(file_name: &str) -> &str {
     let Some(stem_len) = file_name.len().checked_sub(3) else {
         return file_name;
     };
