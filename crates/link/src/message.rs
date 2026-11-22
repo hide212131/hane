@@ -189,9 +189,14 @@ pub fn negotiate(client_min: Version, client_max: Version) -> Option<Version> {
     } else {
         u32::MAX
     };
+    #[allow(
+        clippy::unnecessary_min_or_max,
+        reason = "the minor is 0 for now; the rule must keep holding once it grows"
+    )]
+    let minor = PROTOCOL_MINOR.min(client_minor);
     let agreed = Version {
         major: PROTOCOL_MAJOR,
-        minor: PROTOCOL_MINOR.min(client_minor),
+        minor,
     };
     (agreed >= client_min).then_some(agreed)
 }

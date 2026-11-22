@@ -10,6 +10,9 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Creates the listener for a pipe name.
+pub type ListenFn = Box<dyn Fn(&str) -> io::Result<BoxListener> + Send + Sync>;
+
 /// Everything the runtime needs from the platform, so tests can substitute
 /// an in-memory listener and a scratch directory.
 pub struct Environment {
@@ -23,7 +26,7 @@ pub struct Environment {
     pub clock: Arc<dyn TickClock>,
     pub probe: Arc<dyn ProcessProbe + Send + Sync>,
     /// Creates the listener for a pipe name.
-    pub listen: Box<dyn Fn(&str) -> io::Result<BoxListener> + Send + Sync>,
+    pub listen: ListenFn,
 }
 
 #[cfg(windows)]

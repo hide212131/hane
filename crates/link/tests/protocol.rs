@@ -110,7 +110,9 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        self.service.take().map(RunningService::stop);
+        if let Some(service) = self.service.take() {
+            service.stop();
+        }
         drop(self.pump.take());
     }
 }

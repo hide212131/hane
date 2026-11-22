@@ -94,9 +94,14 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
 /// Creates the directories `components` under `base`, private to the current
 /// user from the moment they exist, refusing any that is a link or reparse
 /// point. Returns the innermost directory.
+///
+/// Only directories this call creates, and the innermost one (which holds the
+/// token), get the private permissions. An outer directory that already exists
+/// (such as the application's own folder) is shared with other parts of the
+/// application and is left as it is.
 pub fn ensure_private_dir(base: &Path, components: &[&str]) -> io::Result<PathBuf> {
     let mut path = base.to_path_buf();
-    for component in components {
+    for (index, component) in components.iter().enumerate() {
         path.push(component);
         match fs::symlink_metadata(&path) {
             Ok(metadata) => {
@@ -106,7 +111,9 @@ pub fn ensure_private_dir(base: &Path, components: &[&str]) -> io::Result<PathBu
                         "descriptor directory is not a plain directory",
                     ));
                 }
-                crate::private_fs::restrict_dir(&path)?;
+                if index + 1 == components.len() {
+                    crate::private_fs::restrict_dir(&path)?;
+                }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 crate::private_fs::create_private_dir(&path)?;
@@ -254,7 +261,7 @@ mod tests {
         let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(&dir), 0o700);
-        assert_eq!(mode(&dir.parent().unwrap().to_path_buf()), 0o700);
+        assert_eq!(mode(dir.parent().unwrap()), 0o700);
         let _ = fs::remove_dir_all(&base);
     }
 

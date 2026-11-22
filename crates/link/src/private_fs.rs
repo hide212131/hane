@@ -1,7 +1,10 @@
 //! Files and directories private to the current user, from creation on.
 
+#[cfg(unix)]
 use std::fs::File;
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::path::Path;
 
 #[cfg(unix)]
