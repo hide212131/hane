@@ -148,8 +148,9 @@ mod sidebar_filter;
 mod sidebar_pins;
 mod task_checkbox;
 mod viewport;
+use sidebar::display_file_name;
 #[cfg(test)]
-use sidebar::{display_file_name, flatten_filtered_work_folder_tree, flatten_work_folder_tree};
+use sidebar::{flatten_filtered_work_folder_tree, flatten_work_folder_tree};
 
 const METRICS_CAPACITY: usize = 4_096;
 #[cfg(feature = "instrument")]
