@@ -56,6 +56,7 @@ impl EditorView {
         self.network_settings
             .begin_settings_session(&self.settings.network);
         self.settings_error = None;
+        self.default_folder_error = None;
         self.file_context_menu_generation = self.file_context_menu_generation.wrapping_add(1);
         let generation = self.file_context_menu_generation;
         self.file_context_menu_busy = true;
@@ -488,6 +489,7 @@ impl EditorView {
                     .child("一般"),
             )
             .child(self.display_and_save_settings(cx))
+            .child(self.default_folder_card(cx))
             .children(self.app_update_card(cx))
             .child(
                 div()
@@ -699,6 +701,159 @@ impl EditorView {
                     .child(section_title("保存"))
                     .child(card("settings-autosave-card").child(autosave).children(store_error)),
             )
+    }
+
+    /// The "デフォルトのフォルダ" card: the saved default folder (or 未設定)
+    /// with one button that opens the folder dialog. A long path is
+    /// ellipsized on one line and shown in full on hover.
+    #[inline(never)]
+    fn default_folder_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let view = cx.entity();
+        let picking = self.default_folder_picking;
+        let saved = self
+            .settings
+            .default_folder
+            .as_ref()
+            .map(|path| path.display().to_string());
+        let button_label = if saved.is_some() { "変更…" } else { "選択…" };
+        let button = Button::new("settings-default-folder-button")
+            .label(button_label)
+            .ghost()
+            .disabled(picking)
+            .on_click(move |_, _window, app| {
+                view.update(app, |view, cx| view.prompt_settings_default_folder(cx));
+            });
+        let value = match saved {
+            Some(full_path) => {
+                let trigger = div()
+                    .debug_selector(|| "settings-default-folder-value".to_owned())
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
+                    .child(full_path.clone());
+                HoverCard::new("settings-default-folder-path")
+                    .anchor(Anchor::TopCenter)
+                    .trigger(trigger)
+                    .content(move |_, _, _| {
+                        div()
+                            .max_w(px(560.0))
+                            .whitespace_normal()
+                            .child(full_path.clone())
+                    })
+                    .into_any_element()
+            }
+            None => div()
+                .debug_selector(|| "settings-default-folder-value".to_owned())
+                .w_full()
+                .min_w_0()
+                .truncate()
+                .child("未設定")
+                .into_any_element(),
+        };
+        let error = self.default_folder_error.as_ref().map(|error| {
+            div()
+                .id("settings-default-folder-error")
+                .debug_selector(|| "settings-default-folder-error".to_owned())
+                .text_color(rgb(0xb42318))
+                .child(format!("フォルダを選択できませんでした（{error}）。"))
+        });
+        div()
+            .id("settings-default-folder-card")
+            .debug_selector(|| "settings-default-folder-card".to_owned())
+            .w_full()
+            .px(px(16.0))
+            .py(px(14.0))
+            .rounded_sm()
+            .border_1()
+            .border_color(rgb(self.theme.sidebar_active_background))
+            .bg(rgb(self.theme.code_background))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(rgb(self.theme.quote_foreground))
+                    .child("デフォルトのフォルダ"),
+            )
+            .child(
+                div()
+                    .text_color(rgb(self.theme.quote_foreground))
+                    .child("次回の通常起動時に、このフォルダを開きます。"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(120.0))
+                            .overflow_hidden()
+                            .child(value),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .debug_selector(|| "settings-default-folder-button".to_owned())
+                            .child(button),
+                    ),
+            )
+            .children(error)
+    }
+
+    /// Opens the folder-only, single-choice dialog for the default folder.
+    /// It never switches the current work folder; the result is handled by
+    /// `finish_settings_default_folder_prompt`.
+    pub(crate) fn prompt_settings_default_folder(&mut self, cx: &mut Context<Self>) {
+        if self.default_folder_picking {
+            return;
+        }
+        self.default_folder_picking = true;
+        self.default_folder_error = None;
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("デフォルトのフォルダを選択".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let result = match receiver.await {
+                Ok(Ok(paths)) => Ok(paths),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = view.update(cx, |view, cx| {
+                view.finish_settings_default_folder_prompt(result, cx);
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Applies the dialog result: a chosen folder becomes the saved default
+    /// (stored through `store_settings`, the settings screen stays open and
+    /// the work folder is untouched); cancel and an empty result write
+    /// nothing; a dialog failure is shown inside the card.
+    pub(crate) fn finish_settings_default_folder_prompt(
+        &mut self,
+        result: Result<Option<Vec<PathBuf>>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.default_folder_picking = false;
+        match result {
+            Ok(paths) => {
+                if let Some(path) = paths.and_then(|paths| paths.into_iter().next()) {
+                    self.default_folder_error = None;
+                    self.settings.default_folder = Some(path);
+                    self.store_settings();
+                }
+            }
+            Err(error) => self.default_folder_error = Some(error),
+        }
+        cx.notify();
     }
 
     /// Applies and stores the chosen theme preference. Choosing the current

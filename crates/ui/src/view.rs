@@ -1002,6 +1002,12 @@ pub struct EditorView {
     /// settings page. Kept apart from `settings_error`, which belongs to the
     /// Windows integration.
     settings_store_error: Option<String>,
+    /// True while the settings screen's default-folder dialog is open, so the
+    /// button stays disabled and a second dialog cannot start.
+    default_folder_picking: bool,
+    /// The last failure of the settings screen's default-folder dialog,
+    /// shown inside that card. Cleared when the dialog is opened again.
+    default_folder_error: Option<String>,
     /// Active drag of the sidebar's visible scrollbar thumb.
     sidebar_scrollbar_drag: Option<ScrollbarDrag>,
     /// Active drag of the editor's visible scrollbar thumb.
@@ -9289,6 +9295,252 @@ mod tests {
                 "{id} must not be clipped past the right edge: {bounds:?}"
             );
         }
+    }
+
+    /// Opens the settings screen of an isolated view backed by `stores`.
+    /// The real platform folder dialog cannot run in tests, so the dialog
+    /// result is handed to `finish_settings_default_folder_prompt` directly.
+    fn open_default_folder_settings(
+        cx: &mut gpui::TestAppContext,
+        stores: StateStores,
+        width: f32,
+    ) -> (gpui::Entity<EditorView>, &mut gpui::VisualTestContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled("body\n", "Untitled"),
+                Arc::new(OsFileService),
+                stores,
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(width), px(600.0)));
+        cx.run_until_parked();
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_settings(window, cx));
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    fn stored_default_folder(view: &EditorView) -> Option<PathBuf> {
+        view.stores.settings().load().default_folder
+    }
+
+    #[gpui::test]
+    fn general_settings_shows_the_saved_default_folder_or_unset(cx: &mut gpui::TestAppContext) {
+        let saved = PathBuf::from("/notes/とても/長い/パス/".repeat(12));
+        let stores = StateStores::memory();
+        let mut settings = stores.settings().load();
+        settings.default_folder = Some(saved.clone());
+        stores.settings().store(&settings).unwrap();
+        let (view, vcx) = open_default_folder_settings(cx, stores, 279.0);
+        view.read_with(vcx, |view, _| {
+            assert_eq!(view.settings.default_folder, Some(saved.clone()));
+            assert!(!view.default_folder_picking);
+        });
+        for id in [
+            "settings-default-folder-card",
+            "settings-default-folder-value",
+            "settings-default-folder-button",
+        ] {
+            let bounds = vcx
+                .debug_bounds(id)
+                .unwrap_or_else(|| panic!("{id} must be laid out"));
+            assert!(bounds.left() >= px(0.0), "{id} clipped on the left");
+            assert!(
+                bounds.right() <= px(279.0),
+                "{id} must not be clipped past the right edge: {bounds:?}"
+            );
+        }
+
+        let (view, cx) = open_default_folder_settings(cx, StateStores::memory(), 640.0);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.settings.default_folder, None);
+        });
+        assert!(cx.debug_bounds("settings-default-folder-value").is_some());
+        assert!(cx.debug_bounds("settings-default-folder-button").is_some());
+    }
+
+    #[gpui::test]
+    fn changing_default_folder_saves_without_replacing_open_sessions(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_default_folder_settings(cx, StateStores::memory(), 640.0);
+        let chosen = PathBuf::from("/notes/chosen");
+        let (session_id, text_len) = view.update(cx, |view, cx| {
+            let end = SourceOffset(view.editor().document().len_bytes().0);
+            view.editor_mut()
+                .set_selection(Selection::caret(end))
+                .unwrap();
+            view.editor_mut().insert_text(" edited").unwrap();
+            view.after_input(cx);
+            assert!(view.sessions.active().is_dirty());
+            (
+                view.sessions.active_id(),
+                view.editor().document().len_bytes().0,
+            )
+        });
+        let root_before = view.read_with(cx, |view, _| {
+            view.work_folder.as_ref().map(|folder| folder.root().to_path_buf())
+        });
+        let other = Settings {
+            default_folder: None,
+            ..view.read_with(cx, |view, _| view.settings.clone())
+        };
+
+        view.update(cx, |view, cx| {
+            view.default_folder_picking = true;
+            view.finish_settings_default_folder_prompt(Ok(Some(vec![chosen.clone()])), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(view.settings_open);
+            assert!(!view.default_folder_picking);
+            assert_eq!(view.settings.default_folder, Some(chosen.clone()));
+            assert_eq!(stored_default_folder(view), Some(chosen.clone()));
+            let stored = view.stores.settings().load();
+            assert_eq!(stored.autosave, other.autosave);
+            assert_eq!(stored.theme, other.theme);
+            assert_eq!(view.sessions.len(), 1);
+            assert_eq!(view.sessions.active_id(), session_id);
+            assert!(view.sessions.active().is_dirty());
+            assert_eq!(view.editor().document().len_bytes().0, text_len);
+            assert_eq!(
+                view.work_folder.as_ref().map(|folder| folder.root().to_path_buf()),
+                root_before
+            );
+            assert_eq!(view.default_folder_error, None);
+        });
+    }
+
+    #[gpui::test]
+    fn cancelling_default_folder_picker_preserves_the_saved_folder(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let saved = PathBuf::from("/notes/saved");
+        let stores = StateStores::memory();
+        let mut settings = stores.settings().load();
+        settings.default_folder = Some(saved.clone());
+        stores.settings().store(&settings).unwrap();
+        let (view, cx) = open_default_folder_settings(cx, stores, 640.0);
+
+        for result in [Ok(None), Ok(Some(Vec::new()))] {
+            view.update(cx, |view, cx| {
+                view.default_folder_picking = true;
+                view.finish_settings_default_folder_prompt(result, cx);
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(!view.default_folder_picking, "the button is usable again");
+                assert_eq!(view.settings.default_folder, Some(saved.clone()));
+                assert_eq!(stored_default_folder(view), Some(saved.clone()));
+                assert_eq!(view.default_folder_error, None);
+                assert_eq!(view.settings_store_error, None);
+                assert!(view.work_folder.is_none());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn default_folder_picker_error_keeps_the_previous_value(cx: &mut gpui::TestAppContext) {
+        let saved = PathBuf::from("/notes/saved");
+        let stores = StateStores::memory();
+        let mut settings = stores.settings().load();
+        settings.default_folder = Some(saved.clone());
+        stores.settings().store(&settings).unwrap();
+        let (view, cx) = open_default_folder_settings(cx, stores, 640.0);
+
+        view.update(cx, |view, cx| {
+            view.default_folder_picking = true;
+            view.finish_settings_default_folder_prompt(Err("dialog broke".to_owned()), cx);
+        });
+        cx.run_until_parked();
+
+        view.read_with(cx, |view, _| {
+            assert!(!view.default_folder_picking, "the picker can be retried");
+            assert_eq!(view.default_folder_error.as_deref(), Some("dialog broke"));
+            assert_eq!(view.settings.default_folder, Some(saved.clone()));
+            assert_eq!(stored_default_folder(view), Some(saved.clone()));
+        });
+        assert!(cx.debug_bounds("settings-default-folder-error").is_some());
+
+        let retried = PathBuf::from("/notes/retried");
+        view.update(cx, |view, cx| {
+            view.finish_settings_default_folder_prompt(Ok(Some(vec![retried.clone()])), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.default_folder_error, None);
+            assert_eq!(stored_default_folder(view), Some(retried.clone()));
+        });
+        assert!(cx.debug_bounds("settings-default-folder-error").is_none());
+    }
+
+    #[gpui::test]
+    fn default_folder_save_error_is_visible_and_same_path_can_be_retried(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use hane_session::{MemoryStateStore, SettingsRepository};
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct FlakySettings {
+            failing: AtomicBool,
+            stored: Mutex<Settings>,
+        }
+
+        impl SettingsRepository for FlakySettings {
+            fn load(&self) -> Settings {
+                self.stored.lock().unwrap().clone()
+            }
+
+            fn store(&self, settings: &Settings) -> std::io::Result<()> {
+                if self.failing.load(Ordering::SeqCst) {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                *self.stored.lock().unwrap() = settings.clone();
+                Ok(())
+            }
+        }
+
+        let repository = Arc::new(FlakySettings {
+            failing: AtomicBool::new(true),
+            stored: Mutex::new(Settings::default()),
+        });
+        let stores = StateStores::new(
+            repository.clone(),
+            Arc::new(MemoryStateStore::default()),
+        );
+        let (view, cx) = open_default_folder_settings(cx, stores, 640.0);
+        let chosen = PathBuf::from("/notes/chosen");
+
+        view.update(cx, |view, cx| {
+            view.default_folder_picking = true;
+            view.finish_settings_default_folder_prompt(Ok(Some(vec![chosen.clone()])), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(repository.load().default_folder, None, "the old value stays stored");
+        view.read_with(cx, |view, _| {
+            assert!(view.settings_store_error.is_some());
+            assert_eq!(view.settings.default_folder, Some(chosen.clone()));
+            assert!(!view.default_folder_picking);
+        });
+        assert!(cx.debug_bounds("settings-store-error").is_some());
+
+        repository.failing.store(false, Ordering::SeqCst);
+        view.update(cx, |view, cx| {
+            view.finish_settings_default_folder_prompt(Ok(Some(vec![chosen.clone()])), cx);
+        });
+        cx.run_until_parked();
+
+        assert_eq!(repository.load().default_folder, Some(chosen.clone()));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.settings_store_error, None);
+        });
+        assert!(cx.debug_bounds("settings-store-error").is_none());
     }
 
     #[test]

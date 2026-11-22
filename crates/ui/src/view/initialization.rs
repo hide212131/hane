@@ -203,6 +203,8 @@ impl EditorView {
             save_problems: HashMap::new(),
             external_comparison: None,
             settings_store_error: None,
+            default_folder_picking: false,
+            default_folder_error: None,
             sidebar_scrollbar_drag: None,
             editor_scrollbar_drag: None,
             text_selection_drag: false,
