@@ -707,7 +707,7 @@ impl EditorView {
     /// with one button that opens the folder dialog. A long path is
     /// ellipsized on one line and shown in full on hover.
     #[inline(never)]
-    fn default_folder_card(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn default_folder_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let view = cx.entity();
         let picking = self.default_folder_picking;
         let saved = self
