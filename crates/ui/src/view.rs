@@ -7057,6 +7057,189 @@ mod tests {
         });
     }
 
+    /// A painted `EditorView` over `text` whose settings and state live in
+    /// memory only, so a test that switches modes never reads or writes the
+    /// user's persisted files.
+    fn open_isolated_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        text: &str,
+    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+        let text = text.to_owned();
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(move |_, cx| {
+            EditorView::from_sessions(
+                SessionSet::with_untitled(&text, "Untitled"),
+                Arc::new(OsFileService),
+                StateStores::memory(),
+                cx,
+            )
+        });
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// Issue #757: an HTML tag opens and closes with the caret, a selection and
+    /// the mode like a Markdown marker does, and none of that touches the
+    /// document bytes, revision, dirty flag or undo history.
+    #[gpui::test]
+    fn html_markup_disclosure_preserves_editor_state(cx: &mut gpui::TestAppContext) {
+        const CLOSED: &str = "pre bold end";
+        const OPEN: &str = "pre <b>bold</b> end";
+        let text = "pre <b>bold</b> end\n";
+        let (view, cx) = open_isolated_view(cx, text);
+        let snapshot = |view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                (
+                    view.editor().document().full_text(),
+                    view.editor().document().revision(),
+                    view.sessions.active().is_dirty(),
+                    view.editor().can_undo(),
+                    view.editor().can_redo(),
+                )
+            })
+        };
+        let shown = |view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext| {
+            view.read_with(cx, |view, _| {
+                view.rendered_line(0).map(|line| line.visual_text)
+            })
+        };
+        let select = |view: &gpui::Entity<EditorView>,
+                      cx: &mut gpui::VisualTestContext,
+                      selection: Selection| {
+            view.update(cx, |view, cx| {
+                view.editor_mut().set_selection(selection).unwrap();
+                cx.notify();
+            });
+            cx.run_until_parked();
+        };
+        let step = |view: &gpui::Entity<EditorView>,
+                    cx: &mut gpui::VisualTestContext,
+                    command: EditorCommand<'static>| {
+            view.update(cx, |view, cx| view.dispatch(command, cx));
+            cx.run_until_parked();
+        };
+        let before = snapshot(&view, cx);
+        assert_eq!(before.0, text);
+        assert!(!before.2 && !before.3 && !before.4);
+
+        select(&view, cx, Selection::caret(SourceOffset(0)));
+        assert_eq!(shown(&view, cx).as_deref(), Some(CLOSED));
+        // Inside the content, and a reversed selection reaching into it.
+        select(&view, cx, Selection::caret(SourceOffset(9)));
+        assert_eq!(shown(&view, cx).as_deref(), Some(OPEN));
+        select(
+            &view,
+            cx,
+            Selection {
+                anchor: SourceOffset(15),
+                active: SourceOffset(7),
+            },
+        );
+        assert_eq!(shown(&view, cx).as_deref(), Some(OPEN));
+
+        // Arrow keys carry the caret over the boundary in both directions.
+        select(&view, cx, Selection::caret(SourceOffset(3)));
+        assert_eq!(shown(&view, cx).as_deref(), Some(CLOSED));
+        step(&view, cx, EditorCommand::MoveRight { extend: false });
+        assert_eq!(
+            view.read_with(cx, |view, _| view.editor().selection()),
+            Selection::caret(SourceOffset(4))
+        );
+        assert_eq!(shown(&view, cx).as_deref(), Some(OPEN));
+        step(&view, cx, EditorCommand::MoveLeft { extend: false });
+        assert_eq!(shown(&view, cx).as_deref(), Some(CLOSED));
+        // Right after the closing tag still belongs to the element.
+        select(&view, cx, Selection::caret(SourceOffset(15)));
+        assert_eq!(shown(&view, cx).as_deref(), Some(OPEN));
+        step(&view, cx, EditorCommand::MoveRight { extend: false });
+        assert_eq!(shown(&view, cx).as_deref(), Some(CLOSED));
+
+        // Reading keeps the tags closed wherever the caret is, and editing
+        // brings the disclosure back.
+        select(&view, cx, Selection::caret(SourceOffset(9)));
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(&view, cx).as_deref(), Some(CLOSED));
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Editing;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(&view, cx).as_deref(), Some(OPEN));
+
+        // None of it was an edit.
+        assert_eq!(snapshot(&view, cx), before);
+    }
+
+    /// Issue #757: a click on an HTML link opens it on mouse-up and a drag
+    /// selects instead, through the same dispatch a Markdown link uses; the
+    /// hidden tags are not part of what is clicked.
+    #[gpui::test]
+    fn html_reading_link_click_and_drag_use_existing_dispatch(cx: &mut gpui::TestAppContext) {
+        const DESTINATION: &str = "https://example.com/";
+        let text = "see <a href=\"https://example.com/\">Hane</a> end\n";
+        let (view, cx) = open_isolated_view(cx, text);
+        view.update(cx, |view, cx| {
+            view.editor_mode = EditorMode::Reading;
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        // Visual text is "see Hane end": offset 5 is inside the link, 9 is past it.
+        assert_eq!(
+            view.read_with(cx, |view, _| view
+                .rendered_line(0)
+                .map(|line| line.visual_text)),
+            Some("see Hane end".to_owned())
+        );
+        let (down_point, pressed) = row_click(&view, cx, "row-0-0", 0, 0, 5);
+        let (move_point, dragged_to) = row_click(&view, cx, "row-0-0", 0, 0, 9);
+        let (text_before, revision_before) = view.read_with(cx, |view, _| {
+            (
+                view.editor().document().full_text(),
+                view.editor().document().revision(),
+            )
+        });
+        assert!(cx.opened_url().is_none());
+
+        // Drag first: the destination is not opened and the selection follows.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(move_point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(move_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        let selection_after_drag = Selection {
+            anchor: pressed,
+            active: dragged_to,
+        };
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert_eq!(view.editor().selection(), selection_after_drag);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+        });
+
+        // A plain click is held at mouse-down and opened at mouse-up.
+        cx.simulate_mouse_down(down_point, MouseButton::Left, gpui::Modifiers::none());
+        assert!(cx.opened_url().is_none());
+        view.read_with(cx, |view, _| assert!(view.pending_reading_link.is_some()));
+        cx.simulate_mouse_up(down_point, MouseButton::Left, gpui::Modifiers::none());
+        assert_eq!(cx.opened_url().as_deref(), Some(DESTINATION));
+        view.read_with(cx, |view, _| {
+            assert!(view.pending_reading_link.is_none());
+            assert!(!view.text_selection_drag);
+            assert_eq!(view.editor().selection(), selection_after_drag);
+            assert_eq!(view.editor().document().full_text(), text_before);
+            assert_eq!(view.editor().document().revision(), revision_before);
+            assert!(!view.sessions.active().is_dirty());
+            assert!(!view.editor().can_undo());
+            assert!(!view.editor().can_redo());
+        });
+    }
+
     /// Issue #603: the click / drag boundary is one distance rule. Travel
     /// shorter than the threshold is a click; exactly the threshold is a drag.
     #[test]

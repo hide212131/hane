@@ -33,6 +33,7 @@ mod block_store;
 mod clipboard;
 mod fence_height;
 mod front_matter;
+mod html;
 mod link_insertion;
 mod list_editing;
 mod list_projection;
@@ -56,6 +57,7 @@ pub use front_matter::{
     FrontMatter, FrontMatterDate, FrontMatterDateState, FrontMatterEntry, FrontMatterHead,
     FrontMatterMetadata, FrontMatterSpan, front_matter_head, recognize_front_matter,
 };
+pub use html::{HtmlElement, HtmlKind, HtmlTagEdge};
 pub use link_insertion::{
     LinkInsertionPlan, LinkInsertionRefusal, clipboard_http_url, plan_link_insertion,
 };

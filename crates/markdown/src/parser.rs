@@ -1,4 +1,5 @@
 use crate::front_matter::recognize_front_matter;
+use crate::html::{HtmlElement, HtmlKind, recognize_html};
 use crate::markers::{
     ParsedCodeSpan, absolute_range, code_padding, derive_markers, line_break_padding,
     list_structural_prefixes, task_markers,
@@ -493,7 +494,7 @@ fn is_valid_bare_url(candidate: &str) -> bool {
 /// True for an absolute `http://` or `https://` URL with a host and no
 /// whitespace or control characters. Everything else (relative paths, `file:`,
 /// other schemes) is not opened.
-fn is_external_http_url(url: &str) -> bool {
+pub(crate) fn is_external_http_url(url: &str) -> bool {
     let Some(scheme_len) = ["https://", "http://"]
         .iter()
         .find(|scheme| {
@@ -553,12 +554,21 @@ pub fn parse_document_with_front_matter(
 ) -> MarkdownParse {
     debug_assert_eq!(source_range.end.0 - source_range.start.0, source.len());
     debug_assert!(front_matter.is_none_or(|range| range.start == source_range.start));
-    let (tree, codes, table_parses, links) = build_tree(source_range, source, front_matter);
-    let markers = derive_markers(&tree, source_range, source);
-    let code_padding = code_padding(&tree, &codes, source_range, source);
+    let (tree, codes, table_parses, mut links) = build_tree(source_range, source, front_matter);
+    let mut markers = derive_markers(&tree, source_range, source);
+    let mut code_padding = code_padding(&tree, &codes, source_range, source);
     let line_break_padding = line_break_padding(&tree, source_range, source);
     let list_structural_prefixes = list_structural_prefixes(&tree, source_range, source);
     let task_markers = task_markers(&tree, &markers.list_item_markers, source_range, source);
+    let html_elements = recognize_html(&tree, source, source_range.start.0);
+    if !html_elements.is_empty() {
+        apply_html(
+            &html_elements,
+            &mut links,
+            &mut markers.markers,
+            &mut code_padding,
+        );
+    }
     MarkdownParse {
         revision,
         source_range,
@@ -574,7 +584,44 @@ pub fn parse_document_with_front_matter(
         list_structural_prefixes,
         code_padding,
         line_break_padding,
+        html_elements,
     }
+}
+
+/// Folds verified HTML elements into the parse's derived tables: their tags
+/// become markers, a valid `<a>` becomes a link, and anything the formal parse
+/// derived from inside literal `<code>` content is dropped so that content
+/// stays plain source.
+fn apply_html(
+    elements: &[HtmlElement],
+    links: &mut Vec<LinkParse>,
+    markers: &mut Vec<SourceRange>,
+    padding: &mut Vec<SourceRange>,
+) {
+    let literal = |range: SourceRange| {
+        elements.iter().any(|element| {
+            element.kind == HtmlKind::Code
+                && element.content_range.start <= range.start
+                && range.end <= element.content_range.end
+        })
+    };
+    links.retain(|link| !literal(link.text_range));
+    padding.retain(|range| !literal(*range));
+    markers.retain(|range| !literal(*range));
+    for element in elements {
+        markers.push(element.open_tag);
+        markers.push(element.close_tag);
+        if let Some(destination) = &element.destination {
+            links.push(LinkParse {
+                node: element.open_node,
+                text_range: element.content_range,
+                destination: destination.clone(),
+                uses_reference: false,
+            });
+        }
+    }
+    markers.sort_by_key(|range| (range.start, range.end));
+    links.sort_by_key(|link| link.text_range.start);
 }
 
 #[cfg(test)]
