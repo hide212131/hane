@@ -206,6 +206,43 @@ fn html_block_height_matches_disclosure_and_measured_rows() {
 }
 
 #[test]
+fn html_block_after_reference_definition_keeps_display_and_height_in_step() {
+    let source = "[r]: https://example.com/\n\n<h1>x</h1>\n";
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let close = |a: f32, b: f32| (a - b).abs() < 1e-3;
+    let element_start = source.find("<h1>").unwrap();
+
+    let collapsed_block = present(source, 0, None, false);
+    assert_eq!(collapsed_block.kind, BlockKind::Heading(1));
+    let collapsed = block_heights_with_disclosure(&buffer, &index, LINE_HEIGHT, None);
+
+    let caret = SourceRange::empty(element_start + 5);
+    let open_block = present(source, 0, Some(caret), false);
+    assert_eq!(open_block.kind, BlockKind::Unsupported);
+    let element = open_block
+        .lines
+        .iter()
+        .find(|line| line.source_range.start.0 == element_start)
+        .expect("element line");
+    assert_eq!(element.visual_text.trim_end(), "<h1>x</h1>");
+    let open = block_heights_with_disclosure(&buffer, &index, LINE_HEIGHT, Some(caret));
+
+    // Disclosing the element turns its Heading row into an ordinary row.
+    assert!(
+        close(collapsed[0] - open[0], LINE_HEIGHT * 0.65),
+        "{collapsed:?} vs {open:?}"
+    );
+
+    // A caret on the reference definition does not disclose the element.
+    let elsewhere = SourceRange::empty(2);
+    let other_block = present(source, 0, Some(elsewhere), false);
+    assert_eq!(other_block.kind, BlockKind::Heading(1));
+    let other = block_heights_with_disclosure(&buffer, &index, LINE_HEIGHT, Some(elsewhere));
+    assert!(close(other[0], collapsed[0]), "{other:?} vs {collapsed:?}");
+}
+
+#[test]
 fn raw_html_fallback_does_not_create_resource_targets() {
     let image = "![i](https://example.com/a.png)";
     let link = "[l](https://example.com/)";

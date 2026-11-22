@@ -656,7 +656,9 @@ pub fn present_block_with_table_projection(
             if window
                 .lines
                 .iter()
-                .find(|line| line.line < content_end && !line.text.trim().is_empty())
+                .find(|line| {
+                    line.line < content_end && super::html_block::is_html_element_line(line.text)
+                })
                 .is_some_and(|line| {
                     super::html_block::html_line_is_disclosed(
                         line.range,

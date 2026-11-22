@@ -186,16 +186,27 @@ pub(super) fn block_kind_with_disclosure(
     let Some(span) = block_line_span(document, block) else {
         return kind;
     };
-    let line = hane_document::LineId(span.start + block.leading_content_lines);
-    let (Ok(range), true) = (document.line_range(line), span.contains(&line.0)) else {
-        return kind;
-    };
-    let Ok(text) = document.text(range) else {
-        return kind;
-    };
-    if html_line_is_disclosed(range, &text, disclosure) {
-        BlockKind::Unsupported
-    } else {
-        kind
+    // The element's own line, not the tile's first non-blank line: leading
+    // link reference definitions share the tile but are not syntax nodes.
+    for line in span {
+        let Ok(range) = document.line_range(hane_document::LineId(line)) else {
+            return kind;
+        };
+        let Ok(text) = document.text(range) else {
+            return kind;
+        };
+        if is_html_element_line(&text) {
+            return if html_line_is_disclosed(range, &text, disclosure) {
+                BlockKind::Unsupported
+            } else {
+                kind
+            };
+        }
     }
+    kind
+}
+
+/// Whether `text` is the one physical line of a single-line HTML element.
+pub(super) fn is_html_element_line(text: &str) -> bool {
+    recognize_html_block_line(text).is_some()
 }
