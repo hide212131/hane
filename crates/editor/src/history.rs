@@ -177,9 +177,10 @@ impl History {
         selection_before: Selection,
         selection_after: Selection,
         kind: EditKind,
-    ) {
+    ) -> u64 {
+        let id = fresh_entry_id();
         self.undo.push(HistoryEntry {
-            id: fresh_entry_id(),
+            id,
             start,
             deleted,
             inserted,
@@ -189,6 +190,32 @@ impl History {
             last_edit_at: Instant::now(),
         });
         self.redo.clear();
+        self.can_merge_last = false;
+        id
+    }
+
+    /// The identity of the newest Undo step, if any.
+    pub(crate) fn top_id(&self) -> Option<u64> {
+        self.undo.last().map(|entry| entry.id)
+    }
+
+    /// Whether the newest Undo step is `id`, nothing can be redone, and the
+    /// step is the insertion `[start, start + inserted_len)`.
+    pub(crate) fn can_amend(&self, id: u64, start: usize, inserted_len: usize) -> bool {
+        self.redo.is_empty()
+            && self.undo.last().is_some_and(|entry| {
+                entry.id == id && entry.start == start && entry.inserted.len() == inserted_len
+            })
+    }
+
+    /// Rewrites the inserted text of the newest Undo step in place, so one Undo
+    /// removes the amended text and one Redo restores it. The caller has
+    /// checked [`Self::can_amend`] and applied the same change to the document.
+    pub(crate) fn amend_top(&mut self, inserted: String, selection_after: Selection) {
+        let entry = self.undo.last_mut().expect("amendable history has a step");
+        entry.inserted = inserted;
+        entry.selection_after = selection_after;
+        entry.id = fresh_entry_id();
         self.can_merge_last = false;
     }
 

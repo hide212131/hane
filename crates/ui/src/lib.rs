@@ -32,10 +32,11 @@ pub use icons::{AppAssets, WorkFolderIcons};
 #[cfg(feature = "instrument")]
 pub use instrument::InstrumentationConfig;
 pub use proxy_secret::{OsProxyCredentialStore, ProxySecretWriter, SecretStoreError};
+pub use view::run_link_call;
 pub use view::{
     AiLifecycle, AiResume, AppUpdateController, AppUpdatePhase, AppUpdateSnapshot, EditorView,
-    ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, NetworkSettingsApplier, PreparedUpdate, RestartBlocker, RestartObservation,
-    RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue,
+    ExplorerRepairScope, ExternalOpenGuard, ExternalOpenOutcome, ExternalOpenQueue, LinkCall, LinkWindow, NetworkSettingsApplier, PreparedUpdate, RestartBlocker, RestartObservation,
+    RestartPreparation, RestartTicketFile, RestartTicketSnapshot, SharedExternalOpenQueue, WhisparrotLinkController,
 };
 
 /// Tracks the settings component setup once per GPUI application.

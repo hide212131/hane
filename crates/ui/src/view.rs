@@ -138,6 +138,9 @@ use mermaid_diagrams::diagram_plan_matches;
 mod network_settings;
 pub use network_settings::NetworkSettingsApplier;
 mod plain_text_mode;
+mod whisparrot_link;
+pub use whisparrot_link::{LinkCall, LinkWindow, WhisparrotLinkController, run_link_call};
+use whisparrot_link::LinkViewState;
 mod reading_mode;
 use reading_mode::{EditorMode, ModeAnchor, command_changes_text};
 mod render;
@@ -835,6 +838,8 @@ pub struct EditorView {
     network_settings: network_settings::NetworkSettingsPage,
     /// Hands a saved network setting to the application's services.
     network_applier: Option<Arc<dyn NetworkSettingsApplier>>,
+    /// The window's side of the whisparrot link (see `view/whisparrot_link.rs`).
+    link: LinkViewState,
     ai_selection: ai_selection::AiSelectionState,
     /// The app-owned update service handle, if one is attached. The service
     /// outlives this view; the view only sends explicit user commands to it.

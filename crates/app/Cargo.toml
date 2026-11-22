@@ -45,6 +45,9 @@ hane-update = { workspace = true, features = ["test-support"] }
 ring = "0.17"
 
 [target.'cfg(windows)'.dependencies]
+async-channel.workspace = true
+hane-link.workspace = true
+raw-window-handle = "0.6"
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_IO", "Win32_UI_WindowsAndMessaging"] }
 
 [[example]]

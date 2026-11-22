@@ -631,6 +631,19 @@ impl EditorView {
                     view.set_syntax_highlight(*checked, cx);
                 });
             });
+        // Offered only where the link exists (the app attached a controller).
+        let link_section = self.whisparrot_link_available().then(|| {
+            let link_view = cx.entity();
+            let link = Checkbox::new("settings-whisparrot-link")
+                .checked(self.whisparrot_link_enabled())
+                .label("whisparrot とのローカル連携を許可する")
+                .on_click(move |checked, _window, app| {
+                    link_view.update(app, |view, cx| {
+                        view.set_whisparrot_link(*checked, cx);
+                    });
+                });
+            (link, self.theme.quote_foreground)
+        });
         let store_error = self.settings_store_error.as_ref().map(|error| {
             div()
                 .id("settings-store-error")
@@ -701,6 +714,20 @@ impl EditorView {
                     .child(section_title("保存"))
                     .child(card("settings-autosave-card").child(autosave).children(store_error)),
             )
+            .children(link_section.map(|(link, note_color)| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("連携"))
+                    .child(card("settings-whisparrot-link-card").child(link).child(
+                        div().text_color(rgb(note_color)).child(
+                            "音声入力アプリ whisparrot が、開いている文書のカーソル付近の文章・\
+                             タイトル・Front Matter を読み取り、認識結果を文書へ挿入・差し替えできるようになります。\
+                             通信はこのパソコン内の専用の接続に限られ、既定ではオフです。",
+                        ),
+                    ))
+            }))
     }
 
     /// The "デフォルトのフォルダ" card: the saved default folder (or 未設定)
