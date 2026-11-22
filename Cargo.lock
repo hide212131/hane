@@ -3139,10 +3139,12 @@ dependencies = [
 name = "hane"
 version = "0.51.0"
 dependencies = [
+ "async-channel",
  "gpui-pre",
  "gpui-pre-platform",
  "hane-ai",
  "hane-document",
+ "hane-link",
  "hane-markdown",
  "hane-metrics",
  "hane-network",
@@ -3150,6 +3152,7 @@ dependencies = [
  "hane-session",
  "hane-ui",
  "hane-update",
+ "raw-window-handle",
  "ring",
  "rustls",
  "rustls-native-certs",
@@ -3193,6 +3196,20 @@ dependencies = [
  "hane-document",
  "hane-metrics",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "hane-link"
+version = "0.51.0"
+dependencies = [
+ "async-channel",
+ "hane-document",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
+ "unicode-segmentation",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3257,6 +3274,7 @@ dependencies = [
  "hane-ai",
  "hane-document",
  "hane-editor",
+ "hane-link",
  "hane-markdown",
  "hane-metrics",
  "hane-network",

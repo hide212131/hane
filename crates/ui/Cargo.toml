@@ -19,6 +19,7 @@ roxmltree = "=0.21.1"
 serde_json = "=1.0.154"
 async-channel.workspace = true
 hane-document.workspace = true
+hane-link.workspace = true
 hane-ai.workspace = true
 hane-editor.workspace = true
 hane-metrics.workspace = true

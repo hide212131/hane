@@ -35,6 +35,8 @@ mod limited_start;
 mod network_state;
 #[cfg(target_os = "windows")]
 mod open_request;
+#[cfg(target_os = "windows")]
+mod whisparrot_link;
 #[cfg(test)]
 mod proxy_curl_tests;
 #[cfg(test)]
@@ -740,6 +742,9 @@ pub(crate) struct EditorLaunch {
     open_requests: std::sync::mpsc::Receiver<open_request::OpenRequest>,
     #[cfg(target_os = "windows")]
     open_guard: hane_ui::ExternalOpenGuard,
+    /// The whisparrot link service; `None` when this process cannot host it.
+    #[cfg(target_os = "windows")]
+    whisparrot_link: Option<whisparrot_link::LinkSetup>,
     #[cfg(target_os = "macos")]
     finder_requests: FinderReceiver,
     #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -851,6 +856,8 @@ pub(crate) fn prepare_launch<T>(
             open_requests,
             #[cfg(target_os = "windows")]
             open_guard,
+            #[cfg(target_os = "windows")]
+            whisparrot_link: whisparrot_link::LinkSetup::prepare(),
             #[cfg(target_os = "macos")]
             finder_requests,
             #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -896,6 +903,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
         open_requests,
         #[cfg(target_os = "windows")]
         open_guard,
+        #[cfg(target_os = "windows")]
+        whisparrot_link,
         #[cfg(target_os = "macos")]
         finder_requests,
         #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -934,6 +943,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
     // `on_open_urls`; the application object exists by now.
     #[cfg(target_os = "macos")]
     finder_service::install(finder_requests.clone());
+    #[cfg(target_os = "windows")]
+    let link_controller = whisparrot_link.as_ref().map(whisparrot_link::LinkSetup::controller);
     let bounds = Bounds::centered(None, size(px(960.), px(760.)), cx);
     let window = cx
         .open_window(
@@ -964,6 +975,8 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
                     view.attach_external_open_inbox(Some(finder_requests.clone()));
                     #[cfg(target_os = "windows")]
                     view.attach_external_open_guard(open_guard.clone());
+                    #[cfg(target_os = "windows")]
+                    view.attach_whisparrot_link_controller(link_controller.clone());
                     if let Some(version) = update_completed.as_deref() {
                         // Only a process started by a committed update gets
                         // this; an ordinary launch never shows it.
@@ -976,6 +989,10 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
             },
         )
         .expect("open Hane window");
+    #[cfg(target_os = "windows")]
+    if let Some(setup) = whisparrot_link {
+        whisparrot_link::start(cx, window, setup);
+    }
     if let Some(service) = auto_update_service {
         // The first deadline counts from the window's creation, not from
         // process start, so a long document load cannot make the first request

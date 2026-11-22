@@ -82,6 +82,11 @@ pub struct Settings {
     /// (`syntax_highlight` key, Issue #738). Independent of
     /// `plain_text_mode`. A missing or invalid value means `true`.
     pub syntax_highlight: bool,
+    /// Whether Hane lets the whisparrot voice-input app read context from the
+    /// open document and insert or replace text (`whisparrot_link` key). Off
+    /// until the user turns it on; a missing key, any value other than `true`,
+    /// and a settings file that cannot be read all mean off.
+    pub whisparrot_link: bool,
 }
 
 impl Default for Settings {
@@ -95,6 +100,7 @@ impl Default for Settings {
             auto_update_check: true,
             plain_text_mode: false,
             syntax_highlight: true,
+            whisparrot_link: false,
         }
     }
 }
@@ -480,13 +486,14 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\nwhisparrot_link={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
             settings.auto_update_check,
             settings.plain_text_mode,
-            settings.syntax_highlight
+            settings.syntax_highlight,
+            settings.whisparrot_link
         );
         if let Some(folder) = &settings.default_folder {
             contents.push_str("default_folder=");
@@ -535,6 +542,8 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.plain_text_mode = value == "true";
                 } else if let Some(value) = line.strip_prefix("syntax_highlight=") {
                     settings.syntax_highlight = value != "false";
+                } else if let Some(value) = line.strip_prefix("whisparrot_link=") {
+                    settings.whisparrot_link = value == "true";
                 }
             }
             settings.network = parse_network_config(network);
@@ -893,6 +902,7 @@ mod tests {
             auto_update_check: false,
             plain_text_mode: true,
             syntax_highlight: false,
+            whisparrot_link: true,
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -1102,6 +1112,7 @@ mod tests {
                     auto_update_check: true,
                     plain_text_mode: false,
                     syntax_highlight: true,
+                    whisparrot_link: false,
                 })
                 .unwrap();
         }
@@ -1192,6 +1203,41 @@ mod tests {
             assert_eq!(loaded, settings);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn whisparrot_link_is_off_unless_explicitly_stored_as_true() {
+        assert!(!Settings::default().whisparrot_link);
+        assert!(!load_after_writing("autosave=true\n").whisparrot_link);
+        for value in ["false", "", "TRUE", "1", "yes", "true "] {
+            let loaded = load_after_writing(&format!("whisparrot_link={value}\n"));
+            assert!(!loaded.whisparrot_link, "value {value:?}");
+        }
+        assert!(load_after_writing("whisparrot_link=true\n").whisparrot_link);
+    }
+
+    #[test]
+    fn whisparrot_link_survives_a_store_reload_and_other_keys_keep_their_values() {
+        let root = temporary_directory("state-whisparrot-link");
+        let store = FileStateStore::at(&root);
+        let settings = Settings {
+            whisparrot_link: true,
+            autosave: false,
+            ..Settings::default()
+        };
+        SettingsRepository::store(&store, &settings).unwrap();
+        let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+        assert!(text.contains("whisparrot_link=true\n"));
+        let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+        assert!(loaded.whisparrot_link);
+        assert!(!loaded.autosave);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_leaves_the_link_off() {
+        let loaded = settings_from_read(Err(io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(!loaded.whisparrot_link);
     }
 
     #[test]

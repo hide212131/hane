@@ -143,6 +143,7 @@ impl EditorView {
             ai_prompts: ai_prompts::AiPromptsPage::default(),
             network_settings: network_settings::NetworkSettingsPage::default(),
             network_applier: None,
+            link: LinkViewState::default(),
             ai_selection:ai_selection::AiSelectionState::default(),
             app_update: None,
             app_update_polling: false,
