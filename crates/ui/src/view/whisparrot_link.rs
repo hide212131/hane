@@ -7,6 +7,7 @@
 //! without yielding, so a check can never go stale before the edit it guards.
 
 use super::*;
+use hane_link::handles::{HandleTable, RangeRecord};
 use hane_link::message::{ErrorCode, HostRequest, LinkError, LinkResult};
 
 /// The application's hook for starting and stopping the link service when the
@@ -22,6 +23,11 @@ pub trait WhisparrotLinkController: Send + Sync {
 #[derive(Default)]
 pub(super) struct LinkViewState {
     pub(super) controller: Option<Arc<dyn WhisparrotLinkController>>,
+    /// What each inserted utterance is, until it is replaced or expires.
+    handles: HandleTable,
+    /// The service instance `handles` belong to. A new instance (the link was
+    /// turned off and on) starts with none: its clients never saw the old ones.
+    instance: Option<String>,
 }
 
 /// A window the link may address, by the native handle the client captured.
@@ -126,14 +132,22 @@ impl EditorView {
         request: &HostRequest,
         call: &LinkCall<'_>,
         window: &Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) -> LinkResult {
+        self.link_sync_instance(call.instance_id);
         match request {
             HostRequest::ContextGet(params) => self.link_context_get(params, call, window),
-            // Editing requests arrive with H-3 and H-4.
-            HostRequest::Insert(_) | HostRequest::Replace(_) => {
-                Err(LinkError::not_applied(ErrorCode::InvalidRequest))
-            }
+            HostRequest::Insert(params) => self.link_insert(params, call, window, cx),
+            // Replacements arrive with H-4.
+            HostRequest::Replace(_) => Err(LinkError::not_applied(ErrorCode::InvalidRequest)),
+        }
+    }
+
+    /// Forgets every handle of an earlier service instance.
+    fn link_sync_instance(&mut self, instance_id: &str) {
+        if self.link.instance.as_deref() != Some(instance_id) {
+            self.link.handles = HandleTable::default();
+            self.link.instance = Some(instance_id.to_owned());
         }
     }
 
@@ -191,6 +205,70 @@ impl EditorView {
             session.id().0,
             session.generation(),
         )
+    }
+
+    /// `edit.insert`: puts the utterance at the caret as one Undo step, after
+    /// checking that the target, version and selection are still the ones the
+    /// client read. The checks and the edit happen in this one turn.
+    fn link_insert(
+        &mut self,
+        params: &hane_link::message::InsertParams,
+        call: &LinkCall<'_>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> LinkResult {
+        self.link_check_target(window, true)?;
+        let document_id = self.link_document_id(call);
+        if params.document_id != document_id {
+            return Err(LinkError::not_applied(ErrorCode::StaleTarget));
+        }
+        let session = self.sessions.active();
+        if params.expected_revision != session.revision().0.to_string() {
+            return Err(LinkError::not_applied(ErrorCode::StaleVersion));
+        }
+        let selection = session.editor().selection();
+        if selection.anchor.0 != params.expected_selection.anchor_byte
+            || selection.active.0 != params.expected_selection.active_byte
+        {
+            return Err(LinkError::not_applied(ErrorCode::StaleCursor));
+        }
+        let (session_id, generation) = (session.id().0, session.generation());
+        // Into the empty range at the caret: a selection is not consumed. The
+        // caret ends after the inserted text; Undo restores the selection.
+        let at = selection.active.0;
+        let end = at + params.text.len();
+        let recorded = self.editor_mut().replace_range_recorded_with_entry(
+            SourceRange::empty(at),
+            &params.text,
+            Selection::caret(SourceOffset(end)),
+        );
+        let (summary, entry) = recorded.map_err(|_| LinkError::not_applied(ErrorCode::Internal))?;
+        self.status = None;
+        self.after_input(cx);
+        let text_hash = hane_link::auth::sha256_hex(params.text.as_bytes());
+        let range = summary.range_after;
+        let handle = self.link.handles.issue(
+            RangeRecord::new(
+                call.window_id,
+                document_id.clone(),
+                session_id,
+                generation,
+                summary.revision_after.0,
+                params.text.clone(),
+                text_hash.clone(),
+                range,
+                entry,
+            ),
+            call.now,
+        );
+        Ok(serde_json::json!({
+            "documentId": document_id,
+            "insertedRevision": summary.revision_after.0.to_string(),
+            "range": { "startByte": range.start.0, "endByte": range.end.0 },
+            "rangeHandle": handle,
+            "expectedTextHash": text_hash,
+            "expiresInMs": hane_link::message::HANDLE_LIFETIME_MS,
+        }))
     }
 
     /// `context.get`: the text around the caret, the title and Front Matter of
@@ -268,6 +346,7 @@ impl EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hane_link::TickClock;
     use std::sync::Mutex;
 
     /// Records what the view asked the service to do, and can refuse.
@@ -759,6 +838,389 @@ mod tests {
         );
         assert_eq!(versioned["result"]["snapshotStatus"], "not_supported");
         assert!(versioned["result"].get("markdownSource").is_none());
+    }
+
+    /// What a client read with `context.get`, to echo back in an edit.
+    struct Read {
+        document_id: String,
+        revision: String,
+        anchor: u64,
+        active: u64,
+    }
+
+    impl Rig {
+        fn read(&mut self, cx: &mut gpui::VisualTestContext) -> Read {
+            let reply = self.context(cx, serde_json::json!({}));
+            let result = &reply["result"];
+            Read {
+                document_id: result["documentId"].as_str().unwrap().to_owned(),
+                revision: result["revision"].as_str().unwrap().to_owned(),
+                anchor: result["selection"]["anchorByte"].as_u64().unwrap(),
+                active: result["selection"]["activeByte"].as_u64().unwrap(),
+            }
+        }
+
+        fn insert_params(&self, read: &Read, operation: &str, text: &str) -> serde_json::Value {
+            serde_json::json!({
+                "operationId": operation,
+                "deadlineTick": (self.link.clock.now_ms() + 60_000).to_string(),
+                "hwnd": HWND,
+                "documentId": read.document_id,
+                "expectedRevision": read.revision,
+                "expectedSelection": {"anchorByte": read.anchor, "activeByte": read.active},
+                "text": text,
+            })
+        }
+
+        fn insert(
+            &mut self,
+            cx: &mut gpui::VisualTestContext,
+            read: &Read,
+            operation: &str,
+            text: &str,
+        ) -> serde_json::Value {
+            let params = self.insert_params(read, operation, text);
+            self.request(cx, "edit.insert", params)
+        }
+    }
+
+    fn text_of(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) -> String {
+        view.read_with(cx, |view, _| view.editor().document().full_text())
+    }
+
+    fn selection_of(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> (usize, usize) {
+        view.read_with(cx, |view, _| {
+            let selection = view.editor().selection();
+            (selection.anchor.0, selection.active.0)
+        })
+    }
+
+    fn undo(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) {
+        cx.update(|_, app| view.update(app, |view, cx| view.dispatch(EditorCommand::Undo, cx)));
+    }
+
+    #[gpui::test]
+    fn insert_puts_the_text_at_the_caret_as_one_undo_step_and_returns_a_handle(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("前後", "Untitled"));
+        let mut rig = Rig::start("insert-basic", handle);
+        set_caret(&view, cx, "前".len());
+        let read = rig.read(cx);
+        let reply = rig.insert(cx, &read, "op-1", "えーと、こんにちは。");
+        let result = &reply["result"];
+        assert_eq!(text_of(&view, cx), "前えーと、こんにちは。後");
+        let end = "前えーと、こんにちは。".len();
+        assert_eq!(
+            selection_of(&view, cx),
+            (end, end),
+            "the caret follows the text"
+        );
+        assert_eq!(result["documentId"], read.document_id);
+        assert_eq!(
+            result["range"],
+            serde_json::json!({"startByte": "前".len(), "endByte": end})
+        );
+        assert_eq!(
+            result["expectedTextHash"],
+            hane_link::auth::sha256_hex("えーと、こんにちは。".as_bytes())
+        );
+        assert_eq!(result["expiresInMs"], 120_000);
+        assert_eq!(result["rangeHandle"].as_str().unwrap().len(), 32);
+        let revision = view.read_with(cx, |view, _| view.active_session().revision().0);
+        assert_eq!(result["insertedRevision"], revision.to_string());
+        assert!(view.read_with(cx, |view, _| view.active_session().is_dirty()));
+        // One Undo removes the whole utterance and puts the caret back.
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "前後");
+        assert_eq!(selection_of(&view, cx), ("前".len(), "前".len()));
+        assert!(!view.read_with(cx, |view, _| view.editor().can_undo()));
+    }
+
+    #[gpui::test]
+    fn insert_goes_to_the_active_end_of_a_selection_and_does_not_consume_it(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("abcdef", "Untitled"));
+        let mut rig = Rig::start("insert-selection", handle);
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(4),
+                        active: SourceOffset(1),
+                    })
+                    .unwrap();
+            });
+        });
+        let read = rig.read(cx);
+        rig.insert(cx, &read, "op-1", "XY");
+        assert_eq!(text_of(&view, cx), "aXYbcdef");
+        assert_eq!(selection_of(&view, cx), (3, 3));
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "abcdef");
+        assert_eq!(
+            selection_of(&view, cx),
+            (4, 1),
+            "Undo restores the selection, with its direction"
+        );
+    }
+
+    #[gpui::test]
+    fn insert_keeps_unicode_crlf_and_combining_characters_as_sent(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("insert-unicode", handle);
+        let text = "🙂e\u{301}\r\n🇯🇵\n結合";
+        let read = rig.read(cx);
+        let reply = rig.insert(cx, &read, "op-1", text);
+        assert_eq!(text_of(&view, cx), text);
+        assert_eq!(
+            reply["result"]["range"],
+            serde_json::json!({"startByte": 0, "endByte": text.len()})
+        );
+        assert_eq!(
+            reply["result"]["expectedTextHash"],
+            hane_link::auth::sha256_hex(text.as_bytes())
+        );
+    }
+
+    #[gpui::test]
+    fn insert_of_the_largest_allowed_text_works(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("insert-large", handle);
+        let text = "あ".repeat(10_000);
+        assert!(text.len() <= 32 * 1024);
+        let read = rig.read(cx);
+        assert!(rig.insert(cx, &read, "op-1", &text).get("result").is_some());
+        assert_eq!(text_of(&view, cx).len(), text.len());
+    }
+
+    #[gpui::test]
+    fn insert_is_refused_if_the_version_the_client_read_has_changed(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("abc", "Untitled"));
+        let mut rig = Rig::start("insert-stale-version", handle);
+        set_caret(&view, cx, 3);
+        let read = rig.read(cx);
+        cx.update(|_, app| view.update(app, |view, _| view.editor_mut().insert_text("!").unwrap()));
+        let reply = rig.insert(cx, &read, "op-1", "XYZ");
+        assert_eq!(error_code(&reply), "STALE_VERSION");
+        assert_eq!(reply["error"]["effect"], "not_applied");
+        assert_eq!(text_of(&view, cx), "abc!");
+    }
+
+    #[gpui::test]
+    fn insert_is_refused_if_the_caret_moved_after_the_read(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("abcdef", "Untitled"));
+        let mut rig = Rig::start("insert-stale-cursor", handle);
+        set_caret(&view, cx, 2);
+        let read = rig.read(cx);
+        set_caret(&view, cx, 5);
+        let reply = rig.insert(cx, &read, "op-1", "XYZ");
+        assert_eq!(error_code(&reply), "STALE_CURSOR");
+        assert_eq!(text_of(&view, cx), "abcdef");
+        assert_eq!(
+            selection_of(&view, cx),
+            (5, 5),
+            "the caret is left where the user put it"
+        );
+        // Extending the selection is a change of selection as well.
+        let read = rig.read(cx);
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                view.editor_mut()
+                    .set_selection(Selection {
+                        anchor: SourceOffset(5),
+                        active: SourceOffset(6),
+                    })
+                    .unwrap();
+            });
+        });
+        assert_eq!(
+            error_code(&rig.insert(cx, &read, "op-2", "XYZ")),
+            "STALE_CURSOR"
+        );
+    }
+
+    #[gpui::test]
+    fn insert_is_refused_for_another_document_or_tab(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("abc", "Untitled"));
+        let mut rig = Rig::start("insert-stale-target", handle);
+        let read = rig.read(cx);
+        let first = view.read_with(cx, |view, _| view.active_session().id());
+        let second = cx.update(|_, app| {
+            view.update(app, |view, _| view.sessions.open_untitled("other", "Other"))
+        });
+        cx.update(|_, app| view.update(app, |view, cx| view.activate_session(second, cx)));
+        let reply = rig.insert(cx, &read, "op-1", "XYZ");
+        assert_eq!(error_code(&reply), "STALE_TARGET");
+        assert_eq!(text_of(&view, cx), "other");
+        cx.update(|_, app| view.update(app, |view, cx| view.activate_session(first, cx)));
+        assert_eq!(text_of(&view, cx), "abc");
+    }
+
+    #[gpui::test]
+    fn insert_is_refused_in_the_states_that_cannot_take_text_and_leaves_the_document_alone(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("abc", "Untitled"));
+        let mut rig = Rig::start("insert-refused", handle);
+        let read = rig.read(cx);
+        // Composing.
+        cx.update(|_, app| {
+            view.update(app, |view, _| {
+                view.editor_mut()
+                    .replace_and_mark_text(None, "に", Some(1..1))
+                    .unwrap();
+            });
+        });
+        let composing_text = text_of(&view, cx);
+        let composing = rig.read_for_error(cx);
+        assert_eq!(composing, "BUSY");
+        let read_now = Read {
+            revision: view.read_with(cx, |view, _| view.active_session().revision().0.to_string()),
+            ..read
+        };
+        let (anchor, active) = selection_of(&view, cx);
+        let read_now = Read {
+            anchor: anchor as u64,
+            active: active as u64,
+            ..read_now
+        };
+        assert_eq!(
+            error_code(&rig.insert(cx, &read_now, "op-1", "XYZ")),
+            "BUSY"
+        );
+        assert_eq!(
+            text_of(&view, cx),
+            composing_text,
+            "the composition is untouched"
+        );
+        assert!(view.read_with(cx, |view, _| view.editor().ime().is_some()));
+        cx.update(|_, app| view.update(app, |view, _| view.editor_mut().commit_composition()));
+        // Frozen for an update restart.
+        let read = rig.read(cx);
+        cx.update(|_, app| view.update(app, |view, _| view.begin_restart_freeze()));
+        assert_eq!(error_code(&rig.insert(cx, &read, "op-2", "XYZ")), "BUSY");
+        cx.update(|_, app| view.update(app, |view, _| view.end_restart_freeze()));
+        // Reading mode.
+        cx.update(|_, app| view.update(app, |view, _| view.editor_mode = EditorMode::Reading));
+        assert_eq!(
+            error_code(&rig.insert(cx, &read, "op-3", "XYZ")),
+            "NOT_EDITABLE"
+        );
+        cx.update(|_, app| view.update(app, |view, _| view.editor_mode = EditorMode::Editing));
+        // The body lost the focus.
+        cx.update(|window, app| {
+            let other = view.read(app).settings_focus_handle.clone();
+            window.focus(&other, app);
+        });
+        cx.run_until_parked();
+        assert_eq!(error_code(&rig.insert(cx, &read, "op-4", "XYZ")), "BUSY");
+        assert_eq!(text_of(&view, cx), composing_text);
+    }
+
+    impl Rig {
+        /// The error code of a `context.get`, for states that refuse it.
+        fn read_for_error(&mut self, cx: &mut gpui::VisualTestContext) -> String {
+            error_code(&self.context(cx, serde_json::json!({})))
+        }
+    }
+
+    #[gpui::test]
+    fn insert_is_refused_in_a_saved_file_that_is_not_markdown(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, markdown_sessions("abc", "/notes/a.txt"));
+        let mut rig = Rig::start("insert-unsupported", handle);
+        let read = Read {
+            document_id: "x".repeat(32),
+            revision: "0".to_owned(),
+            anchor: 0,
+            active: 0,
+        };
+        assert_eq!(
+            error_code(&rig.insert(cx, &read, "op-1", "XYZ")),
+            "UNSUPPORTED_DOCUMENT"
+        );
+        assert_eq!(text_of(&view, cx), "abc");
+    }
+
+    #[gpui::test]
+    fn a_resent_insert_is_answered_from_the_record_and_inserts_once(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("insert-resend", handle);
+        let read = rig.read(cx);
+        let params = rig.insert_params(&read, "op-1", "一回だけ");
+        let first = rig.request(cx, "edit.insert", params.clone());
+        let again = rig.request(cx, "edit.insert", params.clone());
+        assert_eq!(first["result"], again["result"]);
+        assert_eq!(text_of(&view, cx), "一回だけ");
+        // Another content under the same id is a conflict and edits nothing.
+        let mut other = params;
+        other["text"] = serde_json::json!("別の内容");
+        let conflict = rig.request(cx, "edit.insert", other);
+        assert_eq!(error_code(&conflict), "OPERATION_CONFLICT");
+        assert_eq!(text_of(&view, cx), "一回だけ");
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "", "a single Undo step");
+    }
+
+    #[gpui::test]
+    fn an_insert_whose_deadline_passed_while_it_waited_is_not_applied(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("abc", "Untitled"));
+        let mut rig = Rig::start("insert-deadline", handle);
+        let read = rig.read(cx);
+        let mut params = rig.insert_params(&read, "op-1", "XYZ");
+        let deadline = rig.link.clock.now_ms() + 500;
+        params["deadlineTick"] = serde_json::json!(deadline.to_string());
+        // The clock moves past the deadline before the UI thread gets to it.
+        rig.link.clock.set(deadline + 1);
+        let reply = rig.request(cx, "edit.insert", params);
+        assert_eq!(error_code(&reply), "DEADLINE_EXCEEDED");
+        assert_eq!(reply["error"]["effect"], "not_applied");
+        assert_eq!(text_of(&view, cx), "abc");
+    }
+
+    #[gpui::test]
+    fn typing_after_an_insertion_is_its_own_undo_step(cx: &mut gpui::TestAppContext) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("insert-undo-order", handle);
+        let read = rig.read(cx);
+        rig.insert(cx, &read, "op-1", "音声");
+        cx.update(|_, app| {
+            view.update(app, |view, cx| {
+                view.insert_text("a", cx);
+                view.insert_text("b", cx);
+            });
+        });
+        assert_eq!(text_of(&view, cx), "音声ab");
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "音声");
+        undo(&view, cx);
+        assert_eq!(text_of(&view, cx), "");
+    }
+
+    #[gpui::test]
+    fn each_insertion_gets_its_own_handle_and_a_new_service_instance_forgets_them(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, handle, cx) = open_for_link(cx, SessionSet::with_untitled("", "Untitled"));
+        let mut rig = Rig::start("insert-handles", handle);
+        let read = rig.read(cx);
+        let first = rig.insert(cx, &read, "op-1", "一");
+        let read = rig.read(cx);
+        let second = rig.insert(cx, &read, "op-2", "二");
+        assert_ne!(
+            first["result"]["rangeHandle"],
+            second["result"]["rangeHandle"]
+        );
+        assert_eq!(view.read_with(cx, |view, _| view.link.handles.len()), 2);
+        // Calls from another service instance start from nothing.
+        cx.update(|_, app| view.update(app, |view, _| view.link_sync_instance("another-instance")));
+        assert_eq!(view.read_with(cx, |view, _| view.link.handles.len()), 0);
     }
 
     #[gpui::test]

@@ -401,6 +401,80 @@ impl Editor {
         Ok(summary)
     }
 
+    /// [`Self::replace_range_recorded`], also returning the identity of the
+    /// history step that recorded the edit. The identity names that step until
+    /// it is amended or replaced; see [`Self::replace_range_amending`].
+    pub fn replace_range_recorded_with_entry(
+        &mut self,
+        range: SourceRange,
+        replacement: &str,
+        selection_after: Selection,
+    ) -> Result<(EditSummary, u64), BufferError> {
+        let summary = self.replace_range_recorded(range, replacement, selection_after)?;
+        let entry = self
+            .history
+            .top_id()
+            .expect("a recorded replacement leaves a history step");
+        Ok((summary, entry))
+    }
+
+    /// Whether `entry` is still the newest Undo step, with nothing to Redo, and
+    /// recorded exactly the insertion `[start, start + inserted_len)`.
+    pub fn can_amend_history_entry(&self, entry: u64, start: usize, inserted_len: usize) -> bool {
+        self.history.can_amend(entry, start, inserted_len)
+    }
+
+    /// Replaces the text a history step inserted (`range`, which must be exactly
+    /// that insertion) and folds the change into the step, so a single Undo
+    /// removes the whole result. Nothing is touched, and `Ok(None)` returned,
+    /// unless [`Self::can_amend_history_entry`] holds; on success the step gets
+    /// a new identity.
+    ///
+    /// Refused (`Ok(None)`) while a composition is pending: it would have to be
+    /// committed first, which is a visible edit of its own.
+    pub fn replace_range_amending(
+        &mut self,
+        entry: u64,
+        range: SourceRange,
+        replacement: &str,
+        selection_after: Selection,
+    ) -> Result<Option<EditSummary>, BufferError> {
+        // Refuse before changing anything: a composition would be committed
+        // (and recorded) by the amendment, which must leave no trace if refused.
+        if self.ime.is_some()
+            || !self
+                .history
+                .can_amend(entry, range.start.0, range.len_bytes())
+        {
+            return Ok(None);
+        }
+        self.history.break_group();
+        self.document.validate_range(range)?;
+        let next_len = self
+            .document
+            .len_bytes()
+            .0
+            .saturating_sub(range.len_bytes())
+            .saturating_add(replacement.len());
+        for offset in [selection_after.anchor, selection_after.active] {
+            if offset.0 > next_len {
+                return Err(BufferError::OffsetOutOfBounds {
+                    offset,
+                    len: hane_document::ByteLen(next_len),
+                });
+            }
+        }
+        let received = Instant::now();
+        let summary = self.document.edit(range, replacement)?;
+        self.selection = selection_after;
+        self.preferred_grapheme_column = None;
+        self.preferred_visual_x = None;
+        self.history
+            .amend_top(replacement.to_owned(), selection_after);
+        self.record_model_update(received, InputMeasurementKind::Command);
+        Ok(Some(summary))
+    }
+
     /// A copy of the current document with `plan` applied, without touching
     /// the editor. `None` when the plan is not a valid set of replacements.
     pub fn rewritten_document(&self, plan: &RewritePlan) -> Option<RopeBuffer> {
@@ -707,6 +781,105 @@ impl Editor {
 mod tests {
     use super::*;
     use hane_document::SourceRange;
+
+    /// An insertion of `text` at `at` as the link records it.
+    fn insert_recorded(editor: &mut Editor, at: usize, text: &str) -> (EditSummary, u64) {
+        editor
+            .replace_range_recorded_with_entry(
+                SourceRange::empty(at),
+                text,
+                Selection::caret(SourceOffset(at + text.len())),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn an_amended_insertion_is_one_undo_step_that_redoes_to_the_replacement() {
+        let mut e = Editor::new("前後");
+        e.set_selection(Selection::caret(SourceOffset(3))).unwrap();
+        let (summary, entry) = insert_recorded(&mut e, 3, "えーと原文");
+        let range = summary.range_after;
+        let after = Selection::caret(SourceOffset(3 + "整文".len()));
+        assert!(e.can_amend_history_entry(entry, range.start.0, range.len_bytes()));
+        let amended = e
+            .replace_range_amending(entry, range, "整文", after)
+            .unwrap()
+            .expect("amended");
+        assert_eq!(e.document().full_text(), "前整文後");
+        assert_eq!(e.selection(), after);
+        assert_eq!(amended.range_after, SourceRange::new(3, 3 + "整文".len()));
+        // One Undo removes the whole utterance and restores the caret before it.
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "前後");
+        assert_eq!(e.selection(), Selection::caret(SourceOffset(3)));
+        assert!(!e.can_undo());
+        // Redo brings back the replacement, not the original.
+        e.dispatch(EditorCommand::Redo).unwrap();
+        assert_eq!(e.document().full_text(), "前整文後");
+        assert_eq!(e.selection(), after);
+    }
+
+    #[test]
+    fn amending_needs_the_insertion_to_still_be_the_newest_step() {
+        let mut e = Editor::new("ab");
+        let (summary, entry) = insert_recorded(&mut e, 1, "XYZ");
+        e.set_selection(Selection::caret(SourceOffset(5))).unwrap();
+        e.insert_text("!").unwrap();
+        let before = (e.document().full_text(), e.selection(), e.document().revision());
+        assert!(!e.can_amend_history_entry(entry, 1, 3));
+        let refused = e
+            .replace_range_amending(entry, summary.range_after, "x", Selection::caret(SourceOffset(2)))
+            .unwrap();
+        assert!(refused.is_none());
+        assert_eq!(
+            (e.document().full_text(), e.selection(), e.document().revision()),
+            before,
+            "a refused amendment changes nothing"
+        );
+    }
+
+    #[test]
+    fn amending_is_refused_after_undo_and_when_the_range_is_not_the_insertion() {
+        let mut e = Editor::new("ab");
+        let (summary, entry) = insert_recorded(&mut e, 1, "XYZ");
+        // A range that is not the recorded insertion.
+        assert!(!e.can_amend_history_entry(entry, 1, 2));
+        assert!(!e.can_amend_history_entry(entry, 2, 3));
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert!(!e.can_amend_history_entry(entry, 1, 3));
+        e.dispatch(EditorCommand::Redo).unwrap();
+        // The redone step is the same step; the link checks the revision itself.
+        assert!(e.can_amend_history_entry(entry, 1, 3));
+        let _ = summary;
+    }
+
+    #[test]
+    fn amending_is_refused_while_composing_without_committing_it() {
+        let mut e = Editor::new("ab");
+        let (summary, entry) = insert_recorded(&mut e, 1, "XYZ");
+        e.set_selection(Selection::caret(SourceOffset(4))).unwrap();
+        e.replace_and_mark_text(None, "に", Some(1..1)).unwrap();
+        let text = e.document().full_text();
+        assert!(e.is_composing());
+        let refused = e
+            .replace_range_amending(entry, summary.range_after, "x", Selection::caret(SourceOffset(2)))
+            .unwrap();
+        assert!(refused.is_none());
+        assert!(e.is_composing(), "the composition was not committed");
+        assert_eq!(e.document().full_text(), text);
+    }
+
+    #[test]
+    fn a_recorded_insertion_is_never_grouped_with_typing() {
+        let mut e = Editor::new("");
+        insert_recorded(&mut e, 0, "原文");
+        e.insert_text("a").unwrap();
+        e.insert_text("b").unwrap();
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "原文");
+        e.dispatch(EditorCommand::Undo).unwrap();
+        assert_eq!(e.document().full_text(), "");
+    }
     #[test]
     fn grapheme_movement_keeps_combining_sequence_together() {
         let mut e = Editor::new("a\u{301}🙂羽");
