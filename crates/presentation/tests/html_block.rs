@@ -210,7 +210,8 @@ fn raw_html_fallback_does_not_create_resource_targets() {
     let image = "![i](https://example.com/a.png)";
     let link = "[l](https://example.com/)";
     for source in [
-        format!("<div><img src=\"https://example.com/a.png\"><a href=\"https://example.com/\">x</a></div>\n"),
+        "<div><img src=\"https://example.com/a.png\"><a href=\"https://example.com/\">x</a></div>\n"
+            .to_string(),
         format!("<script>\n{image}\n{link}\n</script>\n"),
         format!("<p>{image} {link}</p>\n"),
         format!("<p>{image}\n{link}</p>\n"),
