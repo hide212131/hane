@@ -177,3 +177,39 @@
 8. 性能: 認識完了から原文表示まで p95 250 ms 以下（§6）は未計測。`context.get` の大きな文書での所要時間、UI スレッドの負荷も未計測。
 9. 実際の whisparrot クライアント（W-1 / W-2）との結合。ワイヤ形式は上記の記述に従って実装したが、クライアント側は未実装のため、項目名の食い違いは結合時に見つかる可能性がある。
 10. 複数ウィンドウ・複数インスタンス（現状は単一窓）。
+
+## テスト結果
+
+実行環境は macOS。コマンドは `cargo test --offline --workspace --no-fail-fast`（全ターゲット、ドキュメントテスト含む、70 ターゲット）。
+
+| 実行 | 合格 | 失敗 |
+| --- | ---: | ---: |
+| 全体（最終のコード） | 3,445 | 113 |
+| 全体（H-4 コミット時点） | 3,446 | 112 |
+| ベースライン（`28d36af0`）の `hane-ui` lib のみ | 1,137 | 112 |
+
+失敗の内訳:
+
+- **112 件は `hane-ui` の lib テストで、ベースライン（`origin/main` の `28d36af0` を別 worktree で実行）でも名前まで同一の 112 件が失敗する。** この変更で増えた失敗はない。分野は `view::tests`（71）、`view::task_checkbox`（11）、`view::reading_mode`（9）、`view::mermaid_diagrams`（9）、`view::clipboard`（6）、`view::basic_editing_keys`（3）、`image_paste` / `editor_context_menu` / `document_find`（各 1）。原因（この環境の GUI・フォント・クリップボード等への依存と思われる）は調べていない。
+- **1 件（最終の全体実行のみ）**: `app_update::tests::snapshot_alone_neither_shows_nor_suppresses_the_prompt`（`hane` bin）が `Idle` と `Ready` の不一致で失敗した。同じコードで単独実行（3 回）と `hane` bin 全体の再実行（4 回、各 226 件）は全て合格し、H-4 時点の全体実行でも合格していたため、負荷時の揺らぎと判断している（`app_update` は今回の変更の対象外で、`main.rs` の変更は Windows 限定）。ベースラインでの再現確認はしていない。
+
+今回追加したテスト（合格）:
+
+| 対象 | 件数 |
+| --- | ---: |
+| `hane-link` lib（フレーム・認証・版交渉・台帳・ハンドル・追跡・選択・Front Matter・文脈・記述子・実行時・適用権） | 73 |
+| `hane-link` `tests/protocol.rs`（接続のシナリオ） | 21 |
+| `hane-ui` lib（`view::whisparrot_link`: 設定 4、`context.get` 16、`edit.insert` 13、`edit.replace` 19） | 52 |
+| `hane-editor` lib（履歴の連結 API） | 5 |
+| `hane-session` lib（設定） | 3 |
+
+追加の確認:
+
+- `cargo clippy --all-targets` は `hane-link`・`hane-editor`・`hane-session` で警告なし。`hane-ui` と `hane` では今回追加したコードへの指摘なし（既存コードの指摘は見ていない）。
+- Windows 専用コード（`crates/link/src/windows.rs`）は `rustfmt --check` による構文確認のみ（型検査・コンパイル・実行はしていない）。
+
+## 次の作業の目安
+
+1. Windows 実機で `cargo check` / `cargo test -p hane-link` を通し、パイプの疎通（`hello` → `context.get` → `edit.insert` → `edit.replace`）を whisparrot の W-1 / W-2 と結合して確認する（設計 §6 の結合検証の項目）。
+2. 実機の計測値（フレーム・認証・UI 待ちの時間、p95 250 ms）で、本レポートの初期値（逸脱 10）を調整する。
+3. H-5（版つきスナップショット）。`includeSnapshot` の応答と `features` に `snapshot` を足す。
