@@ -176,6 +176,29 @@ fn html_code_content_is_literal() {
 }
 
 #[test]
+fn html_inside_code_is_excluded_across_markdown_scopes() {
+    let parsed = parse("<code>**<a href=\"https://example.com/\">x</a>**</code>\n");
+    assert_eq!(kinds(&parsed), [HtmlKind::Code]);
+    // Tags inside a backtick code span are never candidates.
+    let parsed = parse("`<b>x</b>` and `<a href=\"https://example.com/\">y</a>`\n");
+    assert!(parsed.html_elements.is_empty());
+    // Outside `<code>`, Markdown and HTML still compose.
+    let parsed = parse("**<b>x</b>** <code>y</code>\n");
+    assert_eq!(kinds(&parsed), [HtmlKind::Bold, HtmlKind::Code]);
+}
+
+#[test]
+fn html_nested_link_with_invalid_inner_href_excludes_both() {
+    let parsed = parse("<a href=\"https://outer.example/\"><a href=\"/relative\">x</a></a>\n");
+    assert!(parsed.html_elements.is_empty());
+    // A valid sibling link is still recognized.
+    let parsed = parse(
+        "<a href=\"https://a.example/\">a</a> <a href=\"https://b.example/\">b</a>\n",
+    );
+    assert_eq!(kinds(&parsed), [HtmlKind::Link, HtmlKind::Link]);
+}
+
+#[test]
 fn html_href_only_accepts_valid_absolute_http_urls() {
     for (attrs, expected) in [
         ("href=\"https://example.com/a\"", Some("https://example.com/a")),

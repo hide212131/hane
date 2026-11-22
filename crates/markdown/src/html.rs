@@ -395,6 +395,8 @@ fn recognize_unit(
 
     let mut scopes: Vec<(Option<NodeId>, Vec<OpenTag>)> = Vec::new();
     let mut found: Vec<HtmlElement> = Vec::new();
+    // Every matched `<a>…</a>` pair, valid `href` or not, for nesting checks.
+    let mut link_pairs: Vec<SourceRange> = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
         let position = match scopes.iter().position(|(scope, _)| *scope == token.parent) {
             Some(position) => position,
@@ -426,6 +428,12 @@ fn recognize_unit(
         match stack.iter().rposition(|open| open.name == token.tag.name) {
             Some(at) if at + 1 == stack.len() => {
                 let open = stack.pop().expect("stack is non-empty");
+                if NAMES[token.tag.name].1 == HtmlKind::Link {
+                    link_pairs.push(SourceRange {
+                        start: tokens[open.token].range.start,
+                        end: token.range.end,
+                    });
+                }
                 if let Some(element) = build_element(
                     tree,
                     source,
@@ -442,31 +450,32 @@ fn recognize_unit(
             None => {}
         }
     }
-    // Nested links are ambiguous; neither side is shown as a link.
-    let links = found
+    // Everything inside a recognized `<code>` is literal, even when a Markdown
+    // construct (e.g. `**`) put the inner tags in a different scope.
+    let code_contents = found
         .iter()
-        .enumerate()
-        .filter(|(_, element)| element.kind == HtmlKind::Link)
-        .map(|(index, _)| index)
+        .filter(|element| element.kind == HtmlKind::Code)
+        .map(|element| element.content_range)
         .collect::<Vec<_>>();
-    let mut dropped = vec![false; found.len()];
-    for outer in &links {
-        for inner in &links {
-            if outer != inner
-                && found[*outer].range.start <= found[*inner].range.start
-                && found[*inner].range.end <= found[*outer].range.end
-            {
-                dropped[*outer] = true;
-                dropped[*inner] = true;
-            }
-        }
-    }
-    out.extend(
-        found
-            .into_iter()
-            .zip(dropped)
-            .filter_map(|(element, dropped)| (!dropped).then_some(element)),
-    );
+    let in_code = |range: SourceRange| {
+        code_contents
+            .iter()
+            .any(|content| content.start <= range.start && range.end <= content.end)
+    };
+    found.retain(|element| !in_code(element.range));
+    link_pairs.retain(|range| !in_code(*range));
+    // Nested links are ambiguous; neither side is shown as a link, whether or
+    // not the other side has a valid `href`.
+    let nested = |a: SourceRange, b: SourceRange| {
+        a != b
+            && ((a.start <= b.start && b.end <= a.end) || (b.start <= a.start && a.end <= b.end))
+    };
+    out.extend(found.into_iter().filter(|element| {
+        element.kind != HtmlKind::Link
+            || !link_pairs
+                .iter()
+                .any(|pair| nested(element.range, *pair))
+    }));
 }
 
 fn build_element(

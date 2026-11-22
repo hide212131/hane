@@ -7076,7 +7076,16 @@ mod tests {
         });
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
         cx.run_until_parked();
+        draw_isolated_view(cx);
         (view, cx)
+    }
+
+    /// `run_until_parked` never renders, so draw explicitly before reading the
+    /// displayed lines; otherwise a stale frame could be observed.
+    fn draw_isolated_view(cx: &mut gpui::VisualTestContext) {
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
     }
 
     /// Issue #757: an HTML tag opens and closes with the caret, a selection and
@@ -7112,12 +7121,14 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            draw_isolated_view(cx);
         };
-        let step = |view: &gpui::Entity<EditorView>,
+        let step =|view: &gpui::Entity<EditorView>,
                     cx: &mut gpui::VisualTestContext,
                     command: EditorCommand<'static>| {
             view.update(cx, |view, cx| view.dispatch(command, cx));
             cx.run_until_parked();
+            draw_isolated_view(cx);
         };
         let before = snapshot(&view, cx);
         assert_eq!(before.0, text);
@@ -7163,12 +7174,14 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
+        draw_isolated_view(cx);
         assert_eq!(shown(&view, cx).as_deref(), Some(CLOSED));
         view.update(cx, |view, cx| {
             view.editor_mode = EditorMode::Editing;
             cx.notify();
         });
         cx.run_until_parked();
+        draw_isolated_view(cx);
         assert_eq!(shown(&view, cx).as_deref(), Some(OPEN));
 
         // None of it was an edit.
@@ -7188,6 +7201,7 @@ mod tests {
             cx.notify();
         });
         cx.run_until_parked();
+        draw_isolated_view(cx);
 
         // Visual text is "see Hane end": offset 5 is inside the link, 9 is past it.
         assert_eq!(
