@@ -4,7 +4,7 @@
 //! are recognised by a process whose creation time no longer matches.
 
 use crate::auth::Credentials;
-use crate::message::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use crate::message::{PROTOCOL_MAJOR, PROTOCOL_MINOR, Version};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
@@ -19,7 +19,7 @@ pub struct Descriptor {
     pub schema: u32,
     pub pid: u32,
     /// The process creation time as a decimal string (on Windows the FILETIME).
-    pub process_created: String,
+    pub process_creation_time: String,
     /// The pipe's name without the `\\.\pipe\` prefix.
     pub pipe_name: String,
     pub instance_id: String,
@@ -27,10 +27,11 @@ pub struct Descriptor {
     pub protocol: ProtocolRange,
 }
 
+/// The protocol versions this instance speaks, as `{"min": …, "max": …}`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProtocolRange {
-    pub major: u32,
-    pub minor: u32,
+    pub min: Version,
+    pub max: Version,
 }
 
 /// The pipe name for a process and instance: `Hane.Whisparrot.<pid>.<instanceId>`.
@@ -40,16 +41,20 @@ pub fn pipe_name(pid: u32, instance_id: &str) -> String {
 
 impl Descriptor {
     pub fn new(pid: u32, process_created: u64, credentials: &Credentials) -> Self {
+        let current = Version {
+            major: PROTOCOL_MAJOR,
+            minor: PROTOCOL_MINOR,
+        };
         Self {
             schema: SCHEMA,
             pid,
-            process_created: process_created.to_string(),
+            process_creation_time: process_created.to_string(),
             pipe_name: pipe_name(pid, credentials.instance_id()),
             instance_id: credentials.instance_id().to_owned(),
             token: credentials.token().to_owned(),
             protocol: ProtocolRange {
-                major: PROTOCOL_MAJOR,
-                minor: PROTOCOL_MINOR,
+                min: current,
+                max: current,
             },
         }
     }
@@ -190,7 +195,7 @@ pub fn sweep_stale(dir: &Path, own_pid: u32, probe: &dyn ProcessProbe) {
         {
             Some(descriptor) if name.ends_with(".json") => probe
                 .creation_time(pid)
-                .is_some_and(|created| created.to_string() == descriptor.process_created),
+                .is_some_and(|created| created.to_string() == descriptor.process_creation_time),
             // A temporary or unreadable file of a dead process is garbage; of a
             // live one it is being written right now.
             _ => probe.creation_time(pid).is_some(),
@@ -238,7 +243,7 @@ mod tests {
             read.pipe_name,
             "Hane.Whisparrot.4321.0123456789abcdef0123456789abcdef"
         );
-        assert_eq!(read.process_created, "99");
+        assert_eq!(read.process_creation_time, "99");
         // No temporary file is left behind.
         assert!(!dir.join("4321.json.tmp").exists());
         // Publishing again replaces it (a re-enable with a fresh token).

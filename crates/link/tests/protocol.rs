@@ -120,8 +120,8 @@ impl Drop for Fixture {
 fn hello(token: &str) -> Value {
     json!({
         "token": token,
-        "minVersion": {"major": 1, "minor": 0},
-        "maxVersion": {"major": 1, "minor": 0},
+        "client": "whisparrot",
+        "protocol": {"min": {"major": 1, "minor": 0}, "max": {"major": 1, "minor": 0}},
     })
 }
 
@@ -235,8 +235,8 @@ fn a_major_mismatch_is_reported_after_authentication_and_closes() {
     let mut conn = fixture.connect();
     let params = json!({
         "token": TOKEN,
-        "minVersion": {"major": 2, "minor": 0},
-        "maxVersion": {"major": 2, "minor": 1},
+        "client": "whisparrot",
+        "protocol": {"min": {"major": 2, "minor": 0}, "max": {"major": 2, "minor": 1}},
     });
     let reply = call(&mut conn, 1, "hello", params);
     assert_eq!(
@@ -252,8 +252,8 @@ fn a_newer_minor_is_spoken_at_the_servers_minor() {
     let mut conn = fixture.connect();
     let params = json!({
         "token": TOKEN,
-        "minVersion": {"major": 1, "minor": 0},
-        "maxVersion": {"major": 1, "minor": 9},
+        "client": "whisparrot",
+        "protocol": {"min": {"major": 1, "minor": 0}, "max": {"major": 1, "minor": 9}},
     });
     let reply = call(&mut conn, 1, "hello", params);
     assert_eq!(reply["result"]["protocol"], json!({"major": 1, "minor": 0}));
@@ -349,6 +349,30 @@ fn a_resend_of_a_finished_insert_is_answered_from_the_record_not_applied_again()
     let again = call(&mut other, 77, "edit.insert", params);
     assert_eq!(first["result"], again["result"]);
     assert_eq!(again["id"], json!(77));
+    assert_eq!(fixture.host.submitted.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_resend_after_the_deadline_still_gets_the_recorded_result_and_a_changed_one_conflicts() {
+    let fixture = Fixture::echo();
+    let mut conn = fixture.authenticated();
+    let params = insert_params("op-old", 2_000, "a");
+    let first = call(&mut conn, 2, "edit.insert", params.clone());
+    assert!(first.get("result").is_some());
+    // The deadline has passed, yet the ledger is consulted first.
+    fixture.clock.set(9_000);
+    let again = call(&mut conn, 3, "edit.insert", params);
+    assert_eq!(first["result"], again["result"]);
+    let changed = call(
+        &mut conn,
+        4,
+        "edit.insert",
+        insert_params("op-old", 2_000, "b"),
+    );
+    assert_eq!(
+        error_of(&changed),
+        ("OPERATION_CONFLICT".into(), "not_applied".into())
+    );
     assert_eq!(fixture.host.submitted.load(Ordering::SeqCst), 1);
 }
 

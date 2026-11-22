@@ -160,7 +160,7 @@ fn handshake<C: Connection>(conn: &mut C, shared: &Shared) -> Result<(), Ended> 
         refuse(conn, &request.id, ErrorCode::Unauthorized);
         return Err(Ended::Unauthenticated);
     }
-    let Some(agreed) = message::negotiate(hello.min_version, hello.max_version) else {
+    let Some(agreed) = message::negotiate(hello.protocol.min, hello.protocol.max) else {
         // Authenticated, so the reason may be given. Still closed.
         refuse(conn, &request.id, ErrorCode::UnsupportedVersion);
         return Err(Ended::Unauthenticated);

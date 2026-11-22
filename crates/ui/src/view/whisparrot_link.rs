@@ -454,12 +454,15 @@ impl EditorView {
                     .and_then(|record| link_resolve_range(record, document).ok());
                 match tracked {
                     Some(range) => serde_json::json!({
-                        "handle": handle,
-                        "status": "tracked",
+                        "rangeHandle": handle,
+                        "tracked": true,
                         "startByte": range.start.0,
                         "endByte": range.end.0,
                     }),
-                    None => serde_json::json!({ "handle": handle, "status": "untrackable" }),
+                    None => serde_json::json!({
+                        "rangeHandle": handle,
+                        "tracked": false,
+                    }),
                 }
             })
             .collect();
@@ -559,8 +562,10 @@ mod tests {
             let mut conn = link.connect();
             let hello = serde_json::json!({"id": 0, "method": "hello", "params": {
                 "token": link.token(),
-                "minVersion": {"major": 1, "minor": 0},
-                "maxVersion": {"major": 1, "minor": 0},
+                "protocol": {
+                    "min": {"major": 1, "minor": 0},
+                    "max": {"major": 1, "minor": 0},
+                },
             }});
             conn.send_frame(&serde_json::to_vec(&hello).unwrap())
                 .unwrap();
@@ -1958,8 +1963,8 @@ mod tests {
         );
         let pending = reply["result"]["pendingRanges"].as_array().unwrap().clone();
         let shift = "前".len();
-        assert_eq!(pending[0]["handle"], first.handle);
-        assert_eq!(pending[0]["status"], "tracked");
+        assert_eq!(pending[0]["rangeHandle"], first.handle);
+        assert_eq!(pending[0]["tracked"], true);
         assert_eq!(pending[0]["startByte"], first.start + shift);
         assert_eq!(pending[0]["endByte"], first.end + shift);
         assert_eq!(pending[1]["startByte"], second.start + shift);
@@ -1971,13 +1976,13 @@ mod tests {
             serde_json::json!({"pendingRangeHandles": [first.handle, second.handle]}),
         );
         let pending = reply["result"]["pendingRanges"].as_array().unwrap().clone();
-        assert_eq!(pending[0]["status"], "untrackable");
-        assert_eq!(pending[1]["status"], "tracked");
+        assert_eq!(pending[0]["tracked"], false);
+        assert_eq!(pending[1]["tracked"], true);
         let reply = rig.context(
             cx,
             serde_json::json!({"pendingRangeHandles": ["0".repeat(32)]}),
         );
-        assert_eq!(reply["result"]["pendingRanges"][0]["status"], "untrackable");
+        assert_eq!(reply["result"]["pendingRanges"][0]["tracked"], false);
     }
 
     #[gpui::test]

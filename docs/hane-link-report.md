@@ -42,15 +42,15 @@
 {
   "schema": 1,
   "pid": 1234,
-  "processCreated": "133500000000000000",
+  "processCreationTime": "133500000000000000",
   "pipeName": "Hane.Whisparrot.1234.<instanceId>",
   "instanceId": "<32 桁の 16 進>",
   "token": "<64 桁の 16 進（256 ビット）>",
-  "protocol": { "major": 1, "minor": 0 }
+  "protocol": { "min": {"major": 1, "minor": 0}, "max": {"major": 1, "minor": 0} }
 }
 ```
 
-- `processCreated` は Hane プロセスの作成時刻（FILETIME、100 ns 単位の十進文字列）。クライアントは `OpenProcess` + `GetProcessTimes` で照合する。
+- `processCreationTime` は Hane プロセスの作成時刻（FILETIME、100 ns 単位の十進文字列）。クライアントは `OpenProcess` + `GetProcessTimes` で照合する。
 - `pipeName` は `\\.\pipe\` を除いた名前。クライアントは固定形式 `Hane.Whisparrot.<pid>.<32 桁 16 進>` に合うものだけを受け入れ、`GetNamedPipeServerProcessId` で `pid` と照合してからトークンを送る。
 - トークンと `instanceId` は有効化のたびに作り直す。無効化で記述子を削除し、再有効化前のトークンは使えない。
 - 正常終了（アプリ終了イベント）で自分の記述子を削除する。クラッシュの残骸は、次回の有効化時に「PID が存在しない、または作成時刻が一致しない」ものを掃除する。
@@ -58,7 +58,7 @@
 ### `hello`
 
 ```json
-{"id":1,"method":"hello","params":{"token":"…","minVersion":{"major":1,"minor":0},"maxVersion":{"major":1,"minor":0}}}
+{"id":1,"method":"hello","params":{"token":"…","client":"whisparrot","protocol":{"min":{"major":1,"minor":0},"max":{"major":1,"minor":0}}}}
 ```
 
 成功（認証後に合意版・機能・上限を返す）:
@@ -91,7 +91,7 @@
   "frontMatter": {"status": "present", "text": "title: x\n", "range": {"startByte": 0, "endByte": 14}},
   "before": "…", "beforeStartByte": 0, "beforeTruncated": false,
   "after": "…", "afterStartByte": 120, "afterTruncated": true,
-  "pendingRanges": [{"handle": "…", "status": "tracked", "startByte": 3, "endByte": 9}, {"handle": "…", "status": "untrackable"}]
+  "pendingRanges": [{"rangeHandle": "…", "tracked": true, "startByte": 3, "endByte": 9}, {"rangeHandle": "…", "tracked": false}]
 }
 ```
 
@@ -141,7 +141,7 @@
 
 設計書の数値・項目・エラーの意味は変えていない。設計が未定義の箇所で次のように決めた。
 
-1. **`hello` の項目名**: 設計は「トークンと対応する major・minor の範囲」とだけ書いている。`token`、`minVersion{major,minor}`、`maxVersion{major,minor}` とした。
+1. **`hello` の項目名**: 設計は「トークンと対応する major・minor の範囲」とだけ書いている。`token`、`protocol{min{major,minor}, max{major,minor}}` とした（`client` は任意で無視する）。旧 `minVersion` / `maxVersion` 形式は廃止した（後述の整合修正）。
 2. **追加したエラーコード**: `UNAUTHORIZED`（設計は認証拒否に「固定コード」と書くのみで名前がない）、`INTERNAL_ERROR`（編集前の想定外の失敗、または着手後に応答できなかった場合）。クライアントは未知のコードを `unknown` 相当として扱える。
 3. **`beforeChars` / `afterChars` が上限を超えた場合**: エラーにせず上限に丸める。
 4. **`includeSnapshot`**: H-5 は範囲外。`expectedDocumentId` と `expectedRevision` が無ければ `INVALID_REQUEST`（設計どおり）、あれば通常の文脈に **`snapshotStatus: "not_supported"`** を付けて返し、全文は返さない。`hello` の `features` に `snapshot` は含めない。
@@ -213,3 +213,20 @@
 1. Windows 実機で `cargo check` / `cargo test -p hane-link` を通し、パイプの疎通（`hello` → `context.get` → `edit.insert` → `edit.replace`）を whisparrot の W-1 / W-2 と結合して確認する（設計 §6 の結合検証の項目）。
 2. 実機の計測値（フレーム・認証・UI 待ちの時間、p95 250 ms）で、本レポートの初期値（逸脱 10）を調整する。
 3. H-5（版つきスナップショット）。`includeSnapshot` の応答と `features` に `snapshot` を足す。
+
+## whisparrot クライアント（W-1）とのワイヤ形式の整合修正
+
+whisparrot 側の解釈部が前提にする形式を正とし、Hane 側を合わせた。
+
+1. **記述子**: `processCreated` を `processCreationTime`（値は従来どおり FILETIME 100 ns の十進文字列）に改名し、`protocol` を `{"min":{"major":1,"minor":0},"max":{"major":1,"minor":0}}` の範囲にした。`schema`・`pid`・`pipeName`・`instanceId`・`token` は変更なし。
+2. **`hello` 要求**: `{"token", "client"（任意・無視）, "protocol":{"min":…,"max":…}}` のみ受け付ける。旧 `minVersion` / `maxVersion` は廃止した（読めないため `UNAUTHORIZED` として閉じる）。応答は従来どおり。
+3. **`context.get` の `pendingRanges`**: 各要素を `{"rangeHandle", "tracked", "startByte", "endByte"}` にした。追跡不能のときは `tracked: false` とし、座標は付けない（キー `rangeHandle` と `tracked` は常にある）。旧 `handle` / `status` は廃止した。
+4. **再送と期限の順序**: 既に正しい順序だった（コード変更なし）。`crates/link/src/server.rs` の `run_mutation` は、最初に台帳の `begin` を引き、`Replay`（完了済みは期限後でも記録した結果を返す）、`InProgress`（`IN_PROGRESS`）、`Conflict`（`OPERATION_CONFLICT`）を返した後で、初めて `deadlineTick` を現在時刻と比較する。`DEADLINE_EXCEEDED`（未適用）は台帳に無い新規の操作が着手前に失効した場合にだけ返る。確認のため回帰テスト `a_resend_after_the_deadline_still_gets_the_recorded_result_and_a_changed_one_conflicts` を `crates/link/tests/protocol.rs` に追加した（完了済み操作を期限後に再送して記録済みの結果が返り、内容を変えると `OPERATION_CONFLICT`、エディタへの投入は 1 回のまま）。
+
+更新したテスト: 記述子・`hello`（`runtime.rs`、`tests/protocol.rs`、`hane-ui` の `whisparrot_link` の試験治具）・`pendingRanges` の検証。設定を切り替えるテストは従来どおり隔離した状態（`StateStores::memory()` 流儀）を使い、共有の実設定ストアには触れていない。
+
+### 検証結果
+
+- `cargo test --no-fail-fast`（全ターゲット、ワークスペース全体）: **合格 3,559 件・失敗 0 件**（`hane-link` lib 73、`hane-ui` lib 1,301 を含む）。
+- 失敗が 0 件のため、`origin/main` との切り分けは対象なし（「ブランチで失敗し main で成功」したテストはない）。なお上の「失敗の内訳」にある `hane-ui` の 112 件の失敗は、今回の実行環境では再現せず全て合格した。当時の失敗は環境依存だったと考えられる（原因は未調査）。
+- 注意: 整形は `rustfmt` をファイル単位で確認した。ワークスペース全体への `cargo fmt --all` は無関係な差分を大量に生むため行わず、連携まわりの変更だけをコミットしている。

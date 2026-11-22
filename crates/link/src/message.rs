@@ -169,8 +169,15 @@ pub struct Version {
 #[serde(rename_all = "camelCase")]
 pub struct HelloParams {
     pub token: String,
-    pub min_version: Version,
-    pub max_version: Version,
+    pub protocol: ProtocolRequest,
+}
+
+/// The versions a client accepts: `{"min": {…}, "max": {…}}`. The optional
+/// `client` name beside it is ignored.
+#[derive(Debug, Deserialize)]
+pub struct ProtocolRequest {
+    pub min: Version,
+    pub max: Version,
 }
 
 /// Picks the protocol version both sides speak: the same major, the lower of

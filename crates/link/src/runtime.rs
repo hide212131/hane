@@ -233,8 +233,8 @@ mod tests {
     fn hello(conn: &mut MemoryConnection, token: &str) -> Option<Value> {
         let body = json!({"id": 1, "method": "hello", "params": {
             "token": token,
-            "minVersion": {"major": 1, "minor": 0},
-            "maxVersion": {"major": 1, "minor": 0},
+            "client": "whisparrot",
+            "protocol": {"min": {"major": 1, "minor": 0}, "max": {"major": 1, "minor": 0}},
         }});
         conn.send_frame(&serde_json::to_vec(&body).unwrap())
             .unwrap();
