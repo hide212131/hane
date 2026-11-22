@@ -194,3 +194,93 @@ impl TickClock for ManualClock {
         self.0.load(Ordering::SeqCst)
     }
 }
+
+/// A whole link service on the in-memory transport, for tests of the code that
+/// executes requests: a real [`crate::runtime::Runtime`] (so connections are
+/// authenticated for real), with the requests it accepts queued on `calls` for
+/// the test to run on its UI thread.
+pub struct TestLink {
+    pub runtime: crate::runtime::Runtime,
+    pub calls: async_channel::Receiver<crate::host::HostCall>,
+    pub clock: Arc<ManualClock>,
+    connector: Arc<Mutex<Option<MemoryConnector>>>,
+    base: std::path::PathBuf,
+}
+
+struct AlwaysAlive;
+
+impl crate::descriptor::ProcessProbe for AlwaysAlive {
+    fn creation_time(&self, _pid: u32) -> Option<u64> {
+        Some(1)
+    }
+}
+
+impl TestLink {
+    /// Starts the service. `name` keeps concurrent tests' descriptor
+    /// directories apart.
+    pub fn start(name: &str) -> Self {
+        use crate::runtime::{Environment, Runtime};
+        let base = std::env::temp_dir().join(format!(
+            "hane-link-testlink-{name}-{}-{}",
+            std::process::id(),
+            crate::auth::random_hex(4).expect("random"),
+        ));
+        std::fs::create_dir_all(&base).expect("scratch directory");
+        let connector = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&connector);
+        let clock = ManualClock::new(1_000_000);
+        let (host, calls) = crate::host::QueueHost::new(16);
+        let runtime = Runtime::new(
+            Environment {
+                descriptor_base: base.clone(),
+                descriptor_dirs: vec!["integration".into()],
+                pid: std::process::id(),
+                process_created: 1,
+                clock: clock.clone(),
+                probe: Arc::new(AlwaysAlive),
+                listen: Box::new(move |_| {
+                    let (listener, connector) = listener();
+                    *slot.lock().unwrap() = Some(connector);
+                    Ok(crate::transport::BoxListener::new(listener))
+                }),
+            },
+            Arc::new(host),
+        );
+        runtime.enable().expect("start the test service");
+        Self {
+            runtime,
+            calls,
+            clock,
+            connector,
+            base,
+        }
+    }
+
+    /// The token a client would read from the published descriptor.
+    pub fn token(&self) -> String {
+        let path = self
+            .base
+            .join("integration")
+            .join(crate::descriptor::Descriptor::file_name(std::process::id()));
+        let bytes = std::fs::read(path).expect("descriptor");
+        serde_json::from_slice::<crate::descriptor::Descriptor>(&bytes)
+            .expect("descriptor json")
+            .token
+    }
+
+    /// A new connection, not yet authenticated.
+    pub fn connect(&self) -> MemoryConnection {
+        self.connector
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("service started")
+            .connect()
+    }
+}
+
+impl Drop for TestLink {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.base);
+    }
+}
