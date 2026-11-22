@@ -24,6 +24,7 @@
 
 use crate::block_store::BlockStore;
 use crate::front_matter::{FrontMatter, FrontMatterHead, front_matter_head, recognize_front_matter};
+use crate::html::recognize_html_block;
 use crate::list_projection::ListProjectionMarkers;
 use crate::parser::parse_document_with_front_matter;
 use crate::{
@@ -847,12 +848,27 @@ pub(crate) fn tiled_blocks(
         .children(MarkdownTree::ROOT)
         .iter()
         .filter_map(|id| tree.node(*id))
-        .map(|node| (node.kind, node.source_range.start.0))
+        .map(|node| (node.kind, node.source_range))
         .collect::<Vec<_>>();
     starts
         .iter()
         .enumerate()
-        .map(|(index, (kind, block_start))| {
+        .map(|(index, (kind, node_range))| {
+            let block_start = &node_range.start.0;
+            // A top-level HTML block that is one complete `p` / heading / `hr`
+            // element on a single line publishes its display kind here, so a
+            // full parse, an incremental window and the local index agree.
+            let kind = if *kind == NodeKind::HtmlBlock {
+                source
+                    .get(
+                        node_range.start.0.saturating_sub(range.start.0)
+                            ..node_range.end.0.saturating_sub(range.start.0),
+                    )
+                    .and_then(recognize_html_block)
+                    .map_or(NodeKind::HtmlBlock, NodeKind::HtmlBlockElement)
+            } else {
+                *kind
+            };
             // Leading bytes before the first block belong to block 0.
             let start = if index == 0 {
                 range.start.0
@@ -861,7 +877,7 @@ pub(crate) fn tiled_blocks(
             };
             let end = starts
                 .get(index + 1)
-                .map_or(range.end.0, |(_, next)| *next)
+                .map_or(range.end.0, |(_, next)| next.start.0)
                 .max(start);
             let slice = &source[start - range.start.0..end - range.start.0];
             let endings = count_line_endings(slice);
@@ -870,7 +886,7 @@ pub(crate) fn tiled_blocks(
             let leading_content_lines = markdown_lines(slice)
                 .take_while(|line| line.trim().is_empty())
                 .count();
-            (*kind, end - start, lines, leading_content_lines)
+            (kind, end - start, lines, leading_content_lines)
         })
         .collect()
 }

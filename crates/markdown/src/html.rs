@@ -9,6 +9,7 @@
 use crate::parser::is_external_http_url;
 use crate::syntax::{MarkdownParse, MarkdownTree, NodeId, NodeKind};
 use hane_document::SourceRange;
+use std::ops::Range;
 use std::sync::Arc;
 
 /// Longest single tag (`<` through `>`) that is considered.
@@ -525,4 +526,323 @@ fn build_element(
         open_node: open.node,
         destination,
     })
+}
+
+/// What a recognized single-line HTML block element displays as (phase 2).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HtmlBlockKind {
+    /// `<p>…</p>`.
+    Paragraph,
+    /// `<h1>…</h1>` through `<h6>…</h6>`.
+    Heading(u8),
+    /// `<hr>` / `<hr />`.
+    Rule,
+}
+
+/// A phase-1 element inside the content of a block element. Offsets are byte
+/// offsets into the physical line that was recognized.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HtmlBlockInline {
+    pub kind: HtmlKind,
+    pub range: Range<usize>,
+    pub open_tag: Range<usize>,
+    pub close_tag: Range<usize>,
+    pub content_range: Range<usize>,
+    pub destination: Option<Arc<str>>,
+}
+
+/// One physical line that holds exactly one complete `p`, `h1`–`h6` or `hr`
+/// element and nothing else but surrounding whitespace. The content is never
+/// re-parsed as Markdown. Offsets are byte offsets into the line text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HtmlBlockLine {
+    pub kind: HtmlBlockKind,
+    /// Leading whitespace through the opening tag; for `hr`, the whole line
+    /// without its line ending.
+    pub open: Range<usize>,
+    /// The bytes between the opening and closing tag. Empty for `hr`.
+    pub content: Range<usize>,
+    /// The closing tag through trailing whitespace, before the line ending.
+    /// Empty for `hr`.
+    pub close: Range<usize>,
+    /// Phase-1 elements inside `content`, sorted by start.
+    pub inline: Vec<HtmlBlockInline>,
+}
+
+fn block_kind_of(name: &str) -> Option<HtmlBlockKind> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_bytes() {
+        b"p" => Some(HtmlBlockKind::Paragraph),
+        b"hr" => Some(HtmlBlockKind::Rule),
+        [b'h', digit @ b'1'..=b'6'] => Some(HtmlBlockKind::Heading(digit - b'0')),
+        _ => None,
+    }
+}
+
+/// The tag starting at `start` (a `<`) through the byte after its `>`, ending
+/// before `limit`. A `>` inside quotes does not end the tag; a bare `<` or an
+/// over-long tag is not a tag.
+fn tag_end(text: &str, start: usize, limit: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let limit = limit.min(bytes.len());
+    let mut quote: Option<u8> = None;
+    let mut index = start + 1;
+    while index < limit {
+        if index - start >= MAX_TAG_BYTES {
+            return None;
+        }
+        let byte = bytes[index];
+        match quote {
+            Some(open) => {
+                if byte == open {
+                    quote = None;
+                }
+            }
+            None => match byte {
+                b'"' | b'\'' => quote = Some(byte),
+                b'>' => return Some(index + 1),
+                b'<' => return None,
+                _ => {}
+            },
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Whether `tag` (`<` … `>`) names a block element this phase owns, so that it
+/// cannot appear inside another block element's content.
+fn names_block_element(tag: &str) -> bool {
+    let inner = tag.strip_prefix('<').unwrap_or(tag);
+    let inner = inner.strip_prefix('/').unwrap_or(inner);
+    let len = inner.bytes().take_while(|byte| byte.is_ascii_alphanumeric()).count();
+    block_kind_of(&inner[..len]).is_some()
+}
+
+/// Whether the text between an opening tag's name and its `>` is well formed:
+/// empty, or whitespace-separated attributes where a `/` outside quotes may
+/// only be the last character.
+fn open_tag_attrs_valid(attrs: &str) -> bool {
+    let attrs = attrs.trim_end_matches(is_ws);
+    if attrs.is_empty() {
+        return true;
+    }
+    let (body, _self_closing) = match attrs.strip_suffix('/') {
+        Some(body) => (body, true),
+        None => (attrs, false),
+    };
+    if !body.is_empty() && !body.starts_with(is_ws) && !attrs.starts_with('/') {
+        return false;
+    }
+    let mut quote: Option<char> = None;
+    for ch in body.chars() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '/' => return false,
+                _ => {}
+            },
+        }
+    }
+    quote.is_none()
+}
+
+struct LineToken {
+    range: Range<usize>,
+    tag: LexedTag,
+}
+
+/// Recognizes `line` as one complete single-line block element. `None` for
+/// anything else (other tags, text around the element, a broken or over-budget
+/// element), which then stays ordinary source.
+pub fn recognize_html_block_line(line: &str) -> Option<HtmlBlockLine> {
+    let body_end = line.trim_end_matches(['\n', '\r']).len();
+    if body_end > MAX_UNIT_BYTES {
+        return None;
+    }
+    let body = &line[..body_end];
+    let lead = body.len() - body.trim_start_matches(is_ws).len();
+    let end = body.trim_end_matches(is_ws).len();
+    if lead >= end || body.as_bytes()[lead] != b'<' {
+        return None;
+    }
+    let open_end = tag_end(body, lead, end)?;
+    let open_tag = &body[lead..open_end];
+    let inner = open_tag.strip_prefix('<')?;
+    if inner.starts_with('/') {
+        return None;
+    }
+    let name_len = inner.bytes().take_while(|byte| byte.is_ascii_alphanumeric()).count();
+    let name = &inner[..name_len];
+    let kind = block_kind_of(name)?;
+    if !inner[name_len..].starts_with(|ch: char| is_ws(ch) || ch == '/' || ch == '>') {
+        return None;
+    }
+    if !open_tag_attrs_valid(&inner[name_len..inner.len() - 1]) {
+        return None;
+    }
+    if kind == HtmlBlockKind::Rule {
+        return (open_end == end).then(|| HtmlBlockLine {
+            kind,
+            open: 0..body_end,
+            content: body_end..body_end,
+            close: body_end..body_end,
+            inline: Vec::new(),
+        });
+    }
+    if open_tag.ends_with("/>") {
+        return None;
+    }
+    let close_start = body[..end].rfind('<')?;
+    if close_start < open_end {
+        return None;
+    }
+    let close_inner = body[close_start..end]
+        .strip_prefix("</")?
+        .strip_suffix('>')?;
+    let close_name = close_inner.get(..name.len())?;
+    if !close_name.eq_ignore_ascii_case(name) || !close_inner[name.len()..].trim_matches(is_ws).is_empty() {
+        return None;
+    }
+    if body[open_end..close_start].trim_matches(is_ws).is_empty() {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let mut at = open_end;
+    while let Some(found) = body[at..close_start].find('<') {
+        let start = at + found;
+        if body[start..close_start].starts_with("<!--") {
+            let comment_end = body[start + 4..close_start].find("-->")?;
+            at = start + 4 + comment_end + 3;
+            continue;
+        }
+        let Some(tag_stop) = tag_end(body, start, close_start) else {
+            at = start + 1;
+            continue;
+        };
+        let text = &body[start..tag_stop];
+        if names_block_element(text) {
+            return None;
+        }
+        if let Some(tag) = lex_tag(text) {
+            if tokens.len() >= MAX_UNIT_TAGS {
+                return None;
+            }
+            tokens.push(LineToken {
+                range: start..tag_stop,
+                tag,
+            });
+        }
+        at = tag_stop;
+    }
+    let inline = pair_line_tokens(&tokens)?;
+    Some(HtmlBlockLine {
+        kind,
+        open: 0..open_end,
+        content: open_end..close_start,
+        close: close_start..body_end,
+        inline,
+    })
+}
+
+/// Pairs the allow-listed inline tags of one block element's content. The same
+/// rules as [`recognize_unit`] apply, without Markdown scopes: crossing or
+/// unclosed tags yield nothing, `<code>` content is literal, and nested links
+/// are ambiguous so neither is a link.
+fn pair_line_tokens(tokens: &[LineToken]) -> Option<Vec<HtmlBlockInline>> {
+    let mut stack: Vec<OpenTag> = Vec::new();
+    let mut found: Vec<HtmlBlockInline> = Vec::new();
+    let mut link_pairs: Vec<Range<usize>> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        if stack.last().is_some_and(|open| open.name == CODE_NAME)
+            && !(token.tag.closing && token.tag.name == CODE_NAME)
+        {
+            continue;
+        }
+        if !token.tag.closing {
+            if token.tag.self_closing {
+                continue;
+            }
+            if stack.len() >= MAX_DEPTH {
+                return None;
+            }
+            stack.push(OpenTag {
+                name: token.tag.name,
+                token: index,
+            });
+            continue;
+        }
+        match stack.iter().rposition(|open| open.name == token.tag.name) {
+            Some(at) if at + 1 == stack.len() => {
+                let Some(open) = stack.pop() else {
+                    continue;
+                };
+                let open_token = &tokens[open.token];
+                let kind = NAMES[token.tag.name].1;
+                let range = open_token.range.start..token.range.end;
+                let content_range = open_token.range.end..token.range.start;
+                if kind == HtmlKind::Link {
+                    link_pairs.push(range.clone());
+                }
+                if content_range.start >= content_range.end {
+                    continue;
+                }
+                let mut destination = None;
+                if kind == HtmlKind::Link {
+                    let Href::Valid(valid) = &open_token.tag.href else {
+                        continue;
+                    };
+                    destination = Some(valid.clone());
+                }
+                found.push(HtmlBlockInline {
+                    kind,
+                    range,
+                    open_tag: open_token.range.clone(),
+                    close_tag: token.range.clone(),
+                    content_range,
+                    destination,
+                });
+            }
+            Some(at) => stack.truncate(at),
+            None => {}
+        }
+    }
+    let code_contents = found
+        .iter()
+        .filter(|element| element.kind == HtmlKind::Code)
+        .map(|element| element.content_range.clone())
+        .collect::<Vec<_>>();
+    let in_code = |range: &Range<usize>| {
+        code_contents
+            .iter()
+            .any(|content| content.start <= range.start && range.end <= content.end)
+    };
+    found.retain(|element| !in_code(&element.range));
+    link_pairs.retain(|range| !in_code(range));
+    let nested = |a: &Range<usize>, b: &Range<usize>| {
+        a != b && ((a.start <= b.start && b.end <= a.end) || (b.start <= a.start && a.end <= b.end))
+    };
+    found.retain(|element| {
+        element.kind != HtmlKind::Link || !link_pairs.iter().any(|pair| nested(&element.range, pair))
+    });
+    found.sort_by_key(|element| (element.range.start, element.range.end));
+    Some(found)
+}
+
+/// The display kind of a top-level `HtmlBlock` whose `source` is exactly one
+/// non-blank line holding one complete block element.
+pub(crate) fn recognize_html_block(source: &str) -> Option<HtmlBlockKind> {
+    let mut lines = source
+        .split(['\n', '\r'])
+        .filter(|line| !line.trim().is_empty());
+    let line = lines.next()?;
+    if lines.next().is_some() {
+        return None;
+    }
+    recognize_html_block_line(line).map(|recognized| recognized.kind)
 }

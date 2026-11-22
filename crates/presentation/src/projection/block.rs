@@ -101,7 +101,10 @@ pub fn block_height_with_disclosure(
     let first_line_height = if visible_lines == 0 {
         0.0
     } else {
-        estimated_height(block_display_kind(block.kind), line_height)
+        estimated_height(
+            super::html_block::block_kind_with_disclosure(document, block, disclosure),
+            line_height,
+        )
     };
     first_line_height
         + line_height * visible_lines.saturating_sub(1) as f32
@@ -398,6 +401,26 @@ pub fn present_block_with_table_projection(
         // The blank run closing the block is not part of the construct, so it
         // never joins the shared parse and carries no list / quote ownership.
         let trailing = window.lines[run.start].line >= content_end;
+        if !trailing
+            && matches!(block.kind, NodeKind::HtmlBlockElement(_))
+            && window.render.contains(&window.lines[run.start].line)
+        {
+            let line = window.lines[run.start];
+            if let Some(mut presented) = super::html_block::present_html_block_line(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+                line.disclosure,
+            ) {
+                while presented.visual_text.ends_with(['\r', '\n']) {
+                    presented.visual_text.pop();
+                }
+                lines.push(presented);
+                continue;
+            }
+        }
         if !trailing && run_uses_shared_parse(run.len(), window.joined) {
             present_joined_run_with_list_projection(
                 &window.lines[run.clone()],
@@ -523,6 +546,23 @@ pub fn present_block_with_table_projection(
                 .links
                 .sort_by_key(|link| (link.source_range.start, link.source_range.end));
         }
+        // A line inside a raw HTML block is literal source. Presenting it on its
+        // own must never turn Markdown-looking text into an image or link target.
+        if !trailing
+            && matches!(block.kind, NodeKind::HtmlBlock | NodeKind::HtmlBlockElement(_))
+            && (presented.image.is_some() || !presented.links.is_empty())
+        {
+            let mut raw = present_raw_source(
+                line.line as u64,
+                revision,
+                line.range,
+                line.text,
+                line_height,
+            );
+            raw.disclosure = line.disclosure;
+            raw.context = line_context;
+            presented = raw;
+        }
         while presented.visual_text.ends_with(['\r', '\n']) {
             presented.visual_text.pop();
         }
@@ -609,9 +649,31 @@ pub fn present_block_with_table_projection(
     if table_delimiter_collapsed {
         record_collapsed(table_delimiter_line.unwrap_or_default(), true);
     }
+    // A single-line HTML block element is raw source while its content line is
+    // disclosed, and its Markdown equivalent otherwise.
+    let block_kind = match block.kind {
+        NodeKind::HtmlBlockElement(_)
+            if window
+                .lines
+                .iter()
+                .find(|line| {
+                    line.line < content_end && super::html_block::is_html_element_line(line.text)
+                })
+                .is_some_and(|line| {
+                    super::html_block::html_line_is_disclosed(
+                        line.range,
+                        line.text,
+                        line.disclosure,
+                    )
+                }) =>
+        {
+            BlockKind::Unsupported
+        }
+        kind => block_display_kind(kind),
+    };
     VisualBlock {
         id: block.id,
-        kind: block_display_kind(block.kind),
+        kind: block_kind,
         source_range: block.source_range,
         revision,
         confidence: block.confidence,
