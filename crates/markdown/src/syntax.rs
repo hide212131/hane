@@ -1,4 +1,4 @@
-use crate::{FenceMarkerEdge, HtmlElement};
+use crate::{FenceMarkerEdge, HtmlBlockKind, HtmlElement};
 use hane_document::{Revision, SourceRange};
 use std::sync::Arc;
 
@@ -39,6 +39,11 @@ pub enum NodeKind {
     TableCell,
     Rule,
     HtmlBlock,
+    /// An index-level kind only, never a tree node: a top-level [`Self::HtmlBlock`]
+    /// whose entire content is one complete `p`, `h1`–`h6` or `hr` element on a
+    /// single line (Issue #757, phase 2). The tree keeps [`Self::HtmlBlock`], so
+    /// full and incremental parses publish the same display information.
+    HtmlBlockElement(HtmlBlockKind),
     Html,
     FootnoteDefinition,
     Text,
@@ -85,6 +90,7 @@ impl NodeKind {
                 | Self::TableCell
                 | Self::Rule
                 | Self::HtmlBlock
+                | Self::HtmlBlockElement(_)
                 | Self::Html
                 | Self::FootnoteDefinition
         )

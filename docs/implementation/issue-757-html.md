@@ -2,7 +2,9 @@
 
 ## 状態
 
-フェーズ1（インラインタグ）は PR #758 で実装・マージ済み（検証結果は同 PR の evidence コメントに記録）。この PR はフェーズ2（単独行ブロック）の実装準備で、フェーズ2は未実装・未検証。
+フェーズ1（インラインタグ）は PR #758 で実装・マージ済み（検証結果は同 PR の evidence コメントに記録）。この PR はフェーズ2（単独行ブロック）の実装で、実装済み・検証待ち（ワークフローの CI、レビュー、GUI 確認は別 action）。
+
+フェーズ2の実装メモ: 単独行の `p`・`h1`〜`h6`・`hr` は `crates/markdown/src/html.rs` の `recognize_html_block_line` が行単位で認識し、索引は `NodeKind::HtmlBlockElement`（索引の種別のみで構文木には現れない）として公開する。全体解析・増分解析・局所索引は同じ `tiled_blocks` を通るため表示情報が一致する。表示は `crates/presentation/src/projection/html_block.rs`。開示中（その行にカーソル・選択・IME・検索一致が触れている間）は原文表示に戻り、高さの初期推定も同じ判定を使う。`IndexedBlock::line_count` は物理行数のまま。
 
 ## 設計
 

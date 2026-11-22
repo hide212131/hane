@@ -1,6 +1,8 @@
 use crate::{SourceMap, Visibility, VisualOffset, VisualRange};
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
-use hane_markdown::{BlockId, Confidence, IndexedBlock, NodeKind, TableAlignment, TableProjection};
+use hane_markdown::{
+    BlockId, Confidence, HtmlBlockKind, IndexedBlock, NodeKind, TableAlignment, TableProjection,
+};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -941,6 +943,16 @@ pub(super) const fn syntax_display(kind: NodeKind) -> SyntaxDisplay {
         },
         NodeKind::FrontMatter => SyntaxDisplay {
             indexed_block: BlockKind::FrontMatter,
+            ..default
+        },
+        // A single-line HTML block element displays as its Markdown
+        // equivalent; an HTML block of any other shape stays `Unsupported`.
+        NodeKind::HtmlBlockElement(kind) => SyntaxDisplay {
+            indexed_block: match kind {
+                HtmlBlockKind::Paragraph => BlockKind::Paragraph,
+                HtmlBlockKind::Heading(level) => BlockKind::Heading(level),
+                HtmlBlockKind::Rule => BlockKind::Rule,
+            },
             ..default
         },
         NodeKind::Strong => SyntaxDisplay {

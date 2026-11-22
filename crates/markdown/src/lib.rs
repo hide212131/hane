@@ -57,7 +57,10 @@ pub use front_matter::{
     FrontMatter, FrontMatterDate, FrontMatterDateState, FrontMatterEntry, FrontMatterHead,
     FrontMatterMetadata, FrontMatterSpan, front_matter_head, recognize_front_matter,
 };
-pub use html::{HtmlElement, HtmlKind, HtmlTagEdge};
+pub use html::{
+    HtmlBlockInline, HtmlBlockKind, HtmlBlockLine, HtmlElement, HtmlKind, HtmlTagEdge,
+    recognize_html_block_line,
+};
 pub use link_insertion::{
     LinkInsertionPlan, LinkInsertionRefusal, clipboard_http_url, plan_link_insertion,
 };
