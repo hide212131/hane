@@ -73,7 +73,30 @@ fn html_block_line_recognizes_only_one_complete_element() {
     }
 }
 
-type Shape = Vec<(NodeKind, SourceRange, usize, usize)>;
+#[test]
+fn html_block_line_validates_tags_strictly() {
+    for source in ["<hr>", "<hr/>", "<hr />"] {
+        assert_eq!(kind_of(source), Some(HtmlBlockKind::Rule), "{source:?}");
+    }
+    for source in ["<hr /foo>", "<hr/foo>", "<p>x</ p>", "<p>x< /p>"] {
+        assert_eq!(kind_of(source), None, "{source:?}");
+    }
+    assert_eq!(kind_of("<p>x</p >"), Some(HtmlBlockKind::Paragraph));
+
+    // A comment is one literal region: tags inside it are never recognized.
+    let commented =
+        recognize_html_block_line("<p><!-- <a href=\"https://example.com/\">x</a> --></p>")
+            .expect("paragraph");
+    assert!(commented.inline.is_empty());
+    let mixed = recognize_html_block_line(
+        "<p><!-- <b>y</b> --><a href=\"https://example.com/\">x</a></p>",
+    )
+    .expect("paragraph");
+    assert_eq!(mixed.inline.len(), 1);
+    assert_eq!(mixed.inline[0].kind, HtmlKind::Link);
+}
+
+type Shape =Vec<(NodeKind, SourceRange, usize, usize)>;
 
 fn shape(index: &BlockIndex) -> Shape {
     index

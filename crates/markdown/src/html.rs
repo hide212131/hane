@@ -619,6 +619,39 @@ fn names_block_element(tag: &str) -> bool {
     block_kind_of(&inner[..len]).is_some()
 }
 
+/// Whether the text between an opening tag's name and its `>` is well formed:
+/// empty, or whitespace-separated attributes where a `/` outside quotes may
+/// only be the last character.
+fn open_tag_attrs_valid(attrs: &str) -> bool {
+    let attrs = attrs.trim_end_matches(is_ws);
+    if attrs.is_empty() {
+        return true;
+    }
+    let (body, _self_closing) = match attrs.strip_suffix('/') {
+        Some(body) => (body, true),
+        None => (attrs, false),
+    };
+    if !body.is_empty() && !body.starts_with(is_ws) && !attrs.starts_with('/') {
+        return false;
+    }
+    let mut quote: Option<char> = None;
+    for ch in body.chars() {
+        match quote {
+            Some(open) => {
+                if ch == open {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => quote = Some(ch),
+                '/' => return false,
+                _ => {}
+            },
+        }
+    }
+    quote.is_none()
+}
+
 struct LineToken {
     range: Range<usize>,
     tag: LexedTag,
@@ -650,6 +683,9 @@ pub fn recognize_html_block_line(line: &str) -> Option<HtmlBlockLine> {
     if !inner[name_len..].starts_with(|ch: char| is_ws(ch) || ch == '/' || ch == '>') {
         return None;
     }
+    if !open_tag_attrs_valid(&inner[name_len..inner.len() - 1]) {
+        return None;
+    }
     if kind == HtmlBlockKind::Rule {
         return (open_end == end).then(|| HtmlBlockLine {
             kind,
@@ -669,7 +705,8 @@ pub fn recognize_html_block_line(line: &str) -> Option<HtmlBlockLine> {
     let close_inner = body[close_start..end]
         .strip_prefix("</")?
         .strip_suffix('>')?;
-    if !close_inner.trim_matches(is_ws).eq_ignore_ascii_case(name) {
+    let close_name = close_inner.get(..name.len())?;
+    if !close_name.eq_ignore_ascii_case(name) || !close_inner[name.len()..].trim_matches(is_ws).is_empty() {
         return None;
     }
     if body[open_end..close_start].trim_matches(is_ws).is_empty() {
@@ -679,6 +716,11 @@ pub fn recognize_html_block_line(line: &str) -> Option<HtmlBlockLine> {
     let mut at = open_end;
     while let Some(found) = body[at..close_start].find('<') {
         let start = at + found;
+        if body[start..close_start].starts_with("<!--") {
+            let comment_end = body[start + 4..close_start].find("-->")?;
+            at = start + 4 + comment_end + 3;
+            continue;
+        }
         let Some(tag_stop) = tag_end(body, start, close_start) else {
             at = start + 1;
             continue;
