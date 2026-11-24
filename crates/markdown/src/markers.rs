@@ -208,17 +208,11 @@ struct ListItemPrefix {
     width: usize,
 }
 
-/// Syntactic content-start column of a list item's opening `line` (indent,
-/// marker and the parser's padding rule; a task checkbox is not included).
-pub(crate) fn list_item_content_column(line: &str) -> Option<usize> {
-    PrefixCursor::default()
-        .list_item(line.as_bytes())
-        .map(|prefix| prefix.width)
-}
-
-/// Like [`list_item_content_column`] for a line whose marker starts at byte
-/// `marker`. The leading whitespace is measured with absolute tab stops, so
-/// indents of four or more columns (which the plain scan rejects) still work.
+/// Syntactic content-start column of a list item's opening `line` whose marker
+/// starts at byte `marker` (indent, marker and the parser's padding rule; a
+/// task checkbox is not included). The leading whitespace is measured with
+/// absolute tab stops, so indents of four or more columns (which the plain
+/// scan rejects) still work.
 pub(crate) fn list_item_content_column_at(line: &str, marker: usize) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut cursor = PrefixCursor::default();
