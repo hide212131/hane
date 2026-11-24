@@ -2452,6 +2452,30 @@ fn indented_bullet_continuation_shares_the_opening_rows_body_origin() {
 }
 
 #[test]
+fn indented_bullet_continuation_keeps_shared_origin_when_parent_is_disclosed() {
+    let source = "- abc\n     - def\n       cont\n";
+    let shaper = shaper();
+    let body_origins = |cursor: Option<usize>| {
+        let (block, child) = nested_child_block(source, cursor);
+        let layout = layout_block(&block, 160.0, &shaper);
+        let origin = |line: usize| {
+            layout
+                .lines
+                .iter()
+                .find(|row| row.line == line)
+                .map(|row| row.body_x_origin)
+                .expect("the row is laid out")
+        };
+        (origin(child), origin(child + 1))
+    };
+    let (def_hidden, cont_hidden) = body_origins(None);
+    assert_eq!(def_hidden, cont_hidden, "hidden rows share a body origin");
+    let (def_disclosed, cont_disclosed) = body_origins(Some(5));
+    assert_eq!(def_disclosed, def_hidden, "opening row stays still");
+    assert_eq!(cont_disclosed, cont_hidden, "continuation row stays still");
+}
+
+#[test]
 fn inactive_nested_bullet_wrap_is_stable_when_parent_is_disclosed() {
     let source = "- abc\n  - def ghi jkl mno pqr stu vwx yz\n";
     let shaper = shaper();

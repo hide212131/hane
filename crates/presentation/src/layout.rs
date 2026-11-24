@@ -1785,12 +1785,13 @@ fn line_geometry(
         .sum::<f32>();
     // A hidden continuation row shares the width its item's opening row
     // reserved for leading spaces, so both rows keep the same body origin.
-    let marker_x = match (list.marker.as_ref(), line.quote) {
-        (None, None) if expanded_prefix_width == 0.0 => leading_widths
-            .get(&list.owner.item_id)
-            .map_or(marker_x, |shared| marker_x.max(*shared)),
-        _ => marker_x,
+    // When the continuation's own spaces are disclosed they are painted inside
+    // that reserved width, so they must not be added to the body origin again.
+    let shared_leading_width = match (list.marker.as_ref(), line.quote) {
+        (None, None) => leading_widths.get(&list.owner.item_id).copied(),
+        _ => None,
     };
+    let marker_x = shared_leading_width.map_or(marker_x, |shared| marker_x.max(shared));
     // A disclosed continuation has no marker of its own. Its expanded
     // structural prefix already paints the indentation that leads to the
     // item's body, so adding the aggregate marker width would reserve that
@@ -1806,7 +1807,10 @@ fn line_geometry(
         .is_some_and(|marker| !marker.synthesized)
     {
         disclosed_marker_width
-    } else if list.marker.is_none() && expanded_prefix_width > 0.0 {
+    } else if list.marker.is_none()
+        && expanded_prefix_width > 0.0
+        && shared_leading_width.is_none()
+    {
         0.0
     } else {
         aggregate_marker_width.max(disclosed_marker_width)
@@ -1827,7 +1831,7 @@ fn line_geometry(
             + marker_body_gap
     } else {
         marker_x
-            + if stable_leading_space_width.is_some() {
+            + if stable_leading_space_width.is_some() || shared_leading_width.is_some() {
                 0.0
             } else {
                 expanded_prefix_width
