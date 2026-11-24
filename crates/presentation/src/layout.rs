@@ -1673,7 +1673,19 @@ fn carried_leading_space_width(
     list.item_leading_space_count
         .filter(|count| *count > 0)
         .filter(|_| line.quote.is_none() && list.owner.marker_kind == ListMarkerKind::Bullet)
-        .map(|count| shaper.width_for_text(line, &" ".repeat(count)))
+        .map(|count| {
+            let spaces = " ".repeat(count);
+            // The opening row measures its spaces in the list item's own font.
+            // Measure the same way here, so a heading or other differently
+            // scaled continuation row does not widen the item's shared width.
+            if line.kind == BlockKind::ListItem {
+                shaper.width_for_text(line, &spaces)
+            } else {
+                let mut opening = line.clone();
+                opening.kind = BlockKind::ListItem;
+                shaper.width_for_text(&opening, &spaces)
+            }
+        })
 }
 
 fn line_geometry(

@@ -1094,6 +1094,7 @@ fn present_markdown_from_parse(
             &line.source_map,
             disclosure,
             shared.list_projection,
+            shared.source,
         );
         return line;
     }
@@ -1425,6 +1426,7 @@ fn present_markdown_from_parse(
         &source_map,
         disclosure,
         shared.list_projection,
+        shared.source,
     );
     let has_hidden_fence = kind == BlockKind::CodeBlock
         && markers_on_line
@@ -2122,6 +2124,7 @@ fn list_row_metadata(
     source_map: &SourceMap,
     disclosure: Option<SourceRange>,
     list_projection: Option<&ListProjection>,
+    parse_source: &str,
 ) -> Option<ListRowMetadata> {
     let item = projection
         .list_items
@@ -2280,6 +2283,7 @@ fn list_row_metadata(
         leading_structural_space_count,
         item_leading_space_count: item_leading_space_count(
             parsed,
+            parse_source,
             projection,
             item,
             projected,
@@ -2295,6 +2299,7 @@ fn list_row_metadata(
 /// item reports the same value even when the opening row is outside the window.
 fn item_leading_space_count(
     parsed: &MarkdownParse,
+    parse_source: &str,
     projection: &ProjectionIndex,
     item: Option<NodeId>,
     projected: Option<&ListProjectionItem>,
@@ -2356,6 +2361,11 @@ fn item_leading_space_count(
         }
     }
     let count = marker_start - cursor;
+    let base = parsed.source_range.start.0;
+    let prefix = parse_source.get(cursor.checked_sub(base)?..marker_start.checked_sub(base)?)?;
+    if !prefix.bytes().all(|byte| byte == b' ') {
+        return None;
+    }
     (count > 0).then_some(count)
 }
 
