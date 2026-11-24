@@ -2693,6 +2693,29 @@ mod tests {
     }
 
     #[test]
+    fn ordered_move_keeps_fenced_code_bytes_including_tabs() {
+        let (indented, _) = replacement(
+            "1. A\n2. B\n   ```\n   all:\n   \tcc -o a a.c\n   ```",
+            9,
+            ListEditIntent::Indent,
+        );
+        assert_eq!(
+            indented,
+            "1. A\n   1. B\n      ```\n      all:\n      \tcc -o a a.c\n      ```"
+        );
+
+        let (outdented, _) = replacement(
+            "1. A\n   1. B\n      ```\n      all:\n      \tcc -o a a.c\n      ```",
+            12,
+            ListEditIntent::Outdent,
+        );
+        assert_eq!(
+            outdented,
+            "1. A\n2. B\n   ```\n   all:\n   \tcc -o a a.c\n   ```"
+        );
+    }
+
+    #[test]
     fn ordered_move_of_the_first_item_is_a_noop() {
         assert_eq!(
             plan("1. A\n2. B", 4, ListEditIntent::Indent),
@@ -2967,16 +2990,14 @@ fn transform_ordered_subtree(
     replacement.push_str(&new_first);
     replacement.push_str(first_ending);
     for (content, ending) in &lines[1..] {
-        let leading = content
-            .bytes()
-            .take_while(|byte| matches!(byte, b' ' | b'\t'))
-            .count();
-        if shift == 0 || leading == content.len() {
+        let blank = content.bytes().all(|byte| matches!(byte, b' ' | b'\t'));
+        if shift == 0 || blank {
+            replacement.push_str(content);
+        } else if shift > 0 {
+            replacement.push_str(&" ".repeat(shift as usize));
             replacement.push_str(content);
         } else {
-            let column = columns(&content[..leading]) as isize + shift;
-            replacement.push_str(&" ".repeat(column.max(0) as usize));
-            replacement.push_str(&content[leading..]);
+            replacement.push_str(&remove_columns(content, shift.unsigned_abs()));
         }
         replacement.push_str(ending);
     }
