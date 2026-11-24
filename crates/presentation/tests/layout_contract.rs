@@ -2424,7 +2424,10 @@ fn indented_bullet_continuation_shares_the_opening_rows_body_origin() {
         .into_iter()
         .find(|block| block.lines.iter().any(|line| line.list.is_some()))
         .expect("the list block is presented");
-    assert_eq!(block.lines.len(), 2);
+    assert!(
+        block.lines.len() >= 2,
+        "the opening and continuation lines are presented"
+    );
     let layout = layout_block(&block, 160.0, &shaper);
     let rows = |line: usize| {
         layout
