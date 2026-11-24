@@ -354,6 +354,11 @@ pub struct ListRowMetadata {
     /// parent's indentation is disclosed. `None` for tabs, other characters
     /// or rows without an opening marker.
     pub leading_structural_space_count: Option<usize>,
+    /// Leading-space count of the item's opening row, carried by every row of
+    /// the item (continuations included) when that opening row is a plain,
+    /// undisclosed, task-less nested bullet. Derived from the whole parse, so a
+    /// window that omits the opening row still reserves the same width.
+    pub item_leading_space_count: Option<usize>,
 }
 
 /// Formal quote context for one physical line. The depth comes from the

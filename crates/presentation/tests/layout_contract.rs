@@ -2451,6 +2451,85 @@ fn indented_bullet_continuation_shares_the_opening_rows_body_origin() {
     );
 }
 
+/// Presents only the `render` lines of the document's first block, the way a
+/// viewport that starts below the block's opening row does.
+fn present_first_block_window(source: &str, render: Range<usize>) -> VisualBlock {
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let block = index.blocks().next().expect("first block");
+    let span = block_line_span(&buffer, &block).expect("block spans lines");
+    let ranges = render
+        .clone()
+        .map(|line| buffer.line_range(LineId(line)).expect("line in range"))
+        .collect::<Vec<_>>();
+    let texts = ranges
+        .iter()
+        .map(|range| buffer.text(*range).expect("line text"))
+        .collect::<Vec<_>>();
+    let lines = render
+        .clone()
+        .zip(&ranges)
+        .zip(&texts)
+        .map(|((line, range), text)| BlockLine {
+            line,
+            range: *range,
+            text,
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    present_block_with_table_projection(
+        &block,
+        buffer.revision(),
+        &BlockWindow {
+            trailing_blank_lines: trailing_blank_lines(&buffer, &span),
+            span,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
+            render,
+            joined: None,
+            block_disclosure: None,
+        },
+        LINE_HEIGHT,
+        index.list_projection(&block),
+        index.table_projection(&block),
+    )
+}
+
+#[test]
+fn continuation_only_window_keeps_the_opening_rows_shared_width() {
+    let source = "  - item\n    continued words that wrap over several rows here\n";
+    let shaper = shaper();
+    let full = present_first_block_window(source, 0..2);
+    let window = present_first_block_window(source, 1..2);
+    assert_eq!(full.lines.len(), 2, "the whole block is presented");
+    assert_eq!(window.lines.len(), 1, "only the continuation is presented");
+    assert!(
+        window.lines[0]
+            .list
+            .as_ref()
+            .is_some_and(|list| list.marker.is_none()),
+        "the window holds a continuation row"
+    );
+    let full_layout = layout_block(&full, 160.0, &shaper);
+    let window_layout = layout_block(&window, 160.0, &shaper);
+    let full_row = full_layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("the continuation row is laid out");
+    let window_row = window_layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the windowed continuation row is laid out");
+    assert_eq!(full_row.body_x_origin, 32.0);
+    assert_eq!(window_row.body_x_origin, full_row.body_x_origin);
+    assert_eq!(window_row.effective_width, full_row.effective_width);
+}
+
 #[test]
 fn indented_bullet_continuation_keeps_shared_origin_when_parent_is_disclosed() {
     let source = "- abc\n     - def\n       cont\n";

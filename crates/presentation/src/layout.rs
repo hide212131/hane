@@ -1633,20 +1633,47 @@ fn stable_leading_space_width(
 
 /// Leading-space width reserved by each item's opening row, shared with the
 /// item's continuation rows so their body origin lines up with the opening row.
+///
+/// A window may omit the opening row, so a continuation row falls back to the
+/// opening row's count carried in its own item metadata. An opening row that is
+/// present always decides for its item.
 fn item_leading_space_widths(
     block: &VisualBlock,
     shaper: &dyn LineShaper,
 ) -> HashMap<ListItemId, f32> {
-    let mut widths = HashMap::new();
+    let mut widths: HashMap<ListItemId, Option<f32>> = HashMap::new();
     for line in &block.lines {
         let Some(list) = &line.list else {
             continue;
         };
-        if let Some(width) = stable_leading_space_width(line, list, shaper) {
-            widths.insert(list.owner.item_id, width);
+        if list.marker.is_some() {
+            widths.insert(
+                list.owner.item_id,
+                stable_leading_space_width(line, list, shaper),
+            );
+        } else {
+            widths
+                .entry(list.owner.item_id)
+                .or_insert_with(|| carried_leading_space_width(line, list, shaper));
         }
     }
     widths
+        .into_iter()
+        .filter_map(|(item, width)| Some((item, width?)))
+        .collect()
+}
+
+/// Width of the opening row's leading spaces as carried by a row of the same
+/// item, for rows whose opening row is not part of the block.
+fn carried_leading_space_width(
+    line: &VisualLine,
+    list: &crate::ListRowMetadata,
+    shaper: &dyn LineShaper,
+) -> Option<f32> {
+    list.item_leading_space_count
+        .filter(|count| *count > 0)
+        .filter(|_| line.quote.is_none() && list.owner.marker_kind == ListMarkerKind::Bullet)
+        .map(|count| shaper.width_for_text(line, &" ".repeat(count)))
 }
 
 fn line_geometry(

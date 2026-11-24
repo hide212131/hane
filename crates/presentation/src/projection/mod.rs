@@ -2278,7 +2278,85 @@ fn list_row_metadata(
         structural_prefixes,
         body_visual_start,
         leading_structural_space_count,
+        item_leading_space_count: item_leading_space_count(
+            parsed,
+            projection,
+            item,
+            projected,
+            disclosure,
+            list_projection,
+        ),
     })
+}
+
+/// Leading-space count of an item's opening row when it is a plain, undisclosed,
+/// task-less item whose structural prefixes cover every leading space. Read
+/// from the whole parse rather than the presented rows, so every row of the
+/// item reports the same value even when the opening row is outside the window.
+fn item_leading_space_count(
+    parsed: &MarkdownParse,
+    projection: &ProjectionIndex,
+    item: Option<NodeId>,
+    projected: Option<&ListProjectionItem>,
+    disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
+) -> Option<usize> {
+    let (marker_start, mut cursor) = if let Some(projected) = projected {
+        if projected.task.is_some()
+            || disclosure.zip(list_projection).is_some_and(|(disclosure, lp)| {
+                projected_list_item_range_touches(lp, projected, disclosure)
+            })
+        {
+            return None;
+        }
+        let marker_start = projected.marker_range.start.0;
+        (marker_start, marker_start)
+    } else {
+        let item = item?;
+        let node = parsed.tree.node(item)?;
+        if projection.list_item_tasks.get(item.0).copied().flatten().is_some()
+            || disclosure.is_some_and(|disclosure| {
+                list_item_range_touches(&parsed.tree, item, node, disclosure)
+            })
+        {
+            return None;
+        }
+        let first = projection
+            .markers
+            .partition_point(|marker| marker.range.start < node.source_range.start);
+        let marker = projection.markers[first..]
+            .iter()
+            .take_while(|marker| marker.range.start < node.source_range.end)
+            .find(|marker| marker.list_owner == Some(item))?;
+        (marker.range.start.0, marker.range.start.0)
+    };
+    while cursor > 0 {
+        let previous = if projected.is_some() {
+            list_projection.and_then(|lp| {
+                lp.prefixes_in(SourceRange::new(cursor - 1, cursor))
+                    .find(|prefix| prefix.source_range.end.0 == cursor)
+                    .map(|prefix| prefix.source_range.start.0)
+            })
+        } else {
+            let index = projection
+                .markers
+                .partition_point(|marker| marker.range.start.0 < cursor);
+            index
+                .checked_sub(1)
+                .map(|index| &projection.markers[index])
+                .filter(|marker| {
+                    marker.range.end.0 == cursor
+                        && (marker.list_prefix.is_some() || marker.global_list_prefix.is_some())
+                })
+                .map(|marker| marker.range.start.0)
+        };
+        match previous {
+            Some(start) if start < cursor => cursor = start,
+            _ => break,
+        }
+    }
+    let count = marker_start - cursor;
+    (count > 0).then_some(count)
 }
 
 /// One joinable block's whole-span parse, kept independent of which lines a
