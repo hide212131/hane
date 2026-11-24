@@ -2739,6 +2739,29 @@ mod tests {
     }
 
     #[test]
+    fn ordered_move_keeps_content_start_of_descendant_with_tab_after_marker() {
+        let (indented, _) = replacement(
+            "10. A\n11. B\n\n    7.\t  [x] text",
+            11,
+            ListEditIntent::Indent,
+        );
+        assert_eq!(indented, "10. A\n    1. B\n\n       7.    [x] text");
+        let items = reparsed_items(&indented);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].task, Some(true));
+
+        let (outdented, _) = replacement(
+            "10. A\n    1. B\n\n        7.\t  [x] text",
+            15,
+            ListEditIntent::Outdent,
+        );
+        assert_eq!(outdented, "10. A\n11. B\n\n     7.    [x] text");
+        let items = reparsed_items(&outdented);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].task, Some(true));
+    }
+
+    #[test]
     fn ordered_move_shifts_tab_structural_indent_by_columns() {
         let (indented, caret) = replacement("10. A\n11. B\n\n\tP", 11, ListEditIntent::Indent);
         assert_eq!(indented, "10. A\n    1. B\n\n       P");
@@ -3106,14 +3129,37 @@ fn transform_ordered_subtree(
         } else {
             reindent_columns(content, shift)
         };
+        // A descendant item whose marker is followed by a tab keeps its
+        // content start only if the padding is rewritten as spaces covering
+        // the same columns (a tab's width depends on its absolute column).
+        let mut run_fix = None;
+        let new_content = if shift != 0 && !blank && !in_code {
+            match fix_descendant_tab_padding(projection, line_start_abs, content, &new_content) {
+                Some((fixed, old_run_end, new_run_end)) => {
+                    run_fix = Some((old_run_end, new_run_end));
+                    fixed
+                }
+                None => new_content,
+            }
+        } else {
+            new_content
+        };
         let old_len = content.len() + ending.len();
         if mapped.is_none() && offset >= old_pos && offset < old_pos + old_len {
             let rel = offset - old_pos;
-            let new_rel = if rel >= lead_old {
+            let mut new_rel = if rel >= lead_old {
                 rel - lead_old + lead_new
             } else {
                 lead_new
             };
+            if let Some((old_run_end, new_run_end)) = run_fix {
+                let shifted_old_end = old_run_end - lead_old + lead_new;
+                if rel >= old_run_end {
+                    new_rel = new_rel + new_run_end - shifted_old_end;
+                } else if new_rel > new_run_end {
+                    new_rel = new_run_end;
+                }
+            }
             mapped = Some(new_pos + new_rel);
         }
         old_pos += old_len;
@@ -3164,6 +3210,65 @@ fn split_physical_lines(text: &str) -> Vec<(&str, &str)> {
         lines.push((&text[line_start..], ""));
     }
     lines
+}
+
+/// For a descendant list item's opening line, rewrites a tab-containing run
+/// after the marker as spaces covering the columns it spanned in `old`, so the
+/// parser's content start survives the reindent. The item's number is left
+/// untouched. Returns the fixed line plus the run end offsets in `old` and the
+/// fixed line, or `None` when the line is not such an item line.
+fn fix_descendant_tab_padding(
+    projection: &ListEditProjection,
+    line_start_abs: usize,
+    old: &str,
+    reindented: &str,
+) -> Option<(String, usize, usize)> {
+    let lead = old
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let marker_abs = line_start_abs + lead;
+    projection
+        .items
+        .iter()
+        .find(|item| item.marker_range.start.0 == marker_abs)?;
+    let digits = old[lead..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let marker_len = if digits > 0 {
+        if !matches!(old.as_bytes().get(lead + digits), Some(b'.' | b')')) {
+            return None;
+        }
+        digits + 1
+    } else if matches!(old.as_bytes().get(lead), Some(b'-' | b'+' | b'*')) {
+        1
+    } else {
+        return None;
+    };
+    let run_start = lead + marker_len;
+    let run_len = old[run_start..]
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let run_end = run_start + run_len;
+    let run = &old[run_start..run_end];
+    if !run.contains('\t') || run_end >= old.len() {
+        return None;
+    }
+    let new_lead = reindented
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let new_run_start = new_lead + marker_len;
+    let run_columns = prefix_columns(&old[..run_end]).saturating_sub(prefix_columns(&old[..run_start]));
+    let fixed = format!(
+        "{}{}{}",
+        reindented.get(..new_run_start)?,
+        " ".repeat(run_columns),
+        &old[run_end..]
+    );
+    Some((fixed, run_end, new_run_start + run_columns))
 }
 
 /// Moves a non-code continuation line's structural indent by `shift` display
