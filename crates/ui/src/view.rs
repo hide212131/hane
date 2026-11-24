@@ -26079,6 +26079,49 @@ mod tests {
     }
 
     #[gpui::test]
+    fn ordered_move_through_real_key_dispatch(cx: &mut gpui::TestAppContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) =
+            cx.add_window_view(|_, cx| EditorView::new("9. A\n10. B", "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        focus_body_for_key_dispatch(cx);
+
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(10)))
+                .unwrap();
+            cx.notify();
+        });
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "9. A\n   1. B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(12)));
+        });
+
+        cx.simulate_keystrokes("shift-tab");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "9. A\n10. B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(10)));
+        });
+
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-z"
+        } else {
+            "ctrl-z"
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().document().full_text(), "9. A\n   1. B");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(12)));
+        });
+    }
+
+    #[gpui::test]
     fn tab_and_shift_tab_are_no_ops_outside_a_list_context_and_never_insert_a_literal_tab_character(
         cx: &mut gpui::TestAppContext,
     ) {

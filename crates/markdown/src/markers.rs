@@ -198,6 +198,14 @@ struct ListItemPrefix {
     width: usize,
 }
 
+/// Syntactic content-start column of a list item's opening `line` (indent,
+/// marker and the parser's padding rule; a task checkbox is not included).
+pub(crate) fn list_item_content_column(line: &str) -> Option<usize> {
+    PrefixCursor::default()
+        .list_item(line.as_bytes())
+        .map(|prefix| prefix.width)
+}
+
 #[derive(Clone, Copy)]
 enum PrefixContainer {
     Quote,

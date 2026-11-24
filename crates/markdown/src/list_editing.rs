@@ -577,6 +577,16 @@ pub fn plan_list_edit(
                     selection_after: selection,
                 }));
             }
+            if let Some(plan) = plan_ordered_move(
+                &source,
+                projection,
+                item,
+                intent,
+                previous.body_indent_columns,
+                selection,
+            ) {
+                return Ok(ListEditPlanResult::Handled(plan));
+            }
             Ok(ListEditPlanResult::Handled(transform_subtree(
                 &source,
                 item,
@@ -602,6 +612,16 @@ pub fn plan_list_edit(
                 return Ok(ListEditPlanResult::Handled(MarkdownEditPlan::NoOp {
                     selection_after: selection,
                 }));
+            }
+            if let Some(plan) = plan_ordered_move(
+                &source,
+                projection,
+                item,
+                intent,
+                parent.marker_indent_columns,
+                selection,
+            ) {
+                return Ok(ListEditPlanResult::Handled(plan));
             }
             Ok(ListEditPlanResult::Handled(transform_subtree(
                 &source,
@@ -2566,6 +2586,115 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordered_move_renumbers_only_the_moved_item() {
+        let indent = ListEditIntent::Indent;
+        let outdent = ListEditIntent::Outdent;
+        let cases: &[(&str, usize, ListEditIntent, &str, usize)] = &[
+            // basic: new child list starts at 1 under the existing indent rule
+            (
+                "1. abc\n2. def\n3. ghi",
+                18,
+                indent,
+                "1. abc\n2. def\n   1. ghi",
+                21,
+            ),
+            // existing child list: semantic number, not the source digits
+            (
+                "1. A\n\n    5. N\n    99. M\n8. B",
+                29,
+                indent,
+                "1. A\n\n    5. N\n    99. M\n   7. B",
+                32,
+            ),
+            // outdent continues the parent's numbering, followers untouched
+            ("3. A\n   1. B\n77. C", 12, outdent, "3. A\n4. B\n77. C", 9),
+            // two digits to one, continuation line, UTF-8 body
+            (
+                "9. A\n10. 日本\n    cont",
+                12,
+                indent,
+                "9. A\n   1. 日本\n      cont",
+                14,
+            ),
+            // one digit to two, separate paragraph and descendants kept
+            (
+                "9. A\n   1. B\n\n      P\n\n      7. C\n9. Z",
+                12,
+                outdent,
+                "9. A\n10. B\n\n    P\n\n    7. C\n9. Z",
+                10,
+            ),
+            ("1) A\n2) B", 9, indent, "1) A\n   1) B", 12),
+            // a different delimiter never joins the existing child list
+            (
+                "1. A\n\n    5) N\n2. B",
+                19,
+                indent,
+                "1. A\n\n    5) N\n   1. B",
+                22,
+            ),
+            // descendant numbers are not touched
+            (
+                "9. A\n10. B\n\n    7. C\n    42. D",
+                10,
+                indent,
+                "9. A\n   1. B\n\n      7. C\n      42. D",
+                12,
+            ),
+            ("1. A\r\n2. B\r\n", 10, indent, "1. A\r\n   1. B\r\n", 13),
+            ("1. A\n2. [ ] B", 13, indent, "1. A\n   1. [ ] B", 16),
+            ("9. A\n10. [X] B", 11, indent, "9. A\n   1. [X] B", 13),
+            ("9. A\n10. B", 6, indent, "9. A\n   1. B", 9),
+        ];
+        for (text, caret, intent, expected, at) in cases {
+            assert_eq!(
+                replacement(text, *caret, *intent),
+                ((*expected).to_owned(), *at),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_move_preserves_structure_and_task_state_after_reparse() {
+        let (text, _) = replacement(
+            "9. A\n10. [X] B\n\n    P\n\n    7. C",
+            11,
+            ListEditIntent::Indent,
+        );
+        let items = reparsed_items(&text);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].depth, 2);
+        assert_eq!(items[1].parent_item, Some(0));
+        assert_eq!(items[1].task, Some(true));
+        assert_eq!(items[2].depth, 3);
+        assert_eq!(items[2].parent_item, Some(1));
+        assert_eq!(items[2].list_start, Some(7));
+
+        let (text, _) = replacement(
+            "9. A\n   1. B\n\n      P\n\n      7. C\n9. Z",
+            12,
+            ListEditIntent::Outdent,
+        );
+        let items = reparsed_items(&text);
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[1].depth, 1);
+        assert_eq!(items[1].ordinal, 1);
+        assert_eq!(items[1].list_range, items[0].list_range);
+        assert_eq!(items[2].parent_item, Some(1));
+    }
+
+    #[test]
+    fn ordered_move_of_the_first_item_is_a_noop() {
+        assert_eq!(
+            plan("1. A\n2. B", 4, ListEditIntent::Indent),
+            MarkdownEditPlan::NoOp {
+                selection_after: SourceSelection::caret(SourceOffset(4)),
+            }
+        );
+    }
+
     /// `transform_subtree` must shift every physical line of the subtree by
     /// the same column delta while keeping each line's own terminator bytes
     /// untouched, even when those terminators mix CRLF, bare CR, and LF
@@ -2722,6 +2851,146 @@ fn transform_subtree(
         replacement,
         selection_after: SourceSelection::caret(SourceOffset(mapped)),
     }
+}
+
+const MAX_ORDERED_NUMBER: u64 = 999_999_999;
+
+/// Plans an Indent / Outdent of a parser-owned ordered item that rewrites only
+/// the moved item's own number. Returns `None` when the item is not an
+/// ordered parser item (or its source shape is unexpected), leaving the plain
+/// whitespace move to the caller.
+fn plan_ordered_move(
+    source: &str,
+    projection: &ListEditProjection,
+    item: &ListEditItem,
+    intent: ListEditIntent,
+    new_indent: usize,
+    selection: SourceSelection,
+) -> Option<MarkdownEditPlan> {
+    let ListMarker::Ordered { delimiter } = item.marker else {
+        return None;
+    };
+    if !item.is_parser_item || item.in_quote {
+        return None;
+    }
+    let number = match intent {
+        ListEditIntent::Indent => {
+            let previous_index = item.previous_sibling?;
+            let previous = projection.items.get(previous_index)?;
+            let last_child = projection
+                .items
+                .iter()
+                .filter(|candidate| {
+                    candidate.parent_item == Some(previous_index)
+                        && candidate.depth == previous.depth + 1
+                })
+                .max_by_key(|candidate| candidate.item_range.start.0);
+            match last_child {
+                Some(child)
+                    if child.marker == ListMarker::Ordered { delimiter }
+                        && source
+                            .get(child.subtree_range.end.0..item.subtree_range.start.0)
+                            .is_some_and(|between| {
+                                between.bytes().all(|byte| byte.is_ascii_whitespace())
+                            }) =>
+                {
+                    child
+                        .list_start
+                        .unwrap_or(1)
+                        .saturating_add(child.ordinal as u64)
+                        .saturating_add(1)
+                }
+                _ => 1,
+            }
+        }
+        ListEditIntent::Outdent => {
+            let parent = projection.items.get(item.parent_item?)?;
+            match parent.marker {
+                ListMarker::Ordered { .. } => parent
+                    .list_start
+                    .unwrap_or(1)
+                    .saturating_add(parent.ordinal as u64)
+                    .saturating_add(1),
+                ListMarker::Unordered { .. } => 1,
+            }
+        }
+        _ => return None,
+    };
+    if number > MAX_ORDERED_NUMBER {
+        return Some(MarkdownEditPlan::NoOp {
+            selection_after: selection,
+        });
+    }
+    transform_ordered_subtree(source, item, new_indent, number, selection.active)
+}
+
+fn transform_ordered_subtree(
+    source: &str,
+    item: &ListEditItem,
+    new_indent: usize,
+    number: u64,
+    caret: SourceOffset,
+) -> Option<MarkdownEditPlan> {
+    let range = item.subtree_range;
+    let original = source.get(range.as_usize())?;
+    let lines = split_physical_lines(original);
+    let (first, first_ending) = *lines.first()?;
+
+    let marker_rel = item.marker_range.start.0.checked_sub(range.start.0)?;
+    let old_indent = first.get(..marker_rel)?;
+    if !old_indent.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+        return None;
+    }
+    let digits = first[marker_rel..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if digits == 0 || !matches!(first.as_bytes().get(marker_rel + digits), Some(b'.' | b')')) {
+        return None;
+    }
+    let rest = &first[marker_rel + digits..];
+    let new_number = number.to_string();
+    let new_first = format!("{}{new_number}{rest}", " ".repeat(new_indent));
+
+    let old_width = crate::markers::list_item_content_column(first)?;
+    let new_width = crate::markers::list_item_content_column(&new_first)?;
+    let shift = new_width as isize - old_width as isize;
+
+    let mut replacement = String::with_capacity(original.len() + new_indent + 8);
+    replacement.push_str(&new_first);
+    replacement.push_str(first_ending);
+    for (content, ending) in &lines[1..] {
+        let leading = content
+            .bytes()
+            .take_while(|byte| matches!(byte, b' ' | b'\t'))
+            .count();
+        if shift == 0 || leading == content.len() {
+            replacement.push_str(content);
+        } else {
+            let column = columns(&content[..leading]) as isize + shift;
+            replacement.push_str(&" ".repeat(column.max(0) as usize));
+            replacement.push_str(&content[leading..]);
+        }
+        replacement.push_str(ending);
+    }
+
+    let offset = caret.0.saturating_sub(range.start.0);
+    let new_marker_end = new_indent + new_number.len();
+    let old_marker_end = marker_rel + digits;
+    let mapped = if offset == 0 {
+        0
+    } else if offset < marker_rel {
+        new_indent.saturating_sub(marker_rel - offset)
+    } else if offset <= old_marker_end {
+        (new_indent + (offset - marker_rel)).min(new_marker_end)
+    } else {
+        offset + new_marker_end - old_marker_end
+    };
+    Some(MarkdownEditPlan::Replace {
+        range,
+        replacement,
+        selection_after: SourceSelection::caret(SourceOffset(range.start.0 + mapped)),
+    })
 }
 
 /// Splits `text` into physical lines, pairing each line's content with its
