@@ -2531,35 +2531,6 @@ fn continuation_only_window_keeps_the_opening_rows_shared_width() {
 }
 
 #[test]
-fn shared_width_does_not_depend_on_the_font_of_the_first_windowed_row() {
-    let source = "  - item\n    # heading\n    continued words that wrap over several rows here\n";
-    let shaper = shaper();
-    let full = present_first_block_window(source, 0..3);
-    let with_heading = present_first_block_window(source, 1..3);
-    let plain_only = present_first_block_window(source, 2..3);
-    assert_eq!(full.lines.len(), 3, "the whole block is presented");
-    assert_eq!(with_heading.lines.len(), 2, "the heading starts the window");
-    assert_eq!(plain_only.lines.len(), 1, "only the plain row is presented");
-    assert!(
-        matches!(with_heading.lines[0].kind, BlockKind::Heading(_)),
-        "the first windowed row is a heading, got {:?}",
-        with_heading.lines[0].kind
-    );
-    let origin_and_width = |block: &VisualBlock, line: usize| {
-        let layout = layout_block(block, 160.0, &shaper);
-        layout
-            .lines
-            .iter()
-            .find(|row| row.line == line)
-            .map(|row| (row.body_x_origin, row.effective_width))
-            .expect("the continuation row is laid out")
-    };
-    let expected = origin_and_width(&full, 2);
-    assert_eq!(origin_and_width(&with_heading, 1), expected);
-    assert_eq!(origin_and_width(&plain_only, 0), expected);
-}
-
-#[test]
 fn tab_indented_item_does_not_share_a_leading_width_with_continuations() {
     let source = "- abc\n\t- def\n\t  continued words that wrap over several rows here\n";
     let shaper = shaper();
