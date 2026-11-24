@@ -146,6 +146,16 @@ impl PrefixCursor {
         if self.pending_spaces != 0 {
             return None;
         }
+        self.list_item_from_marker(line, start_column)
+    }
+
+    /// Parses the marker and padding of a list item whose cursor already sits
+    /// on the marker; `start_column` is the column the item's prefix began at.
+    fn list_item_from_marker(
+        &mut self,
+        line: &[u8],
+        start_column: usize,
+    ) -> Option<ListItemPrefix> {
         let marker = self.byte;
         match line.get(self.byte) {
             Some(b'-' | b'+' | b'*') => self.byte += 1,
@@ -203,6 +213,25 @@ struct ListItemPrefix {
 pub(crate) fn list_item_content_column(line: &str) -> Option<usize> {
     PrefixCursor::default()
         .list_item(line.as_bytes())
+        .map(|prefix| prefix.width)
+}
+
+/// Like [`list_item_content_column`] for a line whose marker starts at byte
+/// `marker`. The leading whitespace is measured with absolute tab stops, so
+/// indents of four or more columns (which the plain scan rejects) still work.
+pub(crate) fn list_item_content_column_at(line: &str, marker: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut cursor = PrefixCursor::default();
+    for byte in bytes.get(..marker)? {
+        match byte {
+            b' ' => cursor.column += 1,
+            b'\t' => cursor.column += 4 - cursor.column % 4,
+            _ => return None,
+        }
+    }
+    cursor.byte = marker;
+    cursor
+        .list_item_from_marker(bytes, 0)
         .map(|prefix| prefix.width)
 }
 

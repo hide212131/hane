@@ -2646,6 +2646,13 @@ mod tests {
             ("1. A\n2. [ ] B", 13, indent, "1. A\n   1. [ ] B", 16),
             ("9. A\n10. [X] B", 11, indent, "9. A\n   1. [X] B", 13),
             ("9. A\n10. B", 6, indent, "9. A\n   1. B", 9),
+            // caret at an unindented marker start follows the marker
+            ("1. A\n2. B", 5, indent, "1. A\n   1. B", 8),
+            // caret right after the old number lands right after the new number
+            ("9. A\n   1. B", 9, outdent, "9. A\n10. B", 7),
+            // indents of four or more columns still renumber
+            ("10. A\n11. B", 11, indent, "10. A\n    1. B", 14),
+            ("1. A\n    1. B", 13, outdent, "1. A\n2. B", 9),
         ];
         for (text, caret, intent, expected, at) in cases {
             assert_eq!(
@@ -2952,8 +2959,8 @@ fn transform_ordered_subtree(
     let new_number = number.to_string();
     let new_first = format!("{}{new_number}{rest}", " ".repeat(new_indent));
 
-    let old_width = crate::markers::list_item_content_column(first)?;
-    let new_width = crate::markers::list_item_content_column(&new_first)?;
+    let old_width = crate::markers::list_item_content_column_at(first, marker_rel)?;
+    let new_width = crate::markers::list_item_content_column_at(&new_first, new_indent)?;
     let shift = new_width as isize - old_width as isize;
 
     let mut replacement = String::with_capacity(original.len() + new_indent + 8);
@@ -2977,11 +2984,13 @@ fn transform_ordered_subtree(
     let offset = caret.0.saturating_sub(range.start.0);
     let new_marker_end = new_indent + new_number.len();
     let old_marker_end = marker_rel + digits;
-    let mapped = if offset == 0 {
+    let mapped = if offset == 0 && marker_rel > 0 {
         0
     } else if offset < marker_rel {
         new_indent.saturating_sub(marker_rel - offset)
-    } else if offset <= old_marker_end {
+    } else if offset == old_marker_end {
+        new_marker_end
+    } else if offset < old_marker_end {
         (new_indent + (offset - marker_rel)).min(new_marker_end)
     } else {
         offset + new_marker_end - old_marker_end
