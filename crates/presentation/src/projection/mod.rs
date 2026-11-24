@@ -1089,6 +1089,7 @@ fn present_markdown_from_parse(
             shared.projection,
             range,
             markers_on_line,
+            source,
             &line.visual_text,
             &line.source_map,
             disclosure,
@@ -1419,6 +1420,7 @@ fn present_markdown_from_parse(
         shared.projection,
         range,
         markers_on_line,
+        source,
         &visual,
         &source_map,
         disclosure,
@@ -2115,6 +2117,7 @@ fn list_row_metadata(
     projection: &ProjectionIndex,
     range: SourceRange,
     markers_on_line: &[ProjectedMarker],
+    source: &str,
     visual: &str,
     source_map: &SourceMap,
     disclosure: Option<SourceRange>,
@@ -2247,12 +2250,34 @@ fn list_row_metadata(
     } else {
         item_projection?.owner.clone()
     };
+    let leading_structural_space_count = marker.as_ref().and_then(|marker| {
+        let marker_start = marker.source_range.start.0;
+        let relative = marker_start.checked_sub(range.start.0)?;
+        let leading = source.get(..relative)?;
+        if !leading.bytes().all(|byte| byte == b' ') {
+            return None;
+        }
+        let mut prefixes = structural_prefixes
+            .iter()
+            .map(|prefix| prefix.source_range)
+            .collect::<Vec<_>>();
+        prefixes.sort_by_key(|prefix| (prefix.start, prefix.end));
+        let mut cursor = range.start.0;
+        for prefix in prefixes {
+            if prefix.start.0 > cursor {
+                break;
+            }
+            cursor = cursor.max(prefix.end.0);
+        }
+        (cursor >= marker_start).then_some(relative)
+    });
     Some(ListRowMetadata {
         owner,
         role,
         marker,
         structural_prefixes,
         body_visual_start,
+        leading_structural_space_count,
     })
 }
 

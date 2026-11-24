@@ -348,6 +348,12 @@ pub struct ListRowMetadata {
     /// presentation. Phase 2 may replace this source-derived visual padding
     /// with absolute layout geometry while retaining the same semantic owner.
     pub body_visual_start: VisualOffset,
+    /// Number of ASCII spaces from the row start to the item's own marker,
+    /// when structural prefixes cover all of them. Independent of disclosure
+    /// (hidden spaces count), so layout can keep a nested marker still while a
+    /// parent's indentation is disclosed. `None` for tabs, other characters
+    /// or rows without an opening marker.
+    pub leading_structural_space_count: Option<usize>,
 }
 
 /// Formal quote context for one physical line. The depth comes from the

@@ -18,7 +18,7 @@
 //! verifiable without a window.
 
 use crate::{
-    BlockKind, LineContext, ListId, ListTaskMetadata, VisualBlock, VisualLine, VisualOffset,
+    BlockKind, LineContext, ListId, ListMarkerKind, ListTaskMetadata, VisualBlock, VisualLine, VisualOffset,
     VisualRange,
 };
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
@@ -1681,7 +1681,22 @@ fn line_geometry(
                 .first()
                 .is_some_and(|quote| quote.start < marker.visual_range.start)
         });
-    let marker_x = list_depth_x(list.owner.depth)
+    // A plain nested bullet whose own marker stays synthesized keeps its marker
+    // and body still when a parent's indentation is disclosed: the disclosed
+    // spaces are painted inside the reserved indent, before the marker.
+    let stable_leading_space_width = list
+        .leading_structural_space_count
+        .filter(|count| *count > 0)
+        .filter(|_| {
+            line.quote.is_none()
+                && list.owner.marker_kind == ListMarkerKind::Bullet
+                && list
+                    .marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.synthesized && marker.task.is_none())
+        })
+        .map(|count| shaper.width_for_text(line, &" ".repeat(count)));
+    let marker_x = list_depth_x(list.owner.depth).max(stable_leading_space_width.unwrap_or(0.0))
         + if quote_prefix_after_outer {
             if quote_prefix_before_list {
                 quote_x + quote_prefix_width
@@ -1773,12 +1788,18 @@ fn line_geometry(
             + marker_body_gap
     } else {
         marker_x
-            + expanded_prefix_width
+            + if stable_leading_space_width.is_some() {
+                0.0
+            } else {
+                expanded_prefix_width
+            }
             + marker_column_width
             + if quote_after_list { quote_x } else { 0.0 }
     };
     let text_x_origin = if quote_prefix_after_outer {
         0.0
+    } else if stable_leading_space_width.is_some() {
+        marker_x - expanded_prefix_width
     } else if opening_marker {
         marker_x
     } else {

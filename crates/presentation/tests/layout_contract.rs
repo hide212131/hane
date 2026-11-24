@@ -16,7 +16,7 @@ use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuf
 use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
-    BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
+    BlockKind, BlockLayout, BlockLine, BlockWindow, LayoutLine, LineShaper, LineWrap, VerticalMove,
     VisualBlock, VisualOffset, block_heights_with_disclosure, block_line_span, layout_block,
     present_block_with_table_projection, table_delimiter_is_collapsed, trailing_blank_lines,
 };
@@ -2339,6 +2339,142 @@ fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
         .point_for_source(&block, inner, &shaper())
         .expect("inner has a point");
     assert_eq!(point.x, 32.0);
+}
+
+/// Presents `source` with the caret at `cursor` and returns the block with the
+/// index of its depth-2 list row.
+fn nested_child_block(source: &str, cursor: Option<usize>) -> (VisualBlock, usize) {
+    let block = present(source, cursor)
+        .into_iter()
+        .find(|block| {
+            block
+                .lines
+                .iter()
+                .any(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        })
+        .expect("the nested list block is presented");
+    let child = block
+        .lines
+        .iter()
+        .position(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        .expect("the nested row is presented");
+    (block, child)
+}
+
+/// Left edge of the marker as painted: the row's text origin plus the width of
+/// whatever is displayed before the marker (disclosed indentation).
+fn painted_marker_left(block: &VisualBlock, row: &LayoutLine, advance: f32) -> f32 {
+    let line = &block.lines[row.line];
+    let marker = line
+        .list
+        .as_ref()
+        .and_then(|list| list.marker.as_ref())
+        .expect("the row has a marker");
+    let before = &line.visual_text[..marker.visual_range.start.0];
+    row.text_x_origin + before.chars().count() as f32 * advance
+}
+
+#[test]
+fn inactive_nested_bullet_geometry_is_stable_when_parent_is_disclosed() {
+    let source = "- abc\n  - def\n";
+    let def = source.find("def").expect("def in source");
+    for advance in [8.0, 10.0] {
+        let shaper = FixedAdvanceShaper::new(advance);
+        let mut observed = Vec::new();
+        for cursor in [None, Some(5)] {
+            let (block, child) = nested_child_block(source, cursor);
+            let marker = block.lines[child]
+                .list
+                .as_ref()
+                .and_then(|list| list.marker.as_ref())
+                .expect("the child has a marker");
+            assert!(marker.synthesized, "{advance}: {cursor:?}");
+
+            let layout = layout_block(&block, 160.0, &shaper);
+            let row = layout
+                .lines
+                .iter()
+                .find(|row| row.line == child)
+                .expect("the child row is laid out");
+            let left = painted_marker_left(&block, row, advance);
+
+            let point = layout
+                .point_for_source(&block, SourceOffset(def), &shaper)
+                .expect("def has a point");
+            assert_eq!(point.x, row.body_x_origin, "{advance}: {cursor:?}");
+            assert_eq!(
+                layout.source_at_x(&block, point.row, point.x, &shaper),
+                Some(SourceOffset(def)),
+                "{advance}: {cursor:?}"
+            );
+            observed.push((row.body_x_origin, row.marker_x_origin, left));
+        }
+        assert_eq!(observed[0], observed[1], "advance {advance}");
+        if advance == 8.0 {
+            assert_eq!(observed[0], (32.0, Some(16.0), 16.0));
+        }
+    }
+}
+
+#[test]
+fn inactive_nested_bullet_wrap_is_stable_when_parent_is_disclosed() {
+    let source = "- abc\n  - def ghi jkl mno pqr stu vwx yz\n";
+    let shaper = shaper();
+    let mut observed = Vec::new();
+    for cursor in [None, Some(5)] {
+        let (block, child) = nested_child_block(source, cursor);
+        let layout = layout_block(&block, 120.0, &shaper);
+        let rows = layout
+            .lines
+            .iter()
+            .filter(|row| row.line == child)
+            .collect::<Vec<_>>();
+        assert!(rows.len() > 1, "the child must wrap: {cursor:?}");
+        for row in &rows[1..] {
+            assert_eq!(row.text_x_origin, row.body_x_origin, "{cursor:?}");
+        }
+        observed.push(
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.source_range,
+                        row.body_x_origin,
+                        row.effective_width,
+                        painted_marker_left(&block, row, 8.0),
+                    )
+                })
+                .take(1)
+                .chain(
+                    rows[1..]
+                        .iter()
+                        .map(|row| (row.source_range, row.body_x_origin, row.effective_width, 0.0)),
+                )
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(observed[0], observed[1]);
+}
+
+#[test]
+fn nested_bullet_keeps_raw_geometry_when_its_own_marker_is_disclosed() {
+    let source = "- abc\n  - def\n";
+    let def = source.find("def").expect("def in source");
+    let (block, child) = nested_child_block(source, Some(def));
+    let marker = block.lines[child]
+        .list
+        .as_ref()
+        .and_then(|list| list.marker.as_ref())
+        .expect("the child has a marker");
+    assert!(!marker.synthesized);
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == child)
+        .expect("the child row is laid out");
+    assert_eq!(row.marker_body_gap, 0.0);
+    assert_eq!(row.body_x_origin, 48.0);
 }
 
 #[test]
