@@ -2417,6 +2417,38 @@ fn inactive_nested_bullet_geometry_is_stable_when_parent_is_disclosed() {
 }
 
 #[test]
+fn indented_bullet_continuation_shares_the_opening_rows_body_origin() {
+    let source = "  - item\n    continued\n";
+    let shaper = shaper();
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    assert_eq!(block.lines.len(), 2);
+    let layout = layout_block(&block, 160.0, &shaper);
+    let rows = |line: usize| {
+        layout
+            .lines
+            .iter()
+            .filter(|row| row.line == line)
+            .collect::<Vec<_>>()
+    };
+    let opening = rows(0);
+    let continuation = rows(1);
+    assert_eq!(opening[0].body_x_origin, 32.0);
+    assert_eq!(
+        continuation[0].body_x_origin,
+        opening[0].body_x_origin,
+        "continuation body origin"
+    );
+    assert_eq!(
+        continuation[0].effective_width,
+        opening[0].effective_width,
+        "continuation wrap width"
+    );
+}
+
+#[test]
 fn inactive_nested_bullet_wrap_is_stable_when_parent_is_disclosed() {
     let source = "- abc\n  - def ghi jkl mno pqr stu vwx yz\n";
     let shaper = shaper();
