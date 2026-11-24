@@ -1089,10 +1089,12 @@ fn present_markdown_from_parse(
             shared.projection,
             range,
             markers_on_line,
+            source,
             &line.visual_text,
             &line.source_map,
             disclosure,
             shared.list_projection,
+            shared.source,
         );
         return line;
     }
@@ -1419,10 +1421,12 @@ fn present_markdown_from_parse(
         shared.projection,
         range,
         markers_on_line,
+        source,
         &visual,
         &source_map,
         disclosure,
         shared.list_projection,
+        shared.source,
     );
     let has_hidden_fence = kind == BlockKind::CodeBlock
         && markers_on_line
@@ -2115,10 +2119,12 @@ fn list_row_metadata(
     projection: &ProjectionIndex,
     range: SourceRange,
     markers_on_line: &[ProjectedMarker],
+    source: &str,
     visual: &str,
     source_map: &SourceMap,
     disclosure: Option<SourceRange>,
     list_projection: Option<&ListProjection>,
+    parse_source: &str,
 ) -> Option<ListRowMetadata> {
     let item = projection
         .list_items
@@ -2247,13 +2253,138 @@ fn list_row_metadata(
     } else {
         item_projection?.owner.clone()
     };
+    let leading_structural_space_count = marker.as_ref().and_then(|marker| {
+        let marker_start = marker.source_range.start.0;
+        let relative = marker_start.checked_sub(range.start.0)?;
+        let leading = source.get(..relative)?;
+        if !leading.bytes().all(|byte| byte == b' ') {
+            return None;
+        }
+        let mut prefixes = structural_prefixes
+            .iter()
+            .map(|prefix| prefix.source_range)
+            .collect::<Vec<_>>();
+        prefixes.sort_by_key(|prefix| (prefix.start, prefix.end));
+        let mut cursor = range.start.0;
+        for prefix in prefixes {
+            if prefix.start.0 > cursor {
+                break;
+            }
+            cursor = cursor.max(prefix.end.0);
+        }
+        (cursor >= marker_start).then_some(relative)
+    });
     Some(ListRowMetadata {
         owner,
         role,
         marker,
         structural_prefixes,
         body_visual_start,
+        leading_structural_space_count,
+        item_leading_space_count: item_leading_space_count(
+            parsed,
+            parse_source,
+            projection,
+            item,
+            projected,
+            disclosure,
+            list_projection,
+        ),
     })
+}
+
+/// Leading-space count of an item's opening row when it is a plain, undisclosed,
+/// task-less item whose structural prefixes cover every leading space. Read
+/// from the whole parse rather than the presented rows, so every row of the
+/// item reports the same value even when the opening row is outside the window.
+fn item_leading_space_count(
+    parsed: &MarkdownParse,
+    parse_source: &str,
+    projection: &ProjectionIndex,
+    item: Option<NodeId>,
+    projected: Option<&ListProjectionItem>,
+    disclosure: Option<SourceRange>,
+    list_projection: Option<&ListProjection>,
+) -> Option<usize> {
+    let (marker_start, mut cursor) = if let Some(projected) = projected {
+        if projected.task.is_some()
+            || disclosure.zip(list_projection).is_some_and(|(disclosure, lp)| {
+                projected_list_item_range_touches(lp, projected, disclosure)
+            })
+        {
+            return None;
+        }
+        let marker_start = projected.marker_range.start.0;
+        (marker_start, marker_start)
+    } else {
+        let item = item?;
+        let node = parsed.tree.node(item)?;
+        if projection.list_item_tasks.get(item.0).copied().flatten().is_some()
+            || disclosure.is_some_and(|disclosure| {
+                list_item_range_touches(&parsed.tree, item, node, disclosure)
+            })
+        {
+            return None;
+        }
+        let first = projection
+            .markers
+            .partition_point(|marker| marker.range.start < node.source_range.start);
+        let marker = projection.markers[first..]
+            .iter()
+            .take_while(|marker| marker.range.start < node.source_range.end)
+            .find(|marker| marker.list_owner == Some(item))?;
+        (marker.range.start.0, marker.range.start.0)
+    };
+    // The document-wide projection can describe an opening row that lies
+    // outside `parse_source`, so its bytes are not readable there. A tab
+    // consumes fewer bytes than columns, so a prefix whose columns differ from
+    // its byte length is the tab signal on that path.
+    let mut columns_match_bytes = true;
+    while cursor > 0 {
+        let previous = if projected.is_some() {
+            list_projection.and_then(|lp| {
+                lp.prefixes_in(SourceRange::new(cursor - 1, cursor))
+                    .find(|prefix| prefix.source_range.end.0 == cursor)
+                    .map(|prefix| {
+                        if prefix.columns != prefix.source_range.end.0 - prefix.source_range.start.0
+                        {
+                            columns_match_bytes = false;
+                        }
+                        prefix.source_range.start.0
+                    })
+            })
+        } else {
+            let index = projection
+                .markers
+                .partition_point(|marker| marker.range.start.0 < cursor);
+            index
+                .checked_sub(1)
+                .map(|index| &projection.markers[index])
+                .filter(|marker| {
+                    marker.range.end.0 == cursor
+                        && (marker.list_prefix.is_some() || marker.global_list_prefix.is_some())
+                })
+                .map(|marker| marker.range.start.0)
+        };
+        match previous {
+            Some(start) if start < cursor => cursor = start,
+            _ => break,
+        }
+    }
+    let count = marker_start - cursor;
+    if projected.is_some() {
+        if !columns_match_bytes {
+            return None;
+        }
+    } else {
+        let base = parsed.source_range.start.0;
+        let prefix =
+            parse_source.get(cursor.checked_sub(base)?..marker_start.checked_sub(base)?)?;
+        if !prefix.bytes().all(|byte| byte == b' ') {
+            return None;
+        }
+    }
+    (count > 0).then_some(count)
 }
 
 /// One joinable block's whole-span parse, kept independent of which lines a

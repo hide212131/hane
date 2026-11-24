@@ -16,7 +16,7 @@ use hane_document::{Bias, LineId, RopeBuffer, SourceOffset, SourceRange, TextBuf
 use hane_markdown::BlockIndex;
 use hane_presentation::testing::FixedAdvanceShaper;
 use hane_presentation::{
-    BlockKind, BlockLayout, BlockLine, BlockWindow, LineShaper, LineWrap, VerticalMove,
+    BlockKind, BlockLayout, BlockLine, BlockWindow, LayoutLine, LineShaper, LineWrap, VerticalMove,
     VisualBlock, VisualOffset, block_heights_with_disclosure, block_line_span, layout_block,
     present_block_with_table_projection, table_delimiter_is_collapsed, trailing_blank_lines,
 };
@@ -2339,6 +2339,308 @@ fn nested_list_rows_use_semantic_depth_after_opening_prefixes_are_hidden() {
         .point_for_source(&block, inner, &shaper())
         .expect("inner has a point");
     assert_eq!(point.x, 32.0);
+}
+
+/// Presents `source` with the caret at `cursor` and returns the block with the
+/// index of its depth-2 list row.
+fn nested_child_block(source: &str, cursor: Option<usize>) -> (VisualBlock, usize) {
+    let block = present(source, cursor)
+        .into_iter()
+        .find(|block| {
+            block
+                .lines
+                .iter()
+                .any(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        })
+        .expect("the nested list block is presented");
+    let child = block
+        .lines
+        .iter()
+        .position(|line| line.list.as_ref().is_some_and(|list| list.owner.depth == 2))
+        .expect("the nested row is presented");
+    (block, child)
+}
+
+/// Left edge of the marker as painted: the row's text origin plus the width of
+/// whatever is displayed before the marker (disclosed indentation).
+fn painted_marker_left(block: &VisualBlock, row: &LayoutLine, advance: f32) -> f32 {
+    let line = &block.lines[row.line];
+    let marker = line
+        .list
+        .as_ref()
+        .and_then(|list| list.marker.as_ref())
+        .expect("the row has a marker");
+    let before = &line.visual_text[..marker.visual_range.start.0];
+    row.text_x_origin + before.chars().count() as f32 * advance
+}
+
+#[test]
+fn inactive_nested_bullet_geometry_is_stable_when_parent_is_disclosed() {
+    let source = "- abc\n  - def\n";
+    let def = source.find("def").expect("def in source");
+    for advance in [8.0, 10.0] {
+        let shaper = FixedAdvanceShaper::new(advance);
+        let mut observed = Vec::new();
+        for cursor in [None, Some(5)] {
+            let (block, child) = nested_child_block(source, cursor);
+            let marker = block.lines[child]
+                .list
+                .as_ref()
+                .and_then(|list| list.marker.as_ref())
+                .expect("the child has a marker");
+            assert!(marker.synthesized, "{advance}: {cursor:?}");
+
+            let layout = layout_block(&block, 160.0, &shaper);
+            let row = layout
+                .lines
+                .iter()
+                .find(|row| row.line == child)
+                .expect("the child row is laid out");
+            let left = painted_marker_left(&block, row, advance);
+
+            let point = layout
+                .point_for_source(&block, SourceOffset(def), &shaper)
+                .expect("def has a point");
+            assert_eq!(point.x, row.body_x_origin, "{advance}: {cursor:?}");
+            assert_eq!(
+                layout.source_at_x(&block, point.row, point.x, &shaper),
+                Some(SourceOffset(def)),
+                "{advance}: {cursor:?}"
+            );
+            observed.push((row.body_x_origin, row.marker_x_origin, left));
+        }
+        assert_eq!(observed[0], observed[1], "advance {advance}");
+        if advance == 8.0 {
+            assert_eq!(observed[0], (32.0, Some(16.0), 16.0));
+        }
+    }
+}
+
+#[test]
+fn indented_bullet_continuation_shares_the_opening_rows_body_origin() {
+    let source = "  - item\n    continued\n";
+    let shaper = shaper();
+    let block = present(source, None)
+        .into_iter()
+        .find(|block| block.lines.iter().any(|line| line.list.is_some()))
+        .expect("the list block is presented");
+    assert!(
+        block.lines.len() >= 2,
+        "the opening and continuation lines are presented"
+    );
+    let layout = layout_block(&block, 160.0, &shaper);
+    let rows = |line: usize| {
+        layout
+            .lines
+            .iter()
+            .filter(|row| row.line == line)
+            .collect::<Vec<_>>()
+    };
+    let opening = rows(0);
+    let continuation = rows(1);
+    assert_eq!(opening[0].body_x_origin, 32.0);
+    assert_eq!(
+        continuation[0].body_x_origin,
+        opening[0].body_x_origin,
+        "continuation body origin"
+    );
+    assert_eq!(
+        continuation[0].effective_width,
+        opening[0].effective_width,
+        "continuation wrap width"
+    );
+}
+
+/// Presents only the `render` lines of the document's first block, the way a
+/// viewport that starts below the block's opening row does.
+fn present_first_block_window(source: &str, render: Range<usize>) -> VisualBlock {
+    let buffer = RopeBuffer::from_text(source);
+    let index = BlockIndex::from_buffer(&buffer);
+    let block = index.blocks().next().expect("first block");
+    let span = block_line_span(&buffer, &block).expect("block spans lines");
+    let ranges = render
+        .clone()
+        .map(|line| buffer.line_range(LineId(line)).expect("line in range"))
+        .collect::<Vec<_>>();
+    let texts = ranges
+        .iter()
+        .map(|range| buffer.text(*range).expect("line text"))
+        .collect::<Vec<_>>();
+    let lines = render
+        .clone()
+        .zip(&ranges)
+        .zip(&texts)
+        .map(|((line, range), text)| BlockLine {
+            line,
+            range: *range,
+            text,
+            disclosure: None,
+        })
+        .collect::<Vec<_>>();
+    present_block_with_table_projection(
+        &block,
+        buffer.revision(),
+        &BlockWindow {
+            trailing_blank_lines: trailing_blank_lines(&buffer, &span),
+            span,
+            lines: &lines,
+            clipped_fence_lines: &[],
+            zero_height_fence_rows_before: 0,
+            zero_height_fence_rows_after: 0,
+            table_delimiter_line: None,
+            render,
+            joined: None,
+            block_disclosure: None,
+        },
+        LINE_HEIGHT,
+        index.list_projection(&block),
+        index.table_projection(&block),
+    )
+}
+
+#[test]
+fn continuation_only_window_keeps_the_opening_rows_shared_width() {
+    let source = "  - item\n    continued words that wrap over several rows here\n";
+    let shaper = shaper();
+    let full = present_first_block_window(source, 0..2);
+    let window = present_first_block_window(source, 1..2);
+    assert_eq!(full.lines.len(), 2, "the whole block is presented");
+    assert_eq!(window.lines.len(), 1, "only the continuation is presented");
+    assert!(
+        window.lines[0]
+            .list
+            .as_ref()
+            .is_some_and(|list| list.marker.is_none()),
+        "the window holds a continuation row"
+    );
+    let full_layout = layout_block(&full, 160.0, &shaper);
+    let window_layout = layout_block(&window, 160.0, &shaper);
+    let full_row = full_layout
+        .lines
+        .iter()
+        .find(|row| row.line == 1)
+        .expect("the continuation row is laid out");
+    let window_row = window_layout
+        .lines
+        .iter()
+        .find(|row| row.line == 0)
+        .expect("the windowed continuation row is laid out");
+    assert_eq!(full_row.body_x_origin, 32.0);
+    assert_eq!(window_row.body_x_origin, full_row.body_x_origin);
+    assert_eq!(window_row.effective_width, full_row.effective_width);
+}
+
+#[test]
+fn tab_indented_item_does_not_share_a_leading_width_with_continuations() {
+    let source = "- abc\n\t- def\n\t  continued words that wrap over several rows here\n";
+    let shaper = shaper();
+    let full = present_first_block_window(source, 0..3);
+    let window = present_first_block_window(source, 2..3);
+    assert_eq!(window.lines.len(), 1, "only the continuation is presented");
+    let list = window.lines[0]
+        .list
+        .as_ref()
+        .expect("the window holds a list row");
+    assert!(list.marker.is_none(), "the window holds a continuation row");
+    assert_eq!(
+        list.item_leading_space_count, None,
+        "a tab in the structural prefix keeps the existing path"
+    );
+    let row = |block: &VisualBlock, line: usize| {
+        let layout = layout_block(block, 160.0, &shaper);
+        layout
+            .lines
+            .iter()
+            .find(|row| row.line == line)
+            .map(|row| (row.body_x_origin, row.effective_width))
+            .expect("the continuation row is laid out")
+    };
+    assert_eq!(row(&window, 0), row(&full, 2));
+}
+
+#[test]
+fn indented_bullet_continuation_keeps_shared_origin_when_parent_is_disclosed() {
+    let source = "- abc\n     - def\n       cont\n";
+    let shaper = shaper();
+    let body_origins = |cursor: Option<usize>| {
+        let (block, child) = nested_child_block(source, cursor);
+        let layout = layout_block(&block, 160.0, &shaper);
+        let origin = |line: usize| {
+            layout
+                .lines
+                .iter()
+                .find(|row| row.line == line)
+                .map(|row| row.body_x_origin)
+                .expect("the row is laid out")
+        };
+        (origin(child), origin(child + 1))
+    };
+    let (def_hidden, cont_hidden) = body_origins(None);
+    assert_eq!(def_hidden, cont_hidden, "hidden rows share a body origin");
+    let (def_disclosed, cont_disclosed) = body_origins(Some(5));
+    assert_eq!(def_disclosed, def_hidden, "opening row stays still");
+    assert_eq!(cont_disclosed, cont_hidden, "continuation row stays still");
+}
+
+#[test]
+fn inactive_nested_bullet_wrap_is_stable_when_parent_is_disclosed() {
+    let source = "- abc\n  - def ghi jkl mno pqr stu vwx yz\n";
+    let shaper = shaper();
+    let mut observed = Vec::new();
+    for cursor in [None, Some(5)] {
+        let (block, child) = nested_child_block(source, cursor);
+        let layout = layout_block(&block, 120.0, &shaper);
+        let rows = layout
+            .lines
+            .iter()
+            .filter(|row| row.line == child)
+            .collect::<Vec<_>>();
+        assert!(rows.len() > 1, "the child must wrap: {cursor:?}");
+        for row in &rows[1..] {
+            assert_eq!(row.text_x_origin, row.body_x_origin, "{cursor:?}");
+        }
+        observed.push(
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.source_range,
+                        row.body_x_origin,
+                        row.effective_width,
+                        painted_marker_left(&block, row, 8.0),
+                    )
+                })
+                .take(1)
+                .chain(
+                    rows[1..]
+                        .iter()
+                        .map(|row| (row.source_range, row.body_x_origin, row.effective_width, 0.0)),
+                )
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(observed[0], observed[1]);
+}
+
+#[test]
+fn nested_bullet_keeps_raw_geometry_when_its_own_marker_is_disclosed() {
+    let source = "- abc\n  - def\n";
+    let def = source.find("def").expect("def in source");
+    let (block, child) = nested_child_block(source, Some(def));
+    let marker = block.lines[child]
+        .list
+        .as_ref()
+        .and_then(|list| list.marker.as_ref())
+        .expect("the child has a marker");
+    assert!(!marker.synthesized);
+
+    let layout = layout_block(&block, 160.0, &shaper());
+    let row = layout
+        .lines
+        .iter()
+        .find(|row| row.line == child)
+        .expect("the child row is laid out");
+    assert_eq!(row.marker_body_gap, 0.0);
+    assert_eq!(row.body_x_origin, 48.0);
 }
 
 #[test]

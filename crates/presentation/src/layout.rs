@@ -18,7 +18,7 @@
 //! verifiable without a window.
 
 use crate::{
-    BlockKind, LineContext, ListId, ListTaskMetadata, VisualBlock, VisualLine, VisualOffset,
+    BlockKind, LineContext, ListId, ListItemId, ListMarkerKind, ListTaskMetadata, VisualBlock, VisualLine, VisualOffset,
     VisualRange,
 };
 use hane_document::{Bias, Revision, RevisionDelta, SourceOffset, SourceRange};
@@ -985,12 +985,13 @@ pub fn layout_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) ->
         return layout_table_block(block, width, shaper);
     }
     let marker_widths = list_marker_widths(block, shaper);
+    let leading_widths = item_leading_space_widths(block, shaper);
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
     for (index, line) in block.lines.iter().enumerate() {
         let block_start = line_visual_start(block, index);
         let height = line.height();
-        let line_geometry = line_geometry(line, width, shaper, &marker_widths);
+        let line_geometry = line_geometry(line, width, shaper, &marker_widths, &leading_widths);
         let boundaries = if width <= 0.0 {
             vec![0, line.visual_text.len()]
         } else {
@@ -1098,6 +1099,7 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
         column_offsets.push(column_offsets.last().copied().unwrap_or(0.0) + *column_width);
     }
     let marker_widths = list_marker_widths(block, shaper);
+    let leading_widths = item_leading_space_widths(block, shaper);
     let mut lines = Vec::with_capacity(block.lines.len());
     let mut y = 0.0;
     for (index, line) in block.lines.iter().enumerate() {
@@ -1146,7 +1148,7 @@ fn layout_table_block(block: &VisualBlock, width: f32, shaper: &dyn LineShaper) 
             }
             let block_start = line_visual_start(block, index);
             let height = line.height();
-            let line_geometry = line_geometry(line, width, shaper, &marker_widths);
+            let line_geometry = line_geometry(line, width, shaper, &marker_widths, &leading_widths);
             let boundaries = if width <= 0.0 {
                 vec![0, line.visual_text.len()]
             } else {
@@ -1608,11 +1610,90 @@ fn list_depth_x(depth: usize) -> f32 {
     depth.saturating_sub(1) as f32 * LIST_DEPTH_INDENT
 }
 
+/// Formatted width of the leading spaces of a plain nested bullet whose own
+/// marker stays synthesized. Disclosure-independent, so every row of the item
+/// can reserve the same width.
+fn stable_leading_space_width(
+    line: &VisualLine,
+    list: &crate::ListRowMetadata,
+    shaper: &dyn LineShaper,
+) -> Option<f32> {
+    list.leading_structural_space_count
+        .filter(|count| *count > 0)
+        .filter(|_| {
+            line.quote.is_none()
+                && list.owner.marker_kind == ListMarkerKind::Bullet
+                && list
+                    .marker
+                    .as_ref()
+                    .is_some_and(|marker| marker.synthesized && marker.task.is_none())
+        })
+        .map(|count| shaper.width_for_text(line, &" ".repeat(count)))
+}
+
+/// Leading-space width reserved by each item's opening row, shared with the
+/// item's continuation rows so their body origin lines up with the opening row.
+///
+/// A window may omit the opening row, so a continuation row falls back to the
+/// opening row's count carried in its own item metadata. An opening row that is
+/// present always decides for its item.
+fn item_leading_space_widths(
+    block: &VisualBlock,
+    shaper: &dyn LineShaper,
+) -> HashMap<ListItemId, f32> {
+    let mut widths: HashMap<ListItemId, Option<f32>> = HashMap::new();
+    for line in &block.lines {
+        let Some(list) = &line.list else {
+            continue;
+        };
+        if list.marker.is_some() {
+            widths.insert(
+                list.owner.item_id,
+                stable_leading_space_width(line, list, shaper),
+            );
+        } else {
+            widths
+                .entry(list.owner.item_id)
+                .or_insert_with(|| carried_leading_space_width(line, list, shaper));
+        }
+    }
+    widths
+        .into_iter()
+        .filter_map(|(item, width)| Some((item, width?)))
+        .collect()
+}
+
+/// Width of the opening row's leading spaces as carried by a row of the same
+/// item, for rows whose opening row is not part of the block.
+fn carried_leading_space_width(
+    line: &VisualLine,
+    list: &crate::ListRowMetadata,
+    shaper: &dyn LineShaper,
+) -> Option<f32> {
+    list.item_leading_space_count
+        .filter(|count| *count > 0)
+        .filter(|_| line.quote.is_none() && list.owner.marker_kind == ListMarkerKind::Bullet)
+        .map(|count| {
+            let spaces = " ".repeat(count);
+            // The opening row measures its spaces in the list item's own font.
+            // Measure the same way here, so a heading or other differently
+            // scaled continuation row does not widen the item's shared width.
+            if line.kind == BlockKind::ListItem {
+                shaper.width_for_text(line, &spaces)
+            } else {
+                let mut opening = line.clone();
+                opening.kind = BlockKind::ListItem;
+                shaper.width_for_text(&opening, &spaces)
+            }
+        })
+}
+
 fn line_geometry(
     line: &VisualLine,
     width: f32,
     shaper: &dyn LineShaper,
     marker_widths: &HashMap<ListId, f32>,
+    leading_widths: &HashMap<ListItemId, f32>,
 ) -> LineGeometry {
     let Some(list) = &line.list else {
         let quote_x = line.quote.map_or(0.0, |quote| {
@@ -1681,7 +1762,11 @@ fn line_geometry(
                 .first()
                 .is_some_and(|quote| quote.start < marker.visual_range.start)
         });
-    let marker_x = list_depth_x(list.owner.depth)
+    // A plain nested bullet whose own marker stays synthesized keeps its marker
+    // and body still when a parent's indentation is disclosed: the disclosed
+    // spaces are painted inside the reserved indent, before the marker.
+    let stable_leading_space_width = stable_leading_space_width(line, list, shaper);
+    let marker_x = list_depth_x(list.owner.depth).max(stable_leading_space_width.unwrap_or(0.0))
         + if quote_prefix_after_outer {
             if quote_prefix_before_list {
                 quote_x + quote_prefix_width
@@ -1737,6 +1822,15 @@ fn line_geometry(
             )
         })
         .sum::<f32>();
+    // A hidden continuation row shares the width its item's opening row
+    // reserved for leading spaces, so both rows keep the same body origin.
+    // When the continuation's own spaces are disclosed they are painted inside
+    // that reserved width, so they must not be added to the body origin again.
+    let shared_leading_width = match (list.marker.as_ref(), line.quote) {
+        (None, None) => leading_widths.get(&list.owner.item_id).copied(),
+        _ => None,
+    };
+    let marker_x = shared_leading_width.map_or(marker_x, |shared| marker_x.max(shared));
     // A disclosed continuation has no marker of its own. Its expanded
     // structural prefix already paints the indentation that leads to the
     // item's body, so adding the aggregate marker width would reserve that
@@ -1752,7 +1846,10 @@ fn line_geometry(
         .is_some_and(|marker| !marker.synthesized)
     {
         disclosed_marker_width
-    } else if list.marker.is_none() && expanded_prefix_width > 0.0 {
+    } else if list.marker.is_none()
+        && expanded_prefix_width > 0.0
+        && shared_leading_width.is_none()
+    {
         0.0
     } else {
         aggregate_marker_width.max(disclosed_marker_width)
@@ -1773,12 +1870,18 @@ fn line_geometry(
             + marker_body_gap
     } else {
         marker_x
-            + expanded_prefix_width
+            + if stable_leading_space_width.is_some() || shared_leading_width.is_some() {
+                0.0
+            } else {
+                expanded_prefix_width
+            }
             + marker_column_width
             + if quote_after_list { quote_x } else { 0.0 }
     };
     let text_x_origin = if quote_prefix_after_outer {
         0.0
+    } else if stable_leading_space_width.is_some() {
+        marker_x - expanded_prefix_width
     } else if opening_marker {
         marker_x
     } else {
