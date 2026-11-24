@@ -2335,12 +2335,23 @@ fn item_leading_space_count(
             .find(|marker| marker.list_owner == Some(item))?;
         (marker.range.start.0, marker.range.start.0)
     };
+    // The document-wide projection can describe an opening row that lies
+    // outside `parse_source`, so its bytes are not readable there. A tab
+    // consumes fewer bytes than columns, so a prefix whose columns differ from
+    // its byte length is the tab signal on that path.
+    let mut columns_match_bytes = true;
     while cursor > 0 {
         let previous = if projected.is_some() {
             list_projection.and_then(|lp| {
                 lp.prefixes_in(SourceRange::new(cursor - 1, cursor))
                     .find(|prefix| prefix.source_range.end.0 == cursor)
-                    .map(|prefix| prefix.source_range.start.0)
+                    .map(|prefix| {
+                        if prefix.columns != prefix.source_range.end.0 - prefix.source_range.start.0
+                        {
+                            columns_match_bytes = false;
+                        }
+                        prefix.source_range.start.0
+                    })
             })
         } else {
             let index = projection
@@ -2361,10 +2372,17 @@ fn item_leading_space_count(
         }
     }
     let count = marker_start - cursor;
-    let base = parsed.source_range.start.0;
-    let prefix = parse_source.get(cursor.checked_sub(base)?..marker_start.checked_sub(base)?)?;
-    if !prefix.bytes().all(|byte| byte == b' ') {
-        return None;
+    if projected.is_some() {
+        if !columns_match_bytes {
+            return None;
+        }
+    } else {
+        let base = parsed.source_range.start.0;
+        let prefix =
+            parse_source.get(cursor.checked_sub(base)?..marker_start.checked_sub(base)?)?;
+        if !prefix.bytes().all(|byte| byte == b' ') {
+            return None;
+        }
     }
     (count > 0).then_some(count)
 }

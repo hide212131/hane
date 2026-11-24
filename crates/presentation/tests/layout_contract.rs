@@ -2541,8 +2541,9 @@ fn shared_width_does_not_depend_on_the_font_of_the_first_windowed_row() {
     assert_eq!(with_heading.lines.len(), 2, "the heading starts the window");
     assert_eq!(plain_only.lines.len(), 1, "only the plain row is presented");
     assert!(
-        with_heading.lines[0].display().font_scale > 1.0,
-        "the first windowed row is a heading"
+        matches!(with_heading.lines[0].kind, BlockKind::Heading(_)),
+        "the first windowed row is a heading, got {:?}",
+        with_heading.lines[0].kind
     );
     let origin_and_width = |block: &VisualBlock, line: usize| {
         let layout = layout_block(block, 160.0, &shaper);
