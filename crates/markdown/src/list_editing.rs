@@ -2752,7 +2752,7 @@ mod tests {
 
         let (outdented, _) = replacement(
             "10. A\n    1. B\n\n        7.\t  [x] text",
-            15,
+            13,
             ListEditIntent::Outdent,
         );
         assert_eq!(outdented, "10. A\n11. B\n\n     7.    [x] text");
