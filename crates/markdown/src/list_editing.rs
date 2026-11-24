@@ -577,6 +577,16 @@ pub fn plan_list_edit(
                     selection_after: selection,
                 }));
             }
+            if let Some(plan) = plan_ordered_move(
+                &source,
+                projection,
+                item,
+                intent,
+                previous.body_indent_columns,
+                selection,
+            ) {
+                return Ok(ListEditPlanResult::Handled(plan));
+            }
             Ok(ListEditPlanResult::Handled(transform_subtree(
                 &source,
                 item,
@@ -602,6 +612,16 @@ pub fn plan_list_edit(
                 return Ok(ListEditPlanResult::Handled(MarkdownEditPlan::NoOp {
                     selection_after: selection,
                 }));
+            }
+            if let Some(plan) = plan_ordered_move(
+                &source,
+                projection,
+                item,
+                intent,
+                parent.marker_indent_columns,
+                selection,
+            ) {
+                return Ok(ListEditPlanResult::Handled(plan));
             }
             Ok(ListEditPlanResult::Handled(transform_subtree(
                 &source,
@@ -2566,6 +2586,205 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ordered_move_renumbers_only_the_moved_item() {
+        let indent = ListEditIntent::Indent;
+        let outdent = ListEditIntent::Outdent;
+        let cases: &[(&str, usize, ListEditIntent, &str, usize)] = &[
+            // basic: new child list starts at 1 under the existing indent rule
+            (
+                "1. abc\n2. def\n3. ghi",
+                18,
+                indent,
+                "1. abc\n2. def\n   1. ghi",
+                21,
+            ),
+            // existing child list: semantic number, not the source digits
+            (
+                "1. A\n\n    5. N\n    99. M\n8. B",
+                29,
+                indent,
+                "1. A\n\n    5. N\n    99. M\n   7. B",
+                32,
+            ),
+            // outdent continues the parent's numbering, followers untouched
+            ("3. A\n   1. B\n77. C", 12, outdent, "3. A\n4. B\n77. C", 9),
+            // two digits to one, continuation line, UTF-8 body
+            (
+                "9. A\n10. 日本\n    cont",
+                12,
+                indent,
+                "9. A\n   1. 日本\n      cont",
+                14,
+            ),
+            // one digit to two, separate paragraph and descendants kept
+            (
+                "9. A\n   1. B\n\n      P\n\n      7. C\n9. Z",
+                12,
+                outdent,
+                "9. A\n10. B\n\n    P\n\n    7. C\n9. Z",
+                10,
+            ),
+            ("1) A\n2) B", 9, indent, "1) A\n   1) B", 12),
+            // a different delimiter never joins the existing child list
+            (
+                "1. A\n\n    5) N\n2. B",
+                19,
+                indent,
+                "1. A\n\n    5) N\n   1. B",
+                22,
+            ),
+            // descendant numbers are not touched
+            (
+                "9. A\n10. B\n\n    7. C\n    42. D",
+                10,
+                indent,
+                "9. A\n   1. B\n\n      7. C\n      42. D",
+                12,
+            ),
+            ("1. A\r\n2. B\r\n", 10, indent, "1. A\r\n   1. B\r\n", 13),
+            ("1. A\n2. [ ] B", 13, indent, "1. A\n   1. [ ] B", 16),
+            ("9. A\n10. [X] B", 11, indent, "9. A\n   1. [X] B", 13),
+            ("9. A\n10. B", 6, indent, "9. A\n   1. B", 9),
+            // caret at an unindented marker start follows the marker
+            ("1. A\n2. B", 5, indent, "1. A\n   1. B", 8),
+            // caret right after the old number lands right after the new number
+            ("9. A\n   1. B", 9, outdent, "9. A\n10. B", 7),
+            // indents of four or more columns still renumber
+            ("10. A\n11. B", 11, indent, "10. A\n    1. B", 14),
+            ("1. A\n    1. B", 13, outdent, "1. A\n2. B", 9),
+        ];
+        for (text, caret, intent, expected, at) in cases {
+            assert_eq!(
+                replacement(text, *caret, *intent),
+                ((*expected).to_owned(), *at),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordered_move_preserves_structure_and_task_state_after_reparse() {
+        let (text, _) = replacement(
+            "9. A\n10. [X] B\n\n    P\n\n    7. C",
+            11,
+            ListEditIntent::Indent,
+        );
+        let items = reparsed_items(&text);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[1].depth, 2);
+        assert_eq!(items[1].parent_item, Some(0));
+        assert_eq!(items[1].task, Some(true));
+        assert_eq!(items[2].depth, 3);
+        assert_eq!(items[2].parent_item, Some(1));
+        assert_eq!(items[2].list_start, Some(7));
+
+        let (text, _) = replacement(
+            "9. A\n   1. B\n\n      P\n\n      7. C\n9. Z",
+            12,
+            ListEditIntent::Outdent,
+        );
+        let items = reparsed_items(&text);
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[1].depth, 1);
+        assert_eq!(items[1].ordinal, 1);
+        assert_eq!(items[1].list_range, items[0].list_range);
+        assert_eq!(items[2].parent_item, Some(1));
+    }
+
+    #[test]
+    fn ordered_move_keeps_fenced_code_bytes_including_tabs() {
+        let (indented, _) = replacement(
+            "1. A\n2. B\n   ```\n   all:\n   \tcc -o a a.c\n   ```",
+            9,
+            ListEditIntent::Indent,
+        );
+        assert_eq!(
+            indented,
+            "1. A\n   1. B\n      ```\n      all:\n      \tcc -o a a.c\n      ```"
+        );
+
+        let (outdented, _) = replacement(
+            "1. A\n   1. B\n      ```\n      all:\n      \tcc -o a a.c\n      ```",
+            12,
+            ListEditIntent::Outdent,
+        );
+        assert_eq!(
+            outdented,
+            "1. A\n2. B\n   ```\n   all:\n   \tcc -o a a.c\n   ```"
+        );
+    }
+
+    #[test]
+    fn ordered_move_ignores_recovered_items_when_continuing_child_numbers() {
+        assert_eq!(
+            replacement(
+                "1. A\n\n       5. code\n2. B",
+                25,
+                ListEditIntent::Indent
+            ),
+            ("1. A\n\n       5. code\n   1. B".to_owned(), 28)
+        );
+    }
+
+    #[test]
+    fn ordered_move_keeps_content_start_with_tab_after_marker() {
+        let (text, caret) = replacement("9. A\n10.\t  [X] B", 16, ListEditIntent::Indent);
+        assert_eq!(text, "9. A\n   1.   [X] B");
+        assert_eq!(caret, 18);
+        let items = reparsed_items(&text);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].depth, 2);
+        assert_eq!(items[1].task, Some(true));
+    }
+
+    #[test]
+    fn ordered_move_keeps_content_start_of_descendant_with_tab_after_marker() {
+        let (indented, _) = replacement(
+            "10. A\n11. B\n\n    7.\t  [x] text",
+            11,
+            ListEditIntent::Indent,
+        );
+        assert_eq!(indented, "10. A\n    1. B\n\n       7.    [x] text");
+        let items = reparsed_items(&indented);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].task, Some(true));
+
+        let (outdented, _) = replacement(
+            "10. A\n    1. B\n\n        7.\t  [x] text",
+            13,
+            ListEditIntent::Outdent,
+        );
+        assert_eq!(outdented, "10. A\n11. B\n\n     7.    [x] text");
+        let items = reparsed_items(&outdented);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[2].task, Some(true));
+    }
+
+    #[test]
+    fn ordered_move_shifts_tab_structural_indent_by_columns() {
+        let (indented, caret) = replacement("10. A\n11. B\n\n\tP", 11, ListEditIntent::Indent);
+        assert_eq!(indented, "10. A\n    1. B\n\n       P");
+        assert_eq!(caret, 14);
+        let items = reparsed_items(&indented);
+        assert_eq!(items[1].parent_item, Some(0));
+
+        let (outdented, caret) =
+            replacement("10. A\n    1. B\n\n\t\tP", 14, ListEditIntent::Outdent);
+        assert_eq!(outdented, "10. A\n11. B\n\n     P");
+        assert_eq!(caret, 11);
+    }
+
+    #[test]
+    fn ordered_move_of_the_first_item_is_a_noop() {
+        assert_eq!(
+            plan("1. A\n2. B", 4, ListEditIntent::Indent),
+            MarkdownEditPlan::NoOp {
+                selection_after: SourceSelection::caret(SourceOffset(4)),
+            }
+        );
+    }
+
     /// `transform_subtree` must shift every physical line of the subtree by
     /// the same column delta while keeping each line's own terminator bytes
     /// untouched, even when those terminators mix CRLF, bare CR, and LF
@@ -2724,6 +2943,238 @@ fn transform_subtree(
     }
 }
 
+const MAX_ORDERED_NUMBER: u64 = 999_999_999;
+
+/// Plans an Indent / Outdent of a parser-owned ordered item that rewrites only
+/// the moved item's own number. Returns `None` when the item is not an
+/// ordered parser item (or its source shape is unexpected), leaving the plain
+/// whitespace move to the caller.
+fn plan_ordered_move(
+    source: &str,
+    projection: &ListEditProjection,
+    item: &ListEditItem,
+    intent: ListEditIntent,
+    new_indent: usize,
+    selection: SourceSelection,
+) -> Option<MarkdownEditPlan> {
+    let ListMarker::Ordered { delimiter } = item.marker else {
+        return None;
+    };
+    if !item.is_parser_item || item.in_quote {
+        return None;
+    }
+    let number = match intent {
+        ListEditIntent::Indent => {
+            let previous_index = item.previous_sibling?;
+            let previous = projection.items.get(previous_index)?;
+            let last_child = projection
+                .items
+                .iter()
+                .filter(|candidate| {
+                    candidate.is_parser_item
+                        && candidate.parent_item == Some(previous_index)
+                        && candidate.depth == previous.depth + 1
+                })
+                .max_by_key(|candidate| candidate.item_range.start.0);
+            match last_child {
+                Some(child)
+                    if child.marker == ListMarker::Ordered { delimiter }
+                        && source
+                            .get(child.subtree_range.end.0..item.subtree_range.start.0)
+                            .is_some_and(|between| {
+                                between.bytes().all(|byte| byte.is_ascii_whitespace())
+                            }) =>
+                {
+                    child
+                        .list_start
+                        .unwrap_or(1)
+                        .saturating_add(child.ordinal as u64)
+                        .saturating_add(1)
+                }
+                _ => 1,
+            }
+        }
+        ListEditIntent::Outdent => {
+            let parent = projection.items.get(item.parent_item?)?;
+            match parent.marker {
+                ListMarker::Ordered { .. } => parent
+                    .list_start
+                    .unwrap_or(1)
+                    .saturating_add(parent.ordinal as u64)
+                    .saturating_add(1),
+                ListMarker::Unordered { .. } => 1,
+            }
+        }
+        _ => return None,
+    };
+    if number > MAX_ORDERED_NUMBER {
+        return Some(MarkdownEditPlan::NoOp {
+            selection_after: selection,
+        });
+    }
+    transform_ordered_subtree(
+        source,
+        projection,
+        item,
+        new_indent,
+        number,
+        selection.active,
+    )
+}
+
+fn transform_ordered_subtree(
+    source: &str,
+    projection: &ListEditProjection,
+    item: &ListEditItem,
+    new_indent: usize,
+    number: u64,
+    caret: SourceOffset,
+) -> Option<MarkdownEditPlan> {
+    let range = item.subtree_range;
+    let original = source.get(range.as_usize())?;
+    let lines = split_physical_lines(original);
+    let (first, first_ending) = *lines.first()?;
+
+    let marker_rel = item.marker_range.start.0.checked_sub(range.start.0)?;
+    let old_indent = first.get(..marker_rel)?;
+    if !old_indent.bytes().all(|byte| matches!(byte, b' ' | b'\t')) {
+        return None;
+    }
+    let digits = first[marker_rel..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if digits == 0 || !matches!(first.as_bytes().get(marker_rel + digits), Some(b'.' | b')')) {
+        return None;
+    }
+    // `first[marker_rel + digits]` is the ASCII delimiter; the run of blanks
+    // after it is the marker padding.
+    let run_start = marker_rel + digits + 1;
+    let run_len = first[run_start..]
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let run = &first[run_start..run_start + run_len];
+    let tail = &first[run_start + run_len..];
+    // A tab in the padding depends on its absolute column, so it would span a
+    // different width after the marker moves. Replace it with spaces covering
+    // the same columns so the parser's content start (and task syntax) is kept.
+    let new_run = if run.contains('\t') && !tail.is_empty() {
+        let run_columns = prefix_columns(&first[..run_start + run_len])
+            .saturating_sub(prefix_columns(&first[..run_start]));
+        " ".repeat(run_columns)
+    } else {
+        run.to_owned()
+    };
+    let delimiter = &first[marker_rel + digits..run_start];
+    let new_number = number.to_string();
+    let new_first = format!(
+        "{}{new_number}{delimiter}{new_run}{tail}",
+        " ".repeat(new_indent)
+    );
+
+    let old_width = crate::markers::list_item_content_column_at(first, marker_rel)?;
+    let new_width = crate::markers::list_item_content_column_at(&new_first, new_indent)?;
+    let shift = new_width as isize - old_width as isize;
+
+    let offset = caret.0.saturating_sub(range.start.0);
+    let new_marker_end = new_indent + new_number.len();
+    let old_marker_end = marker_rel + digits;
+    let new_run_start = new_marker_end + 1;
+    let old_run_end = run_start + run_len;
+    let new_run_end = new_run_start + new_run.len();
+    let mut mapped = if offset > first.len() {
+        None
+    } else if offset == 0 && marker_rel > 0 {
+        Some(0)
+    } else if offset < marker_rel {
+        Some(new_indent.saturating_sub(marker_rel - offset))
+    } else if offset == old_marker_end {
+        Some(new_marker_end)
+    } else if offset < old_marker_end {
+        Some((new_indent + (offset - marker_rel)).min(new_marker_end))
+    } else if offset <= run_start {
+        Some(new_run_start - (run_start - offset))
+    } else if offset < old_run_end {
+        Some(new_run_start + (offset - run_start).min(new_run.len()))
+    } else {
+        Some(offset - old_run_end + new_run_end)
+    };
+
+    let mut replacement = String::with_capacity(original.len() + new_indent + 8);
+    replacement.push_str(&new_first);
+    replacement.push_str(first_ending);
+    let mut old_pos = first.len() + first_ending.len();
+    let mut new_pos = new_first.len() + first_ending.len();
+    for (content, ending) in &lines[1..] {
+        let blank = content.bytes().all(|byte| matches!(byte, b' ' | b'\t'));
+        let line_start_abs = range.start.0 + old_pos;
+        let in_code =
+            projection.line_in_code_block(line_start_abs, line_start_abs + content.len());
+        let (new_content, lead_old, lead_new) = if shift == 0 || blank {
+            ((*content).to_owned(), 0, 0)
+        } else if in_code {
+            // Code lines keep their bytes: only add or drop leading blanks.
+            if shift > 0 {
+                (
+                    format!("{}{content}", " ".repeat(shift as usize)),
+                    0,
+                    shift as usize,
+                )
+            } else {
+                let kept = remove_columns(content, shift.unsigned_abs());
+                let removed = content.len() - kept.len();
+                (kept, removed, 0)
+            }
+        } else {
+            reindent_columns(content, shift)
+        };
+        // A descendant item whose marker is followed by a tab keeps its
+        // content start only if the padding is rewritten as spaces covering
+        // the same columns (a tab's width depends on its absolute column).
+        let mut run_fix = None;
+        let new_content = if shift != 0 && !blank && !in_code {
+            match fix_descendant_tab_padding(projection, line_start_abs, content, &new_content) {
+                Some((fixed, old_run_end, new_run_end)) => {
+                    run_fix = Some((old_run_end, new_run_end));
+                    fixed
+                }
+                None => new_content,
+            }
+        } else {
+            new_content
+        };
+        let old_len = content.len() + ending.len();
+        if mapped.is_none() && offset >= old_pos && offset < old_pos + old_len {
+            let rel = offset - old_pos;
+            let mut new_rel = if rel >= lead_old {
+                rel - lead_old + lead_new
+            } else {
+                lead_new
+            };
+            if let Some((old_run_end, new_run_end)) = run_fix {
+                let shifted_old_end = old_run_end - lead_old + lead_new;
+                if rel >= old_run_end {
+                    new_rel = new_rel + new_run_end - shifted_old_end;
+                } else if new_rel > new_run_end {
+                    new_rel = new_run_end;
+                }
+            }
+            mapped = Some(new_pos + new_rel);
+        }
+        old_pos += old_len;
+        new_pos += new_content.len() + ending.len();
+        replacement.push_str(&new_content);
+        replacement.push_str(ending);
+    }
+    let mapped = mapped.unwrap_or_else(|| new_pos + offset.saturating_sub(old_pos));
+    Some(MarkdownEditPlan::Replace {
+        range,
+        replacement,
+        selection_after: SourceSelection::caret(SourceOffset(range.start.0 + mapped)),
+    })
+}
+
 /// Splits `text` into physical lines, pairing each line's content with its
 /// own line-terminator bytes (`"\n"`, `"\r\n"`, `"\r"`, or `""` for a final
 /// line with no terminator). Unlike `str::split_inclusive('\n')`, a bare `\r`
@@ -2759,6 +3210,81 @@ fn split_physical_lines(text: &str) -> Vec<(&str, &str)> {
         lines.push((&text[line_start..], ""));
     }
     lines
+}
+
+/// For a descendant list item's opening line, rewrites a tab-containing run
+/// after the marker as spaces covering the columns it spanned in `old`, so the
+/// parser's content start survives the reindent. The item's number is left
+/// untouched. Returns the fixed line plus the run end offsets in `old` and the
+/// fixed line, or `None` when the line is not such an item line.
+fn fix_descendant_tab_padding(
+    projection: &ListEditProjection,
+    line_start_abs: usize,
+    old: &str,
+    reindented: &str,
+) -> Option<(String, usize, usize)> {
+    let lead = old
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let marker_abs = line_start_abs + lead;
+    projection
+        .items
+        .iter()
+        .find(|item| item.marker_range.start.0 == marker_abs)?;
+    let digits = old[lead..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let marker_len = if digits > 0 {
+        if !matches!(old.as_bytes().get(lead + digits), Some(b'.' | b')')) {
+            return None;
+        }
+        digits + 1
+    } else if matches!(old.as_bytes().get(lead), Some(b'-' | b'+' | b'*')) {
+        1
+    } else {
+        return None;
+    };
+    let run_start = lead + marker_len;
+    let run_len = old[run_start..]
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let run_end = run_start + run_len;
+    let run = &old[run_start..run_end];
+    if !run.contains('\t') || run_end >= old.len() {
+        return None;
+    }
+    let new_lead = reindented
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let new_run_start = new_lead + marker_len;
+    let run_columns = prefix_columns(&old[..run_end]).saturating_sub(prefix_columns(&old[..run_start]));
+    let fixed = format!(
+        "{}{}{}",
+        reindented.get(..new_run_start)?,
+        " ".repeat(run_columns),
+        &old[run_end..]
+    );
+    Some((fixed, run_end, new_run_start + run_columns))
+}
+
+/// Moves a non-code continuation line's structural indent by `shift` display
+/// columns, rewriting the leading blanks as spaces so tabs never overshoot the
+/// target column. Returns the new line with the old and new leading byte counts.
+fn reindent_columns(line: &str, shift: isize) -> (String, usize, usize) {
+    let lead = line
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let target = (columns(line) as isize + shift).max(0) as usize;
+    (
+        format!("{}{}", " ".repeat(target), &line[lead..]),
+        lead,
+        target,
+    )
 }
 
 fn remove_columns(line: &str, columns_to_remove: usize) -> String {
