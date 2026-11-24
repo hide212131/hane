@@ -2716,6 +2716,43 @@ mod tests {
     }
 
     #[test]
+    fn ordered_move_ignores_recovered_items_when_continuing_child_numbers() {
+        assert_eq!(
+            replacement(
+                "1. A\n\n       5. code\n2. B",
+                25,
+                ListEditIntent::Indent
+            ),
+            ("1. A\n\n       5. code\n   1. B".to_owned(), 28)
+        );
+    }
+
+    #[test]
+    fn ordered_move_keeps_content_start_with_tab_after_marker() {
+        let (text, caret) = replacement("9. A\n10.\t  [X] B", 16, ListEditIntent::Indent);
+        assert_eq!(text, "9. A\n   1.   [X] B");
+        assert_eq!(caret, 18);
+        let items = reparsed_items(&text);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].depth, 2);
+        assert_eq!(items[1].task, Some(true));
+    }
+
+    #[test]
+    fn ordered_move_shifts_tab_structural_indent_by_columns() {
+        let (indented, caret) = replacement("10. A\n11. B\n\n\tP", 11, ListEditIntent::Indent);
+        assert_eq!(indented, "10. A\n    1. B\n\n       P");
+        assert_eq!(caret, 14);
+        let items = reparsed_items(&indented);
+        assert_eq!(items[1].parent_item, Some(0));
+
+        let (outdented, caret) =
+            replacement("10. A\n    1. B\n\n\t\tP", 14, ListEditIntent::Outdent);
+        assert_eq!(outdented, "10. A\n11. B\n\n     P");
+        assert_eq!(caret, 11);
+    }
+
+    #[test]
     fn ordered_move_of_the_first_item_is_a_noop() {
         assert_eq!(
             plan("1. A\n2. B", 4, ListEditIntent::Indent),
@@ -2911,7 +2948,8 @@ fn plan_ordered_move(
                 .items
                 .iter()
                 .filter(|candidate| {
-                    candidate.parent_item == Some(previous_index)
+                    candidate.is_parser_item
+                        && candidate.parent_item == Some(previous_index)
                         && candidate.depth == previous.depth + 1
                 })
                 .max_by_key(|candidate| candidate.item_range.start.0);
@@ -2951,11 +2989,19 @@ fn plan_ordered_move(
             selection_after: selection,
         });
     }
-    transform_ordered_subtree(source, item, new_indent, number, selection.active)
+    transform_ordered_subtree(
+        source,
+        projection,
+        item,
+        new_indent,
+        number,
+        selection.active,
+    )
 }
 
 fn transform_ordered_subtree(
     source: &str,
+    projection: &ListEditProjection,
     item: &ListEditItem,
     new_indent: usize,
     number: u64,
@@ -2978,44 +3024,104 @@ fn transform_ordered_subtree(
     if digits == 0 || !matches!(first.as_bytes().get(marker_rel + digits), Some(b'.' | b')')) {
         return None;
     }
-    let rest = &first[marker_rel + digits..];
+    // `first[marker_rel + digits]` is the ASCII delimiter; the run of blanks
+    // after it is the marker padding.
+    let run_start = marker_rel + digits + 1;
+    let run_len = first[run_start..]
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let run = &first[run_start..run_start + run_len];
+    let tail = &first[run_start + run_len..];
+    // A tab in the padding depends on its absolute column, so it would span a
+    // different width after the marker moves. Replace it with spaces covering
+    // the same columns so the parser's content start (and task syntax) is kept.
+    let new_run = if run.contains('\t') && !tail.is_empty() {
+        let run_columns = prefix_columns(&first[..run_start + run_len])
+            .saturating_sub(prefix_columns(&first[..run_start]));
+        " ".repeat(run_columns)
+    } else {
+        run.to_owned()
+    };
+    let delimiter = &first[marker_rel + digits..run_start];
     let new_number = number.to_string();
-    let new_first = format!("{}{new_number}{rest}", " ".repeat(new_indent));
+    let new_first = format!(
+        "{}{new_number}{delimiter}{new_run}{tail}",
+        " ".repeat(new_indent)
+    );
 
     let old_width = crate::markers::list_item_content_column_at(first, marker_rel)?;
     let new_width = crate::markers::list_item_content_column_at(&new_first, new_indent)?;
     let shift = new_width as isize - old_width as isize;
 
-    let mut replacement = String::with_capacity(original.len() + new_indent + 8);
-    replacement.push_str(&new_first);
-    replacement.push_str(first_ending);
-    for (content, ending) in &lines[1..] {
-        let blank = content.bytes().all(|byte| matches!(byte, b' ' | b'\t'));
-        if shift == 0 || blank {
-            replacement.push_str(content);
-        } else if shift > 0 {
-            replacement.push_str(&" ".repeat(shift as usize));
-            replacement.push_str(content);
-        } else {
-            replacement.push_str(&remove_columns(content, shift.unsigned_abs()));
-        }
-        replacement.push_str(ending);
-    }
-
     let offset = caret.0.saturating_sub(range.start.0);
     let new_marker_end = new_indent + new_number.len();
     let old_marker_end = marker_rel + digits;
-    let mapped = if offset == 0 && marker_rel > 0 {
-        0
+    let new_run_start = new_marker_end + 1;
+    let old_run_end = run_start + run_len;
+    let new_run_end = new_run_start + new_run.len();
+    let mut mapped = if offset > first.len() {
+        None
+    } else if offset == 0 && marker_rel > 0 {
+        Some(0)
     } else if offset < marker_rel {
-        new_indent.saturating_sub(marker_rel - offset)
+        Some(new_indent.saturating_sub(marker_rel - offset))
     } else if offset == old_marker_end {
-        new_marker_end
+        Some(new_marker_end)
     } else if offset < old_marker_end {
-        (new_indent + (offset - marker_rel)).min(new_marker_end)
+        Some((new_indent + (offset - marker_rel)).min(new_marker_end))
+    } else if offset <= run_start {
+        Some(new_run_start - (run_start - offset))
+    } else if offset < old_run_end {
+        Some(new_run_start + (offset - run_start).min(new_run.len()))
     } else {
-        offset + new_marker_end - old_marker_end
+        Some(offset - old_run_end + new_run_end)
     };
+
+    let mut replacement = String::with_capacity(original.len() + new_indent + 8);
+    replacement.push_str(&new_first);
+    replacement.push_str(first_ending);
+    let mut old_pos = first.len() + first_ending.len();
+    let mut new_pos = new_first.len() + first_ending.len();
+    for (content, ending) in &lines[1..] {
+        let blank = content.bytes().all(|byte| matches!(byte, b' ' | b'\t'));
+        let line_start_abs = range.start.0 + old_pos;
+        let in_code =
+            projection.line_in_code_block(line_start_abs, line_start_abs + content.len());
+        let (new_content, lead_old, lead_new) = if shift == 0 || blank {
+            ((*content).to_owned(), 0, 0)
+        } else if in_code {
+            // Code lines keep their bytes: only add or drop leading blanks.
+            if shift > 0 {
+                (
+                    format!("{}{content}", " ".repeat(shift as usize)),
+                    0,
+                    shift as usize,
+                )
+            } else {
+                let kept = remove_columns(content, shift.unsigned_abs());
+                let removed = content.len() - kept.len();
+                (kept, removed, 0)
+            }
+        } else {
+            reindent_columns(content, shift)
+        };
+        let old_len = content.len() + ending.len();
+        if mapped.is_none() && offset >= old_pos && offset < old_pos + old_len {
+            let rel = offset - old_pos;
+            let new_rel = if rel >= lead_old {
+                rel - lead_old + lead_new
+            } else {
+                lead_new
+            };
+            mapped = Some(new_pos + new_rel);
+        }
+        old_pos += old_len;
+        new_pos += new_content.len() + ending.len();
+        replacement.push_str(&new_content);
+        replacement.push_str(ending);
+    }
+    let mapped = mapped.unwrap_or_else(|| new_pos + offset.saturating_sub(old_pos));
     Some(MarkdownEditPlan::Replace {
         range,
         replacement,
@@ -3058,6 +3164,22 @@ fn split_physical_lines(text: &str) -> Vec<(&str, &str)> {
         lines.push((&text[line_start..], ""));
     }
     lines
+}
+
+/// Moves a non-code continuation line's structural indent by `shift` display
+/// columns, rewriting the leading blanks as spaces so tabs never overshoot the
+/// target column. Returns the new line with the old and new leading byte counts.
+fn reindent_columns(line: &str, shift: isize) -> (String, usize, usize) {
+    let lead = line
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let target = (columns(line) as isize + shift).max(0) as usize;
+    (
+        format!("{}{}", " ".repeat(target), &line[lead..]),
+        lead,
+        target,
+    )
 }
 
 fn remove_columns(line: &str, columns_to_remove: usize) -> String {
