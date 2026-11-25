@@ -76,9 +76,9 @@ pub use session::{
     UnsavedChanges, run_external_check, run_reload_verification,
 };
 pub use store::{
-    FileStateStore, InvalidNetworkConfig, MemoryStateStore, NetworkConfig, RecentFiles,
-    RecentFilesRepository, Settings, SettingsRepository, StateStores, ThemePreference, pin_state_root,
-    require_explicit_state_root,
+    DryingInkSpeed, DryingInkStrength, FileStateStore, InvalidNetworkConfig, MemoryStateStore,
+    NetworkConfig, RecentFiles, RecentFilesRepository, Settings, SettingsRepository, StateStores,
+    ThemePreference, pin_state_root, require_explicit_state_root,
 };
 pub use watch::{
     DEFAULT_MAX_WAIT, DEFAULT_QUIET_PERIOD, FolderWatcher, WatchBatch, WatchTiming, WatchedNames,

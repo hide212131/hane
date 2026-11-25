@@ -437,6 +437,8 @@ impl EntityInputHandler for EditorView {
                 }
             }
         }
+        // A composition starting removes any band at once.
+        self.dismiss_ink_band();
         if let Err(error) =
             self.editor_mut()
                 .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)

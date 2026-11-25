@@ -391,7 +391,7 @@ impl InkLedger {
     }
 }
 
-fn is_sentence_end(c: char) -> bool {
+pub(crate) fn is_sentence_end(c: char) -> bool {
     matches!(c, '。' | '！' | '？')
 }
 
@@ -1272,6 +1272,16 @@ mod tests {
             let expected = if dark { 0.03 } else { -0.03 };
             assert!((dl - expected).abs() <= 0.005, "dL {dl}");
             assert!(da <= 0.005 && db <= 0.005, "da {da} db {db}");
+        }
+    }
+
+    #[test]
+    fn band_theme_token_matches_the_standard_derivation() {
+        for (theme, dark) in [(DEFAULT_THEME, false), (DARK_THEME, true)] {
+            let derived = band_color(theme.editor_background, 0.03, dark);
+            let (dl, da, db) = lab_distance_parts(derived, theme.ink_band_background);
+            assert!(dl.abs() <= 0.01, "dL {dl}");
+            assert!(da <= 0.01 && db <= 0.01, "da {da} db {db}");
         }
     }
 }

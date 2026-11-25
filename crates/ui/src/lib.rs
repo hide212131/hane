@@ -22,6 +22,7 @@ mod line;
 mod mermaid;
 mod proxy_secret;
 mod ranges;
+mod reduce_motion;
 mod shape;
 mod short_text_input;
 

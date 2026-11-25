@@ -7,14 +7,14 @@
     reason = "line rendering keeps GPUI-facing arguments and run assembly together"
 )]
 
-use crate::ink::{InkFrame, ink_color};
+use crate::ink::{InkFrame, band_color, ink_color};
 use crate::input_mode::KeyboardInputMode;
 use crate::mermaid::DiagramPaint;
 use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{
     Div, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement, Styled,
-    StyledImage, div, img, prelude::FluentBuilder, px, relative, rgb,
+    StyledImage, Rgba, div, img, prelude::FluentBuilder, px, relative, rgb, rgba,
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
@@ -1121,6 +1121,72 @@ fn row_ink_visuals(
     visuals
 }
 
+/// This row's share of the band in visual coordinates, with its opacity. Same
+/// projection as [`row_ink_visuals`]: a band on hidden markup has no visual
+/// range, and the range is widened to grapheme cluster boundaries.
+fn row_band_visual(
+    block: &VisualBlock,
+    layout: &BlockLayout,
+    row_index: usize,
+    ink: &InkFrame,
+) -> Option<(Range<usize>, f32)> {
+    let (range, opacity) = ink.band.as_ref()?;
+    let row = layout.lines.get(row_index)?;
+    let line = block.lines.get(row.line)?;
+    if range.end.0 <= row.source_range.start.0 || range.start.0 >= row.source_range.end.0 {
+        return None;
+    }
+    let visual = layout.visual_range_on_row(block, row_index, *range)?;
+    let widened = expand_to_grapheme_boundaries(&line.visual_text, visual);
+    let clamped = widened.start.max(row.line_visual_range.start)
+        ..widened.end.min(row.line_visual_range.end);
+    (clamped.start < clamped.end).then_some((clamped, *opacity))
+}
+
+/// The ranges whose edges split the text: the wet ink plus the band. The band
+/// entry carries level 0, so it splits segments without recoloring any text.
+fn ink_split_edges(
+    ink: &[(Range<usize>, u8)],
+    band: Option<&(Range<usize>, f32)>,
+) -> Vec<(Range<usize>, u8)> {
+    let mut edges = ink.to_vec();
+    if let Some((range, _)) = band {
+        edges.push((range.clone(), 0));
+    }
+    edges
+}
+
+/// Opacity of the band when it covers the whole of `range`.
+fn band_opacity_for(range: &Range<usize>, band: Option<&(Range<usize>, f32)>) -> Option<f32> {
+    band.filter(|(band, _)| range.start >= band.start && range.end <= band.end)
+        .map(|(_, opacity)| *opacity)
+}
+
+/// Lightness difference the `ink_band_background` theme token was derived with.
+const STANDARD_BAND_DELTA_L: f32 = 0.03;
+
+/// Background of the band at `opacity`. The standard strength uses the theme
+/// token; the other strengths derive their own from the editor background.
+fn band_fill(theme: &Theme, params: &crate::ink::InkParams, opacity: f32) -> Rgba {
+    let base = if (params.band_delta_l - STANDARD_BAND_DELTA_L).abs() < 1e-6 {
+        theme.ink_band_background
+    } else {
+        band_color(
+            theme.editor_background,
+            params.band_delta_l,
+            theme_is_dark(theme),
+        )
+    };
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+    rgba((base << 8) | alpha)
+}
+
+/// Whether a segment may show the band as its background. Selection and
+/// find highlights keep their own (a current match implies `find_match`).
+fn segment_shows_band(segment: &LineSegment) -> bool {
+    !segment.selected && !segment.find_match
+}
+
 /// The wettest ink level covering the whole of `range`, or 0.
 fn ink_level_for(range: &Range<usize>, ink: &[(Range<usize>, u8)]) -> u8 {
     ink.iter()
@@ -1415,6 +1481,8 @@ pub(crate) fn row_element(
         row_find_match_visuals(block, layout, row_index, find_matches, find_current_match);
     let hover_visuals = link_hover_visuals(line, link_hover);
     let ink_visuals = row_ink_visuals(block, layout, row_index, ink);
+    let band_visual = row_band_visual(block, layout, row_index, ink);
+    let ink_edges = ink_split_edges(&ink_visuals, band_visual.as_ref());
     let segments = line_segments_with_ink(
         row.line_visual_range.clone(),
         visual_cursor.map(|offset| offset.0),
@@ -1428,7 +1496,7 @@ pub(crate) fn row_element(
         row.body_visual_start,
         &link_boundary_visuals(line),
         &hover_visuals,
-        &ink_visuals,
+        &ink_edges,
     );
     let body_gap_segment = body_gap_segment(row, &segments);
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
@@ -1440,6 +1508,8 @@ pub(crate) fn row_element(
             elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
         }
         if !segment.visual_range.is_empty() {
+            let band_opacity = band_opacity_for(&segment.visual_range, band_visual.as_ref())
+                .filter(|_| segment_shows_band(segment));
             elements.push(
                 div()
                     // Selection wins outright over a match highlight when
@@ -1457,6 +1527,10 @@ pub(crate) fn row_element(
                         !segment.selected && !segment.find_current_match && segment.find_match,
                         |element| element.bg(rgb(theme.find_match_background)),
                     )
+                    // Lowest background priority: the drying-ink band.
+                    .when_some(band_opacity, |element, opacity| {
+                        element.bg(band_fill(&theme, &ink.params, opacity))
+                    })
                     .when(segment.marked || segment.display.underline, |element| {
                         element.underline()
                     })
@@ -1470,9 +1544,12 @@ pub(crate) fn row_element(
                     .when(segment.display.monospace, |element| {
                         element.font_family("ui-monospace")
                     })
-                    .when(segment_shows_code_background(segment), |element| {
-                        element.text_bg(rgb(theme.code_background))
-                    })
+                    // `text_bg` paints above `bg`, so inside the band it would
+                    // hide the band.
+                    .when(
+                        segment_shows_code_background(segment) && band_opacity.is_none(),
+                        |element| element.text_bg(rgb(theme.code_background)),
+                    )
                     // Before the link color, so a link (hover included) wins if
                     // both are ever set on one stretch.
                     .when_some(segment_syntax_tone(segment), |element, tone| {
@@ -1668,9 +1745,14 @@ fn table_row_element(
                 // strikethrough or a code span needs the per-segment path;
                 // everything else keeps the single-text fast path.
                 let fragment_ink = clip_ink_visuals(&ink_visuals, fragment_range.clone());
+                let fragment_band = band_visual.as_ref().and_then(|(range, opacity)| {
+                    clip_visual_range(Some(range), fragment_range.clone())
+                        .map(|clipped| (clipped, *opacity))
+                });
                 let fragment_has_link =
                     table_fragment_needs_segments(&line.style_runs, &fragment_range)
-                        || !fragment_ink.is_empty();
+                        || !fragment_ink.is_empty()
+                        || fragment_band.is_some();
                 let fragment_hover = clip_visual_ranges(&hover_visuals, fragment_range.clone());
                 let fragment_links = clip_visual_ranges(&all_link_visuals, fragment_range.clone());
                 if fragment_selected.is_none()
@@ -1718,11 +1800,14 @@ fn table_row_element(
                         None,
                         &fragment_links,
                         &fragment_hover,
-                        &fragment_ink,
+                        &ink_split_edges(&fragment_ink, fragment_band.as_ref()),
                     )
                     .into_iter()
                     .filter(|segment| !segment.visual_range.is_empty())
                     .map(|segment| {
+                        let band_opacity =
+                            band_opacity_for(&segment.visual_range, fragment_band.as_ref())
+                                .filter(|_| segment_shows_band(&segment));
                         let x = fragment.text_x - cell_layout.x
                             + shaper.x_for_offset(
                                 line,
@@ -1749,6 +1834,9 @@ fn table_row_element(
                                     && segment.find_match,
                                 |element| element.bg(rgb(theme.find_match_background)),
                             )
+                            .when_some(band_opacity, |element, opacity| {
+                                element.bg(band_fill(&theme, &ink.params, opacity))
+                            })
                             .when(segment.marked || segment.display.underline, |element| {
                                 element.underline()
                             })
@@ -1765,9 +1853,10 @@ fn table_row_element(
                             .when(segment.display.monospace, |element| {
                                 element.font_family("ui-monospace")
                             })
-                            .when(segment_shows_code_background(&segment), |element| {
-                                element.text_bg(rgb(theme.code_background))
-                            })
+                            .when(
+                                segment_shows_code_background(&segment) && band_opacity.is_none(),
+                                |element| element.text_bg(rgb(theme.code_background)),
+                            )
                             .when(segment.display.link_color, |element| {
                                 let selector = format!(
                                     "table-cell-link-{}-{}-{}",
@@ -2551,6 +2640,83 @@ mod tests {
         );
         assert!(!theme_is_dark(&DEFAULT_THEME));
         assert!(theme_is_dark(&DARK_THEME));
+    }
+
+    #[test]
+    fn band_edges_split_segments_without_recoloring() {
+        let band = (2..5, 1.0_f32);
+        let edges = ink_split_edges(&[(0..1, 2)], Some(&band));
+        assert_eq!(edges, vec![(0..1, 2), (2..5, 0)]);
+        assert_eq!(ink_split_edges(&[(0..1, 2)], None), vec![(0..1, 2)]);
+        let segments = line_segments_with_ink(
+            0..8,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            None,
+            &[],
+            &[],
+            &edges,
+        );
+        let ranges = segments
+            .iter()
+            .map(|segment| segment.visual_range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, vec![0..1, 1..2, 2..5, 5..8]);
+        // The band's level-0 entry never wets the text.
+        assert_eq!(ink_level_for(&(2..5), &edges), 0);
+        assert_eq!(band_opacity_for(&(2..5), Some(&band)), Some(1.0));
+        assert_eq!(band_opacity_for(&(3..4), Some(&band)), Some(1.0));
+        assert_eq!(band_opacity_for(&(1..3), Some(&band)), None);
+        assert_eq!(band_opacity_for(&(2..5), None), None);
+    }
+
+    #[test]
+    fn selection_and_find_matches_keep_their_own_background_over_the_band() {
+        assert!(segment_shows_band(&plain_segment()));
+        let selected = LineSegment {
+            selected: true,
+            ..plain_segment()
+        };
+        assert!(!segment_shows_band(&selected));
+        let matched = LineSegment {
+            find_match: true,
+            ..plain_segment()
+        };
+        assert!(!segment_shows_band(&matched));
+        let current = LineSegment {
+            find_match: true,
+            find_current_match: true,
+            ..plain_segment()
+        };
+        assert!(!segment_shows_band(&current));
+    }
+
+    #[test]
+    fn band_fill_uses_the_token_at_standard_strength_and_fades_by_alpha() {
+        use crate::theme::{DARK_THEME, DEFAULT_THEME};
+        let params = crate::ink::InkParams::default();
+        assert_eq!(
+            band_fill(&DEFAULT_THEME, &params, 1.0),
+            rgba((DEFAULT_THEME.ink_band_background << 8) | 0xff)
+        );
+        assert_eq!(
+            band_fill(&DARK_THEME, &params, 0.5),
+            rgba((DARK_THEME.ink_band_background << 8) | 0x80)
+        );
+        let strong = crate::ink::InkParams {
+            band_delta_l: 0.045,
+            ..params
+        };
+        assert_ne!(
+            band_fill(&DEFAULT_THEME, &strong, 1.0),
+            band_fill(&DEFAULT_THEME, &params, 1.0)
+        );
     }
 
     #[test]

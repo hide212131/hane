@@ -1,4 +1,5 @@
 use super::*;
+use hane_session::{DryingInkSpeed, DryingInkStrength};
 
 impl EditorView {
     pub(crate) fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
@@ -640,6 +641,54 @@ impl EditorView {
                     view.set_drying_ink(*checked, cx);
                 });
             });
+        // The band and the tuning only matter while the master switch is on.
+        let drying_ink_on = self.drying_ink_enabled();
+        let band_view = cx.entity();
+        let drying_ink_band = Checkbox::new("settings-drying-ink-band")
+            .checked(self.drying_ink_band_enabled())
+            .disabled(!drying_ink_on)
+            .label("句点などで文を区切ったとき、直前の文字の背後に一瞬だけ帯を出す")
+            .on_click(move |checked, _window, app| {
+                band_view.update(app, |view, cx| {
+                    view.set_drying_ink_band(*checked, cx);
+                });
+            });
+        let current_speed = self.drying_ink_speed();
+        let speed_view = cx.entity();
+        let speed_buttons = [
+            (DryingInkSpeed::Fast, "速い（20秒）"),
+            (DryingInkSpeed::Standard, "標準（60秒）"),
+            (DryingInkSpeed::Slow, "ゆっくり（180秒）"),
+        ]
+        .map(|(speed, label)| {
+            let view = speed_view.clone();
+            Button::new(format!("settings-drying-ink-speed-{}", speed.as_str()))
+                .label(label)
+                .ghost()
+                .disabled(!drying_ink_on)
+                .selected(current_speed == speed)
+                .on_click(move |_, _window, app| {
+                    view.update(app, |view, cx| view.set_drying_ink_speed(speed, cx));
+                })
+        });
+        let current_strength = self.drying_ink_strength();
+        let strength_view = cx.entity();
+        let strength_buttons = [
+            (DryingInkStrength::Weak, "弱"),
+            (DryingInkStrength::Standard, "標準"),
+            (DryingInkStrength::Strong, "強"),
+        ]
+        .map(|(strength, label)| {
+            let view = strength_view.clone();
+            Button::new(format!("settings-drying-ink-strength-{}", strength.as_str()))
+                .label(label)
+                .ghost()
+                .disabled(!drying_ink_on)
+                .selected(current_strength == strength)
+                .on_click(move |_, _window, app| {
+                    view.update(app, |view, cx| view.set_drying_ink_strength(strength, cx));
+                })
+        });
         // Offered only where the link exists (the app attached a controller).
         let link_section = self.whisparrot_link_available().then(|| {
             let link_view = cx.entity();
@@ -715,11 +764,47 @@ impl EditorView {
                             .child(syntax_highlight),
                     )
                     .child(
-                        card("settings-drying-ink-card").child(drying_ink).child(
-                            div()
-                                .text_color(rgb(self.theme.quote_foreground))
-                                .child("文書には保存されません。タブの切り替えや再起動で消えます。"),
-                        ),
+                        card("settings-drying-ink-card")
+                            .child(drying_ink)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .when(!drying_ink_on, |element| element.opacity(0.5))
+                                    .child(drying_ink_band)
+                                    .child(
+                                        div()
+                                            .text_color(rgb(self.theme.quote_foreground))
+                                            .child("乾く速さ"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .children(speed_buttons),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(rgb(self.theme.quote_foreground))
+                                            .child("濃さ"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .children(strength_buttons),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("文書には保存されません。タブの切り替えや再起動で消えます。"),
+                            ),
                     ),
             )
             .child(

@@ -1,5 +1,7 @@
-//! Drying ink (Issue #779, phase P2): text that was just confirmed is drawn a
-//! little stronger and settles back to the normal color as it dries.
+//! Drying ink (Issue #779, phases P2 and P3): text that was just confirmed is
+//! drawn a little stronger and settles back to the normal color as it dries.
+//! A sentence-ending confirmation or Enter also shows a short-lived band
+//! behind the text that was just confirmed.
 //!
 //! The view owns one [`InkLedger`] for the document on screen and one timer.
 //! Neither touches the document, the selection, the IME state or the history:
@@ -10,7 +12,11 @@
 //! here asks for animation frames.
 
 use super::*;
-use crate::ink::{InkFrame, InkLedger, InkOwner, InkParams, rebase_range};
+use crate::ink::{
+    InkBoundary, InkFrame, InkLedger, InkOwner, InkParams, is_sentence_end, rebase_range,
+};
+use crate::reduce_motion::system_reduce_motion;
+use hane_session::{DryingInkSpeed, DryingInkStrength};
 
 /// The ledger and the single wake-up timer of the visible document.
 pub(super) struct DryingInkState {
@@ -18,6 +24,9 @@ pub(super) struct DryingInkState {
     /// When the pending wake-up fires, and the task that will fire it. Dropping
     /// the task cancels it.
     timer: Option<(Instant, Task<()>)>,
+    /// Reads the OS reduce-motion preference. Only called when a band would
+    /// be triggered; tests replace it.
+    reduce_motion: fn() -> bool,
 }
 
 impl DryingInkState {
@@ -25,6 +34,7 @@ impl DryingInkState {
         Self {
             ledger: InkLedger::new(epoch),
             timer: None,
+            reduce_motion: system_reduce_motion,
         }
     }
 
@@ -32,15 +42,6 @@ impl DryingInkState {
     pub(super) fn reset(&mut self) {
         self.ledger.reset();
         self.timer = None;
-    }
-}
-
-/// Parameters in effect. Speed and strength are fixed for now, and the band
-/// is not drawn yet, so it is never created.
-fn ink_params() -> InkParams {
-    InkParams {
-        band_enabled: false,
-        ..InkParams::default()
     }
 }
 
@@ -83,6 +84,95 @@ impl EditorView {
         true
     }
 
+    pub(crate) fn drying_ink_band_enabled(&self) -> bool {
+        self.settings.drying_ink_band
+    }
+
+    pub(crate) fn drying_ink_speed(&self) -> DryingInkSpeed {
+        self.settings.drying_ink_speed
+    }
+
+    pub(crate) fn drying_ink_strength(&self) -> DryingInkStrength {
+        self.settings.drying_ink_strength
+    }
+
+    /// Turns the band on or off. Turning it off removes the band being shown.
+    pub(crate) fn set_drying_ink_band(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.drying_ink_band == on {
+            return;
+        }
+        self.settings.drying_ink_band = on;
+        if !on {
+            self.drying_ink.ledger.dismiss_band();
+        }
+        self.store_settings();
+        self.schedule_drying_ink_wakeup(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_drying_ink_speed(&mut self, speed: DryingInkSpeed, cx: &mut Context<Self>) {
+        if self.settings.drying_ink_speed == speed {
+            return;
+        }
+        self.settings.drying_ink_speed = speed;
+        self.store_settings();
+        self.schedule_drying_ink_wakeup(cx);
+        cx.notify();
+    }
+
+    pub(crate) fn set_drying_ink_strength(
+        &mut self,
+        strength: DryingInkStrength,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.drying_ink_strength == strength {
+            return;
+        }
+        self.settings.drying_ink_strength = strength;
+        self.store_settings();
+        cx.notify();
+    }
+
+    /// Parameters in effect, from the settings.
+    fn ink_params(&self) -> InkParams {
+        InkParams {
+            dry_duration: Duration::from_secs(self.settings.drying_ink_speed.dry_seconds()),
+            delta_l: self.settings.drying_ink_strength.delta_l(),
+            band_delta_l: self.settings.drying_ink_strength.band_delta_l(),
+            band_enabled: self.settings.drying_ink_band,
+        }
+    }
+
+    /// Parameters for an event that may trigger a band. Reduce Motion is read
+    /// only here, and only when the event can actually trigger one.
+    fn trigger_params(&self, may_trigger: bool) -> InkParams {
+        let mut params = self.ink_params();
+        if may_trigger && params.band_enabled && (self.drying_ink.reduce_motion)() {
+            params.band_enabled = false;
+        }
+        params
+    }
+
+    /// Hides the band at once (an IME composition started).
+    pub(crate) fn dismiss_ink_band(&mut self) {
+        self.drying_ink.ledger.dismiss_band();
+    }
+
+    /// Enter or Shift+Enter in the body changed the document: the text before
+    /// it ends a run, so it gets a band. Call after `after_input`.
+    pub(crate) fn note_ink_boundary(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.drying_ink || !self.body_editable() {
+            return;
+        }
+        self.sync_drying_ink();
+        let params = self.trigger_params(true);
+        let now = cx.background_executor().now();
+        self.drying_ink
+            .ledger
+            .record_boundary(InkBoundary::Newline, now, &params);
+        self.schedule_drying_ink_wakeup(cx);
+    }
+
     fn ink_owner(&self) -> InkOwner {
         InkOwner {
             session: self.sessions.active_id(),
@@ -121,9 +211,10 @@ impl EditorView {
             return;
         };
         let now = cx.background_executor().now();
+        let params = self.trigger_params(text.chars().next_back().is_some_and(is_sentence_end));
         self.drying_ink
             .ledger
-            .record_commit(range, text, now, &ink_params());
+            .record_commit(range, text, now, &params);
         self.schedule_drying_ink_wakeup(cx);
     }
 
@@ -152,7 +243,7 @@ impl EditorView {
     /// What the renderer needs for this frame. Empty while reading and while
     /// the switch is off. Also keeps the timer pointed at the next change.
     pub(crate) fn drying_ink_frame(&mut self, cx: &mut Context<Self>) -> InkFrame {
-        let params = ink_params();
+        let params = self.ink_params();
         if !self.settings.drying_ink {
             self.drying_ink.timer = None;
             return InkFrame {
@@ -166,7 +257,12 @@ impl EditorView {
         let frame = self.drying_ink.ledger.frame(now, &params);
         self.schedule_drying_ink_wakeup(cx);
         if self.body_editable() {
-            frame
+            // A composition in progress hides the band and never shows a new one.
+            let composing = self.editor().ime().is_some();
+            InkFrame {
+                band: if composing { None } else { frame.band },
+                ..frame
+            }
         } else {
             // Time keeps running while reading, but nothing is drawn.
             InkFrame {
@@ -182,7 +278,7 @@ impl EditorView {
     pub(crate) fn schedule_drying_ink_wakeup(&mut self, cx: &mut Context<Self>) {
         let now = cx.background_executor().now();
         let next = (self.settings.drying_ink && self.body_editable())
-            .then(|| self.drying_ink.ledger.next_wakeup(now, &ink_params()))
+            .then(|| self.drying_ink.ledger.next_wakeup(now, &self.ink_params()))
             .flatten();
         let Some(at) = next else {
             self.drying_ink.timer = None;
@@ -474,6 +570,254 @@ mod tests {
         advance(cx, Duration::from_secs(30));
         assert_eq!(notifications.get(), 0);
         assert!(!timer_active(&view, cx));
+    }
+
+    /// The band as `(start, end, opacity)`, read the way the renderer reads it.
+    fn band(view: &TestView, cx: &mut TestCx) -> Option<(usize, usize, f32)> {
+        view.update(cx, |view, cx| {
+            view.drying_ink_frame(cx)
+                .band
+                .map(|(range, opacity)| (range.start.0, range.end.0, opacity))
+        })
+    }
+
+    /// Presses Enter in the body through the real action.
+    fn enter(view: &TestView, cx: &mut TestCx) {
+        cx.update(|window, app| {
+            view.read(app).focus_handle.clone().focus(window);
+            window.dispatch_action(Box::new(crate::actions::Newline), app);
+        });
+        cx.run_until_parked();
+    }
+
+    /// Types each text in turn into an empty document and returns the band.
+    fn band_after_typing(
+        cx: &mut gpui::TestAppContext,
+        texts: &[&str],
+    ) -> Option<(usize, usize, f32)> {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        for text in texts {
+            replace(&view, cx, text);
+        }
+        band(&view, cx)
+    }
+
+    #[gpui::test]
+    fn a_fullwidth_sentence_end_shows_a_band_over_the_confirmed_run(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        assert_eq!(
+            band_after_typing(cx, &["あ", "い。"]),
+            Some((0, 9, 1.0))
+        );
+    }
+
+    #[gpui::test]
+    fn exclamation_mark_shows_a_band(cx: &mut gpui::TestAppContext) {
+        assert!(band_after_typing(cx, &["あ！"]).is_some());
+    }
+
+    #[gpui::test]
+    fn question_mark_shows_a_band(cx: &mut gpui::TestAppContext) {
+        assert!(band_after_typing(cx, &["あ？"]).is_some());
+    }
+
+    #[gpui::test]
+    fn ordinary_text_shows_no_band(cx: &mut gpui::TestAppContext) {
+        assert_eq!(band_after_typing(cx, &["あいう"]), None);
+    }
+
+    #[gpui::test]
+    fn an_ascii_period_shows_no_band(cx: &mut gpui::TestAppContext) {
+        assert_eq!(band_after_typing(cx, &["It ends here."]), None);
+    }
+
+    #[gpui::test]
+    fn ascii_exclamation_and_question_marks_show_no_band(cx: &mut gpui::TestAppContext) {
+        assert_eq!(band_after_typing(cx, &["Really?", "Yes!"]), None);
+    }
+
+    #[gpui::test]
+    fn enter_shows_a_band_over_the_text_before_it(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        replace(&view, cx, "あい");
+        assert_eq!(band(&view, cx), None);
+        enter(&view, cx);
+        assert_eq!(text_of(&view, cx), "あい\n");
+        assert_eq!(band(&view, cx), Some((0, 6, 1.0)));
+    }
+
+    #[gpui::test]
+    fn enter_without_confirmed_text_shows_no_band(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "abc", StateStores::memory());
+        enter(&view, cx);
+        assert_eq!(band(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn no_band_appears_while_composing(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        mark(&view, cx, "。");
+        assert_eq!(band(&view, cx), None);
+        // The confirmation itself is what triggers it.
+        unmark(&view, cx);
+        assert!(band(&view, cx).is_some());
+    }
+
+    #[gpui::test]
+    fn starting_a_composition_removes_the_band(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        replace(&view, cx, "あ。");
+        assert!(band(&view, cx).is_some());
+        mark(&view, cx, "か");
+        assert_eq!(band(&view, cx), None);
+        unmark(&view, cx);
+        assert_eq!(band(&view, cx), None);
+    }
+
+    #[gpui::test]
+    fn a_band_lasts_one_second_in_at_most_five_notifications(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        replace(&view, cx, "あ。");
+        let notifications = count_notifications(&view, cx);
+        assert_eq!(band(&view, cx), Some((0, 6, 1.0)));
+        advance(cx, Duration::from_millis(500));
+        assert_eq!(band(&view, cx), Some((0, 6, 1.0)));
+        advance(cx, Duration::from_millis(100));
+        assert_eq!(band(&view, cx), Some((0, 6, 0.75)));
+        advance(cx, Duration::from_millis(100));
+        assert_eq!(band(&view, cx), Some((0, 6, 0.5)));
+        advance(cx, Duration::from_millis(100));
+        assert_eq!(band(&view, cx), Some((0, 6, 0.25)));
+        advance(cx, Duration::from_millis(100));
+        assert_eq!(band(&view, cx), None);
+        assert!(notifications.get() <= 5, "{} notifications", notifications.get());
+        // Nothing else asks for a redraw before the ink itself changes.
+        advance(cx, Duration::from_secs(5));
+        assert!(notifications.get() <= 5, "{} notifications", notifications.get());
+    }
+
+    #[gpui::test]
+    fn reduce_motion_suppresses_the_band_but_not_the_drying(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        view.update(cx, |view, _| view.drying_ink.reduce_motion = || true);
+        replace(&view, cx, "あ。");
+        assert_eq!(band(&view, cx), None);
+        assert_eq!(wet(&view, cx), vec![(0, 6, 4)]);
+        enter(&view, cx);
+        assert_eq!(band(&view, cx), None);
+        view.update(cx, |view, _| view.drying_ink.reduce_motion = || false);
+        replace(&view, cx, "い。");
+        assert!(band(&view, cx).is_some());
+    }
+
+    #[gpui::test]
+    fn reduce_motion_is_read_only_when_a_band_could_trigger(cx: &mut gpui::TestAppContext) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static READS: AtomicUsize = AtomicUsize::new(0);
+        fn counted() -> bool {
+            READS.fetch_add(1, Ordering::SeqCst);
+            false
+        }
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        view.update(cx, |view, _| view.drying_ink.reduce_motion = counted);
+        replace(&view, cx, "あいう");
+        assert_eq!(READS.load(Ordering::SeqCst), 0);
+        replace(&view, cx, "。");
+        assert_eq!(READS.load(Ordering::SeqCst), 1);
+    }
+
+    #[gpui::test]
+    fn the_band_setting_turns_the_band_off_and_is_stored(cx: &mut gpui::TestAppContext) {
+        let stores = StateStores::memory();
+        let (view, cx) = open_view(cx, "", stores.clone());
+        replace(&view, cx, "あ。");
+        assert!(band(&view, cx).is_some());
+        view.update(cx, |view, cx| view.set_drying_ink_band(false, cx));
+        assert_eq!(band(&view, cx), None);
+        assert!(!stores.settings().load().drying_ink_band);
+        replace(&view, cx, "い。");
+        assert_eq!(band(&view, cx), None);
+        assert_eq!(wet(&view, cx).len(), 1);
+        view.update(cx, |view, cx| view.set_drying_ink_band(true, cx));
+        replace(&view, cx, "う。");
+        assert!(band(&view, cx).is_some());
+        assert!(stores.settings().load().drying_ink_band);
+    }
+
+    #[gpui::test]
+    fn speed_and_strength_reach_the_ink_parameters(cx: &mut gpui::TestAppContext) {
+        let stores = StateStores::memory();
+        let (view, cx) = open_view(cx, "", stores.clone());
+        let params = |view: &TestView, cx: &mut TestCx| {
+            view.update(cx, |view, cx| view.drying_ink_frame(cx).params)
+        };
+        let standard = params(&view, cx);
+        assert_eq!(standard.dry_duration, Duration::from_secs(60));
+        assert_eq!(standard.delta_l, 0.04);
+        assert_eq!(standard.band_delta_l, 0.03);
+        view.update(cx, |view, cx| {
+            view.set_drying_ink_speed(DryingInkSpeed::Slow, cx);
+            view.set_drying_ink_strength(DryingInkStrength::Strong, cx);
+        });
+        let tuned = params(&view, cx);
+        assert_eq!(tuned.dry_duration, Duration::from_secs(180));
+        assert_eq!(tuned.delta_l, 0.06);
+        assert_eq!(tuned.band_delta_l, 0.045);
+        view.update(cx, |view, cx| {
+            view.set_drying_ink_speed(DryingInkSpeed::Fast, cx);
+            view.set_drying_ink_strength(DryingInkStrength::Weak, cx);
+        });
+        let tuned = params(&view, cx);
+        assert_eq!(tuned.dry_duration, Duration::from_secs(20));
+        assert_eq!(tuned.delta_l, 0.025);
+        assert_eq!(tuned.band_delta_l, 0.02);
+        let stored = stores.settings().load();
+        assert_eq!(stored.drying_ink_speed, DryingInkSpeed::Fast);
+        assert_eq!(stored.drying_ink_strength, DryingInkStrength::Weak);
+    }
+
+    #[gpui::test]
+    fn the_speed_setting_changes_how_long_ink_stays_wet(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        view.update(cx, |view, cx| {
+            view.set_drying_ink_speed(DryingInkSpeed::Fast, cx);
+        });
+        replace(&view, cx, "abc");
+        advance(cx, Duration::from_secs(25));
+        assert!(wet(&view, cx).is_empty());
+        view.update(cx, |view, cx| {
+            view.set_drying_ink_speed(DryingInkSpeed::Standard, cx);
+        });
+        replace(&view, cx, "def");
+        advance(cx, Duration::from_secs(25));
+        assert_eq!(wet(&view, cx).len(), 1);
+    }
+
+    fn typed_band_in(cx: &mut gpui::TestAppContext, band_on: bool) -> (Rendered, Rendered) {
+        let (view, cx) = open_view(cx, "# Title\n\nbody\n", StateStores::memory());
+        view.update(cx, |view, cx| view.set_drying_ink_band(band_on, cx));
+        view.update(cx, |view, _| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(14)))
+                .unwrap();
+        });
+        replace(&view, cx, "追加。");
+        assert_eq!(band(&view, cx).is_some(), band_on);
+        let with_band = rendered(&view, cx);
+        advance(cx, Duration::from_secs(2));
+        assert_eq!(band(&view, cx), None);
+        let without_band = rendered(&view, cx);
+        (with_band, without_band)
+    }
+
+    #[gpui::test]
+    fn the_band_changes_neither_layout_nor_document_state(cx: &mut gpui::TestAppContext) {
+        let (banded, banded_after) = typed_band_in(cx, true);
+        let (plain, plain_after) = typed_band_in(cx, false);
+        assert_eq!(banded, plain);
+        assert_eq!(banded, banded_after);
+        assert_eq!(plain, plain_after);
     }
 
     type Rendered = (

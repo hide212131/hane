@@ -2,6 +2,7 @@ use crate::clipboard::PasteMode;
 use crate::view::EditorView;
 use crate::view::input_routing::InputTarget;
 use gpui::{App, ClipboardItem, Context, InteractiveElement, KeyBinding, Window, actions};
+use hane_document::TextBuffer;
 use hane_editor::{EditorCommand, ForwardStop};
 use hane_markdown::ListEditIntent;
 
@@ -382,11 +383,14 @@ command_actions! {
                 }
             }
             InputTarget::Body => {
-                if view.editor().ime().is_none()
-                    && !view.late_input_guard_armed()
-                    && !view.apply_list_edit_intent(ListEditIntent::Enter, cx)
-                {
-                    view.insert_newline(cx);
+                if view.editor().ime().is_none() && !view.late_input_guard_armed() {
+                    let revision = view.editor().document().revision();
+                    if !view.apply_list_edit_intent(ListEditIntent::Enter, cx) {
+                        view.insert_newline(cx);
+                    }
+                    if view.editor().document().revision() != revision {
+                        view.note_ink_boundary(cx);
+                    }
                 }
             }
         }
@@ -416,10 +420,14 @@ command_actions! {
                 }
             }
             InputTarget::Body => {
-                if view.editor().ime().is_none()
-                    && !view.apply_list_edit_intent(ListEditIntent::ShiftEnter, cx)
-                {
-                    view.insert_newline(cx);
+                if view.editor().ime().is_none() {
+                    let revision = view.editor().document().revision();
+                    if !view.apply_list_edit_intent(ListEditIntent::ShiftEnter, cx) {
+                        view.insert_newline(cx);
+                    }
+                    if view.editor().document().revision() != revision {
+                        view.note_ink_boundary(cx);
+                    }
                 }
             }
         }
