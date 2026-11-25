@@ -499,6 +499,9 @@ impl EditorView {
         // (or an unnamed work-folder note's draft directory), never against
         // the directory the process happens to run in.
         let resolver = self.document_resource_resolver();
+        // Wet ink for this frame; empty while reading and while the master
+        // switch is off. Taken before `editor` borrows the sessions.
+        let ink_frame = self.drying_ink_frame(cx);
         let editor = self.sessions.active().editor();
         let editor_scrollbar = self.editor_scrollbar(self.scrollable_content_height(), cx);
         let main_column = main_column.child(
@@ -560,6 +563,7 @@ impl EditorView {
                                         find_current_match,
                                         link_hover,
                                         diagram_paint.as_ref(),
+                                        &ink_frame,
                                     )
                                     // Lets GPUI-event regression tests read a row's real
                                     // painted window bounds via `VisualTestContext::debug_bounds`

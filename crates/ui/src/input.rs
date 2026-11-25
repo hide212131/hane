@@ -5,7 +5,7 @@ use gpui::{
     GlobalElementId, IntoElement, LayoutId, PaintQuad, Pixels, ShapedLine, Size, Style, TextRun,
     UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba,
 };
-use hane_document::SourceRange;
+use hane_document::{SourceRange, TextBuffer};
 use std::ops::Range;
 
 /// The visible, one-line text field used by a sidebar inline rename. Keeping
@@ -281,7 +281,17 @@ impl EntityInputHandler for EditorView {
                 // A callback that arrives after the body stopped accepting
                 // input must not commit anything into the document.
                 if self.body_editable() {
+                    // The confirmed range is only known before the commit
+                    // clears the composition.
+                    let confirmed = self
+                        .editor()
+                        .ime()
+                        .map(|ime| (ime.current_range, ime.marked_text.clone()));
+                    let revision = self.editor().document().revision();
                     self.editor_mut().commit_composition();
+                    if let Some((range, text)) = confirmed {
+                        self.note_ink_commit(range, revision, &text, cx);
+                    }
                     // The core commit owns no UI notification, yet the mode
                     // switch's disabled state is fixed at render time. Tell
                     // the UI the composition ended so the first click works.
@@ -346,17 +356,22 @@ impl EntityInputHandler for EditorView {
             return;
         }
         if range_utf16.is_none() && self.editor().ime().is_none() {
-            self.insert_text(new_text, cx);
+            self.insert_typed_text(new_text, cx);
             return;
         }
-        let result = self
-            .editor_mut()
-            .commit_text(range_utf16, new_text)
-            .map(|_| ());
-        if let Err(error) = result {
-            self.report_error("text input", error);
-        }
+        let summary = match self.editor_mut().commit_text(range_utf16, new_text) {
+            Ok(summary) => Some(summary),
+            Err(error) => {
+                self.report_error("text input", error);
+                None
+            }
+        };
         self.after_input(cx);
+        // After `after_input`, so the ledger has followed this edit and any
+        // rewrite that ran with it before the confirmed range is recorded.
+        if let Some(summary) = summary {
+            self.note_ink_commit(summary.range_after, summary.revision_after, new_text, cx);
+        }
     }
 
     fn replace_and_mark_text_in_range(
@@ -422,6 +437,8 @@ impl EntityInputHandler for EditorView {
                 }
             }
         }
+        // A composition starting removes any band at once.
+        self.dismiss_ink_band();
         if let Err(error) =
             self.editor_mut()
                 .replace_and_mark_text(range_utf16, new_text, new_selected_range_utf16)

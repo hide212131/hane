@@ -131,6 +131,9 @@ impl EditorView {
                 }
             }
         });
+        // Anchors the drying-ink level grid; time always comes from the
+        // executor's clock so tests can drive it.
+        let ink_epoch = cx.background_executor().now();
         Self {
             sessions,
             files,
@@ -288,6 +291,7 @@ impl EditorView {
             joined_parse_jobs: HashMap::new(),
             joined_parse_jobs_running: 0,
             mermaid: MermaidStore::new(),
+            drying_ink: drying_ink::DryingInkState::new(ink_epoch),
             _mermaid_release_subscription: mermaid_release_subscription,
         }
     }

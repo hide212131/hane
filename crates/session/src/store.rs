@@ -48,6 +48,89 @@ impl ThemePreference {
     }
 }
 
+/// How long freshly confirmed text takes to dry (`drying_ink_speed` key,
+/// Issue #779). A missing or invalid value means `Standard`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DryingInkSpeed {
+    Fast,
+    #[default]
+    Standard,
+    Slow,
+}
+
+impl DryingInkSpeed {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fast => "fast",
+            Self::Standard => "standard",
+            Self::Slow => "slow",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "fast" => Self::Fast,
+            "slow" => Self::Slow,
+            _ => Self::Standard,
+        }
+    }
+
+    /// Seconds from confirmation until the text is dry.
+    pub fn dry_seconds(self) -> u64 {
+        match self {
+            Self::Fast => 20,
+            Self::Standard => 60,
+            Self::Slow => 180,
+        }
+    }
+}
+
+/// How strongly wet text and the band stand out (`drying_ink_strength` key,
+/// Issue #779). A missing or invalid value means `Standard`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DryingInkStrength {
+    Weak,
+    #[default]
+    Standard,
+    Strong,
+}
+
+impl DryingInkStrength {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Weak => "weak",
+            Self::Standard => "standard",
+            Self::Strong => "strong",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "weak" => Self::Weak,
+            "strong" => Self::Strong,
+            _ => Self::Standard,
+        }
+    }
+
+    /// OKLab lightness difference of the wettest text.
+    pub fn delta_l(self) -> f32 {
+        match self {
+            Self::Weak => 0.025,
+            Self::Standard => 0.04,
+            Self::Strong => 0.06,
+        }
+    }
+
+    /// OKLab lightness difference of the band background.
+    pub fn band_delta_l(self) -> f32 {
+        match self {
+            Self::Weak => 0.02,
+            Self::Standard => 0.03,
+            Self::Strong => 0.045,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Settings {
     pub autosave: bool,
@@ -82,6 +165,17 @@ pub struct Settings {
     /// (`syntax_highlight` key, Issue #738). Independent of
     /// `plain_text_mode`. A missing or invalid value means `true`.
     pub syntax_highlight: bool,
+    /// Whether freshly confirmed text is drawn slightly emphasized until it
+    /// dries (`drying_ink` key, Issue #779). Display only. A missing or
+    /// invalid value means `true`.
+    pub drying_ink: bool,
+    /// Whether a band is drawn behind a just-confirmed sentence
+    /// (`drying_ink_band` key). A missing or invalid value means `true`.
+    pub drying_ink_band: bool,
+    /// How long the ink takes to dry (`drying_ink_speed` key).
+    pub drying_ink_speed: DryingInkSpeed,
+    /// How strongly the ink and band stand out (`drying_ink_strength` key).
+    pub drying_ink_strength: DryingInkStrength,
     /// Whether Hane lets the whisparrot voice-input app read context from the
     /// open document and insert or replace text (`whisparrot_link` key). Off
     /// until the user turns it on; a missing key, any value other than `true`,
@@ -100,6 +194,10 @@ impl Default for Settings {
             auto_update_check: true,
             plain_text_mode: false,
             syntax_highlight: true,
+            drying_ink: true,
+            drying_ink_band: true,
+            drying_ink_speed: DryingInkSpeed::default(),
+            drying_ink_strength: DryingInkStrength::default(),
             whisparrot_link: false,
         }
     }
@@ -486,13 +584,17 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\nwhisparrot_link={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\ndrying_ink_band={}\ndrying_ink_speed={}\ndrying_ink_strength={}\nwhisparrot_link={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
             settings.auto_update_check,
             settings.plain_text_mode,
             settings.syntax_highlight,
+            settings.drying_ink,
+            settings.drying_ink_band,
+            settings.drying_ink_speed.as_str(),
+            settings.drying_ink_strength.as_str(),
             settings.whisparrot_link
         );
         if let Some(folder) = &settings.default_folder {
@@ -542,6 +644,14 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.plain_text_mode = value == "true";
                 } else if let Some(value) = line.strip_prefix("syntax_highlight=") {
                     settings.syntax_highlight = value != "false";
+                } else if let Some(value) = line.strip_prefix("drying_ink=") {
+                    settings.drying_ink = value != "false";
+                } else if let Some(value) = line.strip_prefix("drying_ink_band=") {
+                    settings.drying_ink_band = value != "false";
+                } else if let Some(value) = line.strip_prefix("drying_ink_speed=") {
+                    settings.drying_ink_speed = DryingInkSpeed::parse(value);
+                } else if let Some(value) = line.strip_prefix("drying_ink_strength=") {
+                    settings.drying_ink_strength = DryingInkStrength::parse(value);
                 } else if let Some(value) = line.strip_prefix("whisparrot_link=") {
                     settings.whisparrot_link = value == "true";
                 }
@@ -902,6 +1012,10 @@ mod tests {
             auto_update_check: false,
             plain_text_mode: true,
             syntax_highlight: false,
+            drying_ink: false,
+            drying_ink_band: false,
+            drying_ink_speed: DryingInkSpeed::Slow,
+            drying_ink_strength: DryingInkStrength::Strong,
             whisparrot_link: true,
         };
         SettingsRepository::store(&store, &settings).unwrap();
@@ -1112,6 +1226,10 @@ mod tests {
                     auto_update_check: true,
                     plain_text_mode: false,
                     syntax_highlight: true,
+                    drying_ink: true,
+                    drying_ink_band: true,
+                    drying_ink_speed: DryingInkSpeed::Standard,
+                    drying_ink_strength: DryingInkStrength::Standard,
                     whisparrot_link: false,
                 })
                 .unwrap();
@@ -1203,6 +1321,125 @@ mod tests {
             assert_eq!(loaded, settings);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drying_ink_survives_a_store_reload() {
+        let root = temporary_directory("state-drying-ink-round-trip");
+        let store = FileStateStore::at(&root);
+        for enabled in [false, true] {
+            let settings = Settings {
+                drying_ink: enabled,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+            assert!(text.contains(&format!("drying_ink={enabled}\n")));
+            let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+            assert_eq!(loaded.drying_ink, enabled);
+            assert_eq!(loaded, settings);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drying_ink_defaults_to_true_when_missing_or_invalid() {
+        assert!(Settings::default().drying_ink);
+        assert!(load_after_writing("autosave=false\ntheme=dark\n").drying_ink);
+        for value in ["maybe", "", "FALSE", "0"] {
+            let loaded = load_after_writing(&format!("drying_ink={value}\n"));
+            assert!(loaded.drying_ink, "value {value:?}");
+        }
+        assert!(!load_after_writing("drying_ink=false\n").drying_ink);
+    }
+
+    #[test]
+    fn drying_ink_band_round_trips_and_defaults_to_true() {
+        let root = temporary_directory("state-drying-ink-band-round-trip");
+        let store = FileStateStore::at(&root);
+        for enabled in [false, true] {
+            let settings = Settings {
+                drying_ink_band: enabled,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+            assert!(text.contains(&format!("drying_ink_band={enabled}\n")));
+            let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+            assert_eq!(loaded.drying_ink_band, enabled);
+            assert_eq!(loaded, settings);
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(Settings::default().drying_ink_band);
+        assert!(load_after_writing("autosave=false\n").drying_ink_band);
+        for value in ["maybe", "", "FALSE", "0"] {
+            let loaded = load_after_writing(&format!("drying_ink_band={value}\n"));
+            assert!(loaded.drying_ink_band, "value {value:?}");
+        }
+        assert!(!load_after_writing("drying_ink_band=false\n").drying_ink_band);
+    }
+
+    #[test]
+    fn drying_ink_speed_and_strength_round_trip() {
+        let root = temporary_directory("state-drying-ink-tuning-round-trip");
+        let store = FileStateStore::at(&root);
+        for speed in [
+            DryingInkSpeed::Fast,
+            DryingInkSpeed::Standard,
+            DryingInkSpeed::Slow,
+        ] {
+            for strength in [
+                DryingInkStrength::Weak,
+                DryingInkStrength::Standard,
+                DryingInkStrength::Strong,
+            ] {
+                let settings = Settings {
+                    drying_ink_speed: speed,
+                    drying_ink_strength: strength,
+                    ..Settings::default()
+                };
+                SettingsRepository::store(&store, &settings).unwrap();
+                let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+                assert!(text.contains(&format!("drying_ink_speed={}\n", speed.as_str())));
+                assert!(text.contains(&format!("drying_ink_strength={}\n", strength.as_str())));
+                assert_eq!(
+                    SettingsRepository::load(&FileStateStore::at(&root)),
+                    settings
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drying_ink_speed_and_strength_fall_back_to_standard() {
+        let missing = load_after_writing("autosave=false\n");
+        assert_eq!(missing.drying_ink_speed, DryingInkSpeed::Standard);
+        assert_eq!(missing.drying_ink_strength, DryingInkStrength::Standard);
+        for value in ["", "FAST", "medium", "0"] {
+            let loaded = load_after_writing(&format!(
+                "drying_ink_speed={value}\ndrying_ink_strength={value}\n"
+            ));
+            assert_eq!(loaded.drying_ink_speed, DryingInkSpeed::Standard, "{value:?}");
+            assert_eq!(
+                loaded.drying_ink_strength,
+                DryingInkStrength::Standard,
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drying_ink_tuning_values_match_the_specification() {
+        assert_eq!(DryingInkSpeed::Fast.dry_seconds(), 20);
+        assert_eq!(DryingInkSpeed::Standard.dry_seconds(), 60);
+        assert_eq!(DryingInkSpeed::Slow.dry_seconds(), 180);
+        assert_eq!(DryingInkStrength::Weak.delta_l(), 0.025);
+        assert_eq!(DryingInkStrength::Standard.delta_l(), 0.04);
+        assert_eq!(DryingInkStrength::Strong.delta_l(), 0.06);
+        assert_eq!(DryingInkStrength::Weak.band_delta_l(), 0.02);
+        assert_eq!(DryingInkStrength::Standard.band_delta_l(), 0.03);
+        assert_eq!(DryingInkStrength::Strong.band_delta_l(), 0.045);
     }
 
     #[test]

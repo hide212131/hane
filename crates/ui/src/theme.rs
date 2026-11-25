@@ -44,6 +44,10 @@ pub(crate) struct Theme {
     pub syntax_code: u32,
     /// List markers, quote markers, task checkboxes and fence language names.
     pub syntax_structure: u32,
+    /// Drying-ink band background at the standard strength (Issue #779):
+    /// `band_color(editor_background, 0.03, dark)`, kept as a token so the
+    /// default needs no color conversion while drawing.
+    pub ink_band_background: u32,
     pub media_background: u32,
     pub table_background: u32,
     pub table_header_background: u32,
@@ -81,6 +85,7 @@ pub(crate) const DEFAULT_THEME: Theme = Theme {
     syntax_heading_minor: 0x7a4a2e,
     syntax_code: 0x2a6b57,
     syntax_structure: 0x9a3f1c,
+    ink_band_background: 0xefeeec,
     media_background: 0xf3f0eb,
     table_background: 0xf5f2ed,
     table_header_background: 0xe9e4dc,
@@ -118,6 +123,7 @@ pub(crate) const DARK_THEME: Theme = Theme {
     syntax_heading_minor: 0xd9b08c,
     syntax_code: 0x8fcbb4,
     syntax_structure: 0xf0a36b,
+    ink_band_background: 0x27282a,
     media_background: 0x292a2d,
     table_background: 0x27282b,
     table_header_background: 0x34363a,

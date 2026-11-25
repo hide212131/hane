@@ -7,13 +7,14 @@
     reason = "line rendering keeps GPUI-facing arguments and run assembly together"
 )]
 
+use crate::ink::{InkFrame, band_color, ink_color};
 use crate::input_mode::KeyboardInputMode;
 use crate::mermaid::DiagramPaint;
 use crate::ranges::partition;
 use crate::theme::Theme;
 use gpui::{
     Div, FontWeight, InteractiveElement, IntoElement, ObjectFit, ParentElement, Styled,
-    StyledImage, div, img, prelude::FluentBuilder, px, relative, rgb,
+    StyledImage, Rgba, div, img, prelude::FluentBuilder, px, relative, rgb, rgba,
 };
 use hane_document::{Bias, LineId, SourceOffset, SourceRange, TextBuffer};
 use hane_editor::Editor;
@@ -33,6 +34,7 @@ use hane_presentation::{
 };
 use hane_session::ResourceResolver;
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 fn line_owns_cursor(range: SourceRange, cursor: SourceOffset, is_final_line: bool) -> bool {
     range.start <= cursor && (cursor < range.end || (is_final_line && cursor == range.end))
@@ -1056,6 +1058,186 @@ fn row_find_match_visuals(
     (visuals, current_visual)
 }
 
+/// Widens `range` outward to grapheme cluster boundaries of `text`, so a
+/// combining mark, a variation selector or a ZWJ sequence is never split
+/// between two ink levels.
+fn expand_to_grapheme_boundaries(text: &str, range: Range<usize>) -> Range<usize> {
+    let mut start = range.start.min(text.len());
+    let mut end = range.end.min(text.len());
+    for (offset, cluster) in text.grapheme_indices(true) {
+        if offset >= range.end {
+            break;
+        }
+        let cluster_end = offset + cluster.len();
+        if offset < range.start && range.start < cluster_end {
+            start = offset;
+        }
+        if offset < range.end && range.end < cluster_end {
+            end = cluster_end;
+        }
+    }
+    start..end
+}
+
+/// This row's share of the wet ink ranges in visual coordinates, each with its
+/// level. Same shape as [`row_find_match_visuals`]: source ranges are projected
+/// per row, and a range that lies on hidden markup has no visual range and is
+/// dropped. Every range is widened to grapheme cluster boundaries.
+fn row_ink_visuals(
+    block: &VisualBlock,
+    layout: &BlockLayout,
+    row_index: usize,
+    ink: &InkFrame,
+) -> Vec<(Range<usize>, u8)> {
+    if ink.wet.is_empty() {
+        return Vec::new();
+    }
+    let Some(row) = layout.lines.get(row_index) else {
+        return Vec::new();
+    };
+    let Some(line) = block.lines.get(row.line) else {
+        return Vec::new();
+    };
+    // `wet` is sorted and disjoint, so the ranges before this row are skipped
+    // with a binary search and the walk stops at the first one past it.
+    let first = ink
+        .wet
+        .partition_point(|(range, _)| range.end.0 <= row.source_range.start.0);
+    let mut visuals = Vec::new();
+    for (range, level) in &ink.wet[first..] {
+        if range.start.0 >= row.source_range.end.0 {
+            break;
+        }
+        let Some(visual) = layout.visual_range_on_row(block, row_index, *range) else {
+            continue;
+        };
+        let widened = expand_to_grapheme_boundaries(&line.visual_text, visual);
+        let clamped = widened.start.max(row.line_visual_range.start)
+            ..widened.end.min(row.line_visual_range.end);
+        if clamped.start < clamped.end {
+            visuals.push((clamped, *level));
+        }
+    }
+    visuals
+}
+
+/// This row's share of the band in visual coordinates, with its opacity. Same
+/// projection as [`row_ink_visuals`]: a band on hidden markup has no visual
+/// range, and the range is widened to grapheme cluster boundaries.
+fn row_band_visual(
+    block: &VisualBlock,
+    layout: &BlockLayout,
+    row_index: usize,
+    ink: &InkFrame,
+) -> Option<(Range<usize>, f32)> {
+    let (range, opacity) = ink.band.as_ref()?;
+    let row = layout.lines.get(row_index)?;
+    let line = block.lines.get(row.line)?;
+    if range.end.0 <= row.source_range.start.0 || range.start.0 >= row.source_range.end.0 {
+        return None;
+    }
+    let visual = layout.visual_range_on_row(block, row_index, *range)?;
+    let widened = expand_to_grapheme_boundaries(&line.visual_text, visual);
+    let clamped = widened.start.max(row.line_visual_range.start)
+        ..widened.end.min(row.line_visual_range.end);
+    (clamped.start < clamped.end).then_some((clamped, *opacity))
+}
+
+/// The ranges whose edges split the text: the wet ink plus the band. The band
+/// entry carries level 0, so it splits segments without recoloring any text.
+fn ink_split_edges(
+    ink: &[(Range<usize>, u8)],
+    band: Option<&(Range<usize>, f32)>,
+) -> Vec<(Range<usize>, u8)> {
+    let mut edges = ink.to_vec();
+    if let Some((range, _)) = band {
+        edges.push((range.clone(), 0));
+    }
+    edges
+}
+
+/// Opacity of the band when it covers the whole of `range`.
+fn band_opacity_for(range: &Range<usize>, band: Option<&(Range<usize>, f32)>) -> Option<f32> {
+    band.filter(|(band, _)| range.start >= band.start && range.end <= band.end)
+        .map(|(_, opacity)| *opacity)
+}
+
+/// Lightness difference the `ink_band_background` theme token was derived with.
+const STANDARD_BAND_DELTA_L: f32 = 0.03;
+
+/// Background of the band at `opacity`. The standard strength uses the theme
+/// token; the other strengths derive their own from the editor background.
+fn band_fill(theme: &Theme, params: &crate::ink::InkParams, opacity: f32) -> Rgba {
+    let base = if (params.band_delta_l - STANDARD_BAND_DELTA_L).abs() < 1e-6 {
+        theme.ink_band_background
+    } else {
+        band_color(
+            theme.editor_background,
+            params.band_delta_l,
+            theme_is_dark(theme),
+        )
+    };
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+    rgba((base << 8) | alpha)
+}
+
+/// Whether a segment may show the band as its background. Selection and
+/// find highlights keep their own (a current match implies `find_match`).
+fn segment_shows_band(segment: &LineSegment) -> bool {
+    !segment.selected && !segment.find_match
+}
+
+/// The wettest ink level covering the whole of `range`, or 0.
+fn ink_level_for(range: &Range<usize>, ink: &[(Range<usize>, u8)]) -> u8 {
+    ink.iter()
+        .filter(|(wet, _)| range.start >= wet.start && range.end <= wet.end)
+        .map(|(_, level)| *level)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether the theme is a dark one. `Theme` carries no such flag, so it is read
+/// from the editor background: OKLab lightness below 0.5 (for a gray, the cube
+/// root of its linear luminance) is dark.
+fn theme_is_dark(theme: &Theme) -> bool {
+    let linear = |shift: u32| {
+        let value = f64::from((theme.editor_background >> shift) & 0xff) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(16) + 0.7152 * linear(8) + 0.0722 * linear(0);
+    luminance.cbrt() < 0.5
+}
+
+/// The color a segment's text takes while its ink is wet, or `None` when the
+/// segment keeps the color it already has: dry text, a document-find match and
+/// the IME composition are never recolored. The base is the color the segment
+/// would otherwise be painted in, in the renderer's own priority order.
+fn segment_ink_color(
+    segment: &LineSegment,
+    level: u8,
+    display: BlockDisplay,
+    theme: &Theme,
+    params: &crate::ink::InkParams,
+) -> Option<u32> {
+    if level == 0 || segment.find_match || segment.marked {
+        return None;
+    }
+    let base = if segment.display.link_color {
+        link_text_color(*theme, segment.link_hover)
+    } else if let Some(tone) = segment_syntax_tone(segment) {
+        syntax_tone_color(theme, tone)
+    } else if display.tint == BlockTint::Muted {
+        theme.quote_foreground
+    } else {
+        theme.foreground
+    };
+    Some(ink_color(base, level, params.delta_l, theme_is_dark(theme)))
+}
+
 /// One row of a block: the text that fits on it, with the caret, selection and
 /// IME underline that fall inside it.
 ///
@@ -1078,6 +1260,7 @@ pub(crate) fn row_element(
     find_current_match: Option<SourceRange>,
     link_hover: Option<SourceRange>,
     diagram: Option<&DiagramPaint>,
+    ink: &InkFrame,
 ) -> Div {
     let row = &layout.lines[row_index];
     let line = &block.lines[row.line];
@@ -1218,6 +1401,7 @@ pub(crate) fn row_element(
             find_matches,
             find_current_match,
             link_hover,
+            ink,
         );
     }
 
@@ -1273,6 +1457,7 @@ pub(crate) fn row_element(
             find_matches,
             find_current_match,
             link_hover,
+            ink,
         );
     }
 
@@ -1295,7 +1480,10 @@ pub(crate) fn row_element(
     let (match_visuals, current_match_visual) =
         row_find_match_visuals(block, layout, row_index, find_matches, find_current_match);
     let hover_visuals = link_hover_visuals(line, link_hover);
-    let segments = line_segments_with_hover(
+    let ink_visuals = row_ink_visuals(block, layout, row_index, ink);
+    let band_visual = row_band_visual(block, layout, row_index, ink);
+    let ink_edges = ink_split_edges(&ink_visuals, band_visual.as_ref());
+    let segments = line_segments_with_ink(
         row.line_visual_range.clone(),
         visual_cursor.map(|offset| offset.0),
         selected_visual,
@@ -1308,6 +1496,7 @@ pub(crate) fn row_element(
         row.body_visual_start,
         &link_boundary_visuals(line),
         &hover_visuals,
+        &ink_edges,
     );
     let body_gap_segment = body_gap_segment(row, &segments);
     let mut elements = Vec::with_capacity(segments.len() * 2 + 1);
@@ -1319,6 +1508,8 @@ pub(crate) fn row_element(
             elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
         }
         if !segment.visual_range.is_empty() {
+            let band_opacity = band_opacity_for(&segment.visual_range, band_visual.as_ref())
+                .filter(|_| segment_shows_band(segment));
             elements.push(
                 div()
                     // Selection wins outright over a match highlight when
@@ -1336,6 +1527,10 @@ pub(crate) fn row_element(
                         !segment.selected && !segment.find_current_match && segment.find_match,
                         |element| element.bg(rgb(theme.find_match_background)),
                     )
+                    // Lowest background priority: the drying-ink band.
+                    .when_some(band_opacity, |element, opacity| {
+                        element.bg(band_fill(&theme, &ink.params, opacity))
+                    })
                     .when(segment.marked || segment.display.underline, |element| {
                         element.underline()
                     })
@@ -1349,9 +1544,12 @@ pub(crate) fn row_element(
                     .when(segment.display.monospace, |element| {
                         element.font_family("ui-monospace")
                     })
-                    .when(segment_shows_code_background(segment), |element| {
-                        element.text_bg(rgb(theme.code_background))
-                    })
+                    // `text_bg` paints above `bg`, so inside the band it would
+                    // hide the band.
+                    .when(
+                        segment_shows_code_background(segment) && band_opacity.is_none(),
+                        |element| element.text_bg(rgb(theme.code_background)),
+                    )
                     // Before the link color, so a link (hover included) wins if
                     // both are ever set on one stretch.
                     .when_some(segment_syntax_tone(segment), |element, tone| {
@@ -1360,6 +1558,17 @@ pub(crate) fn row_element(
                     .when(segment.display.link_color, |element| {
                         element.text_color(rgb(link_text_color(theme, segment.link_hover)))
                     })
+                    // Last, so wet ink overrides the final color of the stretch.
+                    .when_some(
+                        segment_ink_color(
+                            segment,
+                            ink_level_for(&segment.visual_range, &ink_visuals),
+                            display,
+                            &theme,
+                            &ink.params,
+                        ),
+                        |element, color| element.text_color(rgb(color)),
+                    )
                     .child(line.visual_text[segment.visual_range.clone()].to_owned())
                     .into_any_element(),
             );
@@ -1430,7 +1639,10 @@ fn table_row_element(
     find_matches: &[SourceRange],
     find_current_match: Option<SourceRange>,
     link_hover: Option<SourceRange>,
+    ink: &InkFrame,
 ) -> Div {
+    let ink_visuals = row_ink_visuals(block, layout, row_index, ink);
+    let band_visual = row_band_visual(block, layout, row_index, ink);
     let hover_visuals = link_hover_visuals(line, link_hover);
     let all_link_visuals = link_boundary_visuals(line);
     let selection = editor.selection().range();
@@ -1533,8 +1745,15 @@ fn table_row_element(
                 // Only a stretch the formal projection marked as a link, a
                 // strikethrough or a code span needs the per-segment path;
                 // everything else keeps the single-text fast path.
+                let fragment_ink = clip_ink_visuals(&ink_visuals, fragment_range.clone());
+                let fragment_band = band_visual.as_ref().and_then(|(range, opacity)| {
+                    clip_visual_range(Some(range), fragment_range.clone())
+                        .map(|clipped| (clipped, *opacity))
+                });
                 let fragment_has_link =
-                    table_fragment_needs_segments(&line.style_runs, &fragment_range);
+                    table_fragment_needs_segments(&line.style_runs, &fragment_range)
+                        || !fragment_ink.is_empty()
+                        || fragment_band.is_some();
                 let fragment_hover = clip_visual_ranges(&hover_visuals, fragment_range.clone());
                 let fragment_links = clip_visual_ranges(&all_link_visuals, fragment_range.clone());
                 if fragment_selected.is_none()
@@ -1569,7 +1788,7 @@ fn table_row_element(
                         .child(text);
                     vec![text_element]
                 } else {
-                    line_segments_with_hover(
+                    line_segments_with_ink(
                         fragment_range.clone(),
                         None,
                         fragment_selected,
@@ -1582,10 +1801,14 @@ fn table_row_element(
                         None,
                         &fragment_links,
                         &fragment_hover,
+                        &ink_split_edges(&fragment_ink, fragment_band.as_ref()),
                     )
                     .into_iter()
                     .filter(|segment| !segment.visual_range.is_empty())
                     .map(|segment| {
+                        let band_opacity =
+                            band_opacity_for(&segment.visual_range, fragment_band.as_ref())
+                                .filter(|_| segment_shows_band(&segment));
                         let x = fragment.text_x - cell_layout.x
                             + shaper.x_for_offset(
                                 line,
@@ -1612,6 +1835,9 @@ fn table_row_element(
                                     && segment.find_match,
                                 |element| element.bg(rgb(theme.find_match_background)),
                             )
+                            .when_some(band_opacity, |element, opacity| {
+                                element.bg(band_fill(&theme, &ink.params, opacity))
+                            })
                             .when(segment.marked || segment.display.underline, |element| {
                                 element.underline()
                             })
@@ -1628,9 +1854,10 @@ fn table_row_element(
                             .when(segment.display.monospace, |element| {
                                 element.font_family("ui-monospace")
                             })
-                            .when(segment_shows_code_background(&segment), |element| {
-                                element.text_bg(rgb(theme.code_background))
-                            })
+                            .when(
+                                segment_shows_code_background(&segment) && band_opacity.is_none(),
+                                |element| element.text_bg(rgb(theme.code_background)),
+                            )
                             .when(segment.display.link_color, |element| {
                                 let selector = format!(
                                     "table-cell-link-{}-{}-{}",
@@ -1640,6 +1867,16 @@ fn table_row_element(
                                     .text_color(rgb(link_text_color(theme, segment.link_hover)))
                                     .debug_selector(move || selector.clone())
                             })
+                            .when_some(
+                                segment_ink_color(
+                                    &segment,
+                                    ink_level_for(&segment.visual_range, &fragment_ink),
+                                    display,
+                                    &theme,
+                                    &ink.params,
+                                ),
+                                |element, color| element.text_color(rgb(color)),
+                            )
                             .child(line.visual_text[segment.visual_range].to_owned())
                     })
                     .collect::<Vec<_>>()
@@ -1878,6 +2115,16 @@ fn clip_visual_ranges(sources: &[Range<usize>], bounds: Range<usize>) -> Vec<Ran
         .collect()
 }
 
+/// A table cell/fragment's share of the row's wet ink ranges.
+fn clip_ink_visuals(sources: &[(Range<usize>, u8)], bounds: Range<usize>) -> Vec<(Range<usize>, u8)> {
+    sources
+        .iter()
+        .filter_map(|(source, level)| {
+            clip_visual_range(Some(source), bounds.clone()).map(|clipped| (clipped, *level))
+        })
+        .collect()
+}
+
 /// A row's (or a table fragment's) share of the document-find highlight:
 /// `matches` are the match visual ranges (already clipped to the row, and in
 /// source order; see `BlockLayout::visual_range_on_row`), and `current` is
@@ -1910,6 +2157,8 @@ fn line_segments(
     )
 }
 
+/// [`line_segments_with_ink`] without any wet ink.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn line_segments_with_hover(
     bounds: Range<usize>,
@@ -1921,6 +2170,35 @@ fn line_segments_with_hover(
     body_visual_start: Option<usize>,
     link_ranges: &[Range<usize>],
     link_hover: &[Range<usize>],
+) -> Vec<LineSegment> {
+    line_segments_with_ink(
+        bounds,
+        cursor,
+        selected,
+        marked,
+        find,
+        style_runs,
+        body_visual_start,
+        link_ranges,
+        link_hover,
+        &[],
+    )
+}
+
+/// `ink` holds the wet ink ranges (already widened to grapheme clusters) whose
+/// edges split the text like any other boundary; an empty slice adds none.
+#[allow(clippy::too_many_arguments)]
+fn line_segments_with_ink(
+    bounds: Range<usize>,
+    cursor: Option<usize>,
+    selected: Option<Range<usize>>,
+    marked: Option<Range<usize>>,
+    find: FindHighlight<'_>,
+    style_runs: &[hane_presentation::StyleRun],
+    body_visual_start: Option<usize>,
+    link_ranges: &[Range<usize>],
+    link_hover: &[Range<usize>],
+    ink: &[(Range<usize>, u8)],
 ) -> Vec<LineSegment> {
     // Every link edge splits the text whether or not a link is hovered, so the
     // shaped runs (and therefore the geometry) do not change on hover.
@@ -1942,6 +2220,10 @@ fn line_segments_with_hover(
     for run in style_runs {
         boundaries.push(run.visual_range.start.0);
         boundaries.push(run.visual_range.end.0);
+    }
+    for (range, _) in ink {
+        boundaries.push(range.start);
+        boundaries.push(range.end);
     }
     partition(bounds, boundaries)
         .into_iter()
@@ -2269,6 +2551,173 @@ mod tests {
             .iter()
             .filter(|segment| segment.visual_range.start >= 2 && segment.visual_range.end <= 8)
             .all(|segment| segment.link_hover));
+    }
+
+    fn plain_segment() -> LineSegment {
+        LineSegment {
+            visual_range: 0..1,
+            selected: false,
+            marked: false,
+            cursor_before: false,
+            find_match: false,
+            find_current_match: false,
+            display: InlineDisplay::default(),
+            link_hover: false,
+        }
+    }
+
+    #[test]
+    fn grapheme_expansion_never_splits_a_cluster() {
+        // "e" + combining acute (bytes 0..3), then "x".
+        let text = "e\u{301}x";
+        assert_eq!(expand_to_grapheme_boundaries(text, 1..3), 0..3);
+        assert_eq!(expand_to_grapheme_boundaries(text, 0..1), 0..3);
+        assert_eq!(expand_to_grapheme_boundaries(text, 3..4), 3..4);
+        // A ZWJ family emoji is one cluster.
+        let family = "a\u{1F468}\u{200D}\u{1F469}b";
+        let end = family.len() - 1;
+        assert_eq!(expand_to_grapheme_boundaries(family, 2..end - 1), 1..end);
+        assert_eq!(expand_to_grapheme_boundaries("abc", 1..2), 1..2);
+    }
+
+    #[test]
+    fn ink_ranges_split_segments_and_empty_ink_changes_nothing() {
+        let run = |ink: &[(Range<usize>, u8)]| {
+            line_segments_with_ink(
+                0..6,
+                None,
+                None,
+                None,
+                FindHighlight {
+                    matches: &[],
+                    current: None,
+                },
+                &[],
+                None,
+                &[],
+                &[],
+                ink,
+            )
+            .into_iter()
+            .map(|segment| segment.visual_range)
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(run(&[]), vec![0..6]);
+        let ink = [(2..4, 3)];
+        assert_eq!(run(&ink), vec![0..2, 2..4, 4..6]);
+        assert_eq!(ink_level_for(&(2..4), &ink), 3);
+        assert_eq!(ink_level_for(&(0..2), &ink), 0);
+        assert_eq!(ink_level_for(&(2..5), &ink), 0);
+    }
+
+    #[test]
+    fn wet_ink_recolors_plain_text_but_not_matches_or_composition() {
+        use crate::theme::{DARK_THEME, DEFAULT_THEME};
+        let params = crate::ink::InkParams::default();
+        let display = BlockDisplay::default();
+        let plain = plain_segment();
+        let wet = segment_ink_color(&plain, 4, display, &DEFAULT_THEME, &params)
+            .expect("wet text is recolored");
+        assert_ne!(wet, DEFAULT_THEME.foreground);
+        assert_eq!(
+            segment_ink_color(&plain, 0, display, &DEFAULT_THEME, &params),
+            None
+        );
+        let matched = LineSegment {
+            find_match: true,
+            ..plain_segment()
+        };
+        assert_eq!(
+            segment_ink_color(&matched, 4, display, &DEFAULT_THEME, &params),
+            None
+        );
+        let composing = LineSegment {
+            marked: true,
+            ..plain_segment()
+        };
+        assert_eq!(
+            segment_ink_color(&composing, 4, display, &DEFAULT_THEME, &params),
+            None
+        );
+        assert!(!theme_is_dark(&DEFAULT_THEME));
+        assert!(theme_is_dark(&DARK_THEME));
+    }
+
+    #[test]
+    fn band_edges_split_segments_without_recoloring() {
+        let band = (2..5, 1.0_f32);
+        let edges = ink_split_edges(&[(0..1, 2)], Some(&band));
+        assert_eq!(edges, vec![(0..1, 2), (2..5, 0)]);
+        assert_eq!(ink_split_edges(&[(0..1, 2)], None), vec![(0..1, 2)]);
+        let segments = line_segments_with_ink(
+            0..8,
+            None,
+            None,
+            None,
+            FindHighlight {
+                matches: &[],
+                current: None,
+            },
+            &[],
+            None,
+            &[],
+            &[],
+            &edges,
+        );
+        let ranges = segments
+            .iter()
+            .map(|segment| segment.visual_range.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(ranges, vec![0..1, 1..2, 2..5, 5..8]);
+        // The band's level-0 entry never wets the text.
+        assert_eq!(ink_level_for(&(2..5), &edges), 0);
+        assert_eq!(band_opacity_for(&(2..5), Some(&band)), Some(1.0));
+        assert_eq!(band_opacity_for(&(3..4), Some(&band)), Some(1.0));
+        assert_eq!(band_opacity_for(&(1..3), Some(&band)), None);
+        assert_eq!(band_opacity_for(&(2..5), None), None);
+    }
+
+    #[test]
+    fn selection_and_find_matches_keep_their_own_background_over_the_band() {
+        assert!(segment_shows_band(&plain_segment()));
+        let selected = LineSegment {
+            selected: true,
+            ..plain_segment()
+        };
+        assert!(!segment_shows_band(&selected));
+        let matched = LineSegment {
+            find_match: true,
+            ..plain_segment()
+        };
+        assert!(!segment_shows_band(&matched));
+        let current = LineSegment {
+            find_match: true,
+            find_current_match: true,
+            ..plain_segment()
+        };
+        assert!(!segment_shows_band(&current));
+    }
+
+    #[test]
+    fn band_fill_uses_the_token_at_standard_strength_and_fades_by_alpha() {
+        use crate::theme::{DARK_THEME, DEFAULT_THEME};
+        let params = crate::ink::InkParams::default();
+        assert_eq!(
+            band_fill(&DEFAULT_THEME, &params, 1.0),
+            rgba((DEFAULT_THEME.ink_band_background << 8) | 0xff)
+        );
+        assert_eq!(
+            band_fill(&DARK_THEME, &params, 0.5),
+            rgba((DARK_THEME.ink_band_background << 8) | 0x80)
+        );
+        let strong = crate::ink::InkParams {
+            band_delta_l: 0.045,
+            ..params
+        };
+        assert_ne!(
+            band_fill(&DEFAULT_THEME, &strong, 1.0),
+            band_fill(&DEFAULT_THEME, &params, 1.0)
+        );
     }
 
     #[test]

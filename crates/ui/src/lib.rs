@@ -13,6 +13,7 @@ mod clipboard;
 mod clipboard_image;
 pub mod context_menu;
 mod icons;
+mod ink;
 mod input;
 mod input_mode;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
@@ -21,6 +22,7 @@ mod line;
 mod mermaid;
 mod proxy_secret;
 mod ranges;
+mod reduce_motion;
 mod shape;
 mod short_text_input;
 
