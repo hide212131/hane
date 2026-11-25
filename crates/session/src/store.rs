@@ -181,6 +181,12 @@ pub struct Settings {
     /// until the user turns it on; a missing key, any value other than `true`,
     /// and a settings file that cannot be read all mean off.
     pub whisparrot_link: bool,
+    /// Whether voice composition (recognized speech shown as unconfirmed
+    /// segments in the body) is on (`voice_composition` key). Off until the
+    /// user turns it on, like `whisparrot_link`, and mutually exclusive with
+    /// it: when a file says `true` for both, voice composition wins and the
+    /// link is off.
+    pub voice_composition: bool,
 }
 
 impl Default for Settings {
@@ -199,6 +205,7 @@ impl Default for Settings {
             drying_ink_speed: DryingInkSpeed::default(),
             drying_ink_strength: DryingInkStrength::default(),
             whisparrot_link: false,
+            voice_composition: false,
         }
     }
 }
@@ -584,7 +591,7 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\ndrying_ink_band={}\ndrying_ink_speed={}\ndrying_ink_strength={}\nwhisparrot_link={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\ndrying_ink_band={}\ndrying_ink_speed={}\ndrying_ink_strength={}\nwhisparrot_link={}\nvoice_composition={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
@@ -595,7 +602,8 @@ impl SettingsRepository for FileStateStore {
             settings.drying_ink_band,
             settings.drying_ink_speed.as_str(),
             settings.drying_ink_strength.as_str(),
-            settings.whisparrot_link
+            settings.whisparrot_link && !settings.voice_composition,
+            settings.voice_composition
         );
         if let Some(folder) = &settings.default_folder {
             contents.push_str("default_folder=");
@@ -654,7 +662,12 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.drying_ink_strength = DryingInkStrength::parse(value);
                 } else if let Some(value) = line.strip_prefix("whisparrot_link=") {
                     settings.whisparrot_link = value == "true";
+                } else if let Some(value) = line.strip_prefix("voice_composition=") {
+                    settings.voice_composition = value == "true";
                 }
+            }
+            if settings.voice_composition {
+                settings.whisparrot_link = false;
             }
             settings.network = parse_network_config(network);
         }
@@ -1017,6 +1030,7 @@ mod tests {
             drying_ink_speed: DryingInkSpeed::Slow,
             drying_ink_strength: DryingInkStrength::Strong,
             whisparrot_link: true,
+            voice_composition: false,
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -1231,6 +1245,7 @@ mod tests {
                     drying_ink_speed: DryingInkSpeed::Standard,
                     drying_ink_strength: DryingInkStrength::Standard,
                     whisparrot_link: false,
+                    voice_composition: false,
                 })
                 .unwrap();
         }
@@ -1468,6 +1483,30 @@ mod tests {
         let loaded = SettingsRepository::load(&FileStateStore::at(&root));
         assert!(loaded.whisparrot_link);
         assert!(!loaded.autosave);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn voice_composition_is_off_unless_stored_as_true_and_beats_the_link() {
+        assert!(!Settings::default().voice_composition);
+        assert!(!load_after_writing("autosave=true\n").voice_composition);
+        for value in ["false", "", "TRUE", "1", "true "] {
+            let loaded = load_after_writing(&format!("voice_composition={value}\n"));
+            assert!(!loaded.voice_composition, "value {value:?}");
+        }
+        let loaded = load_after_writing("whisparrot_link=true\nvoice_composition=true\n");
+        assert!(loaded.voice_composition);
+        assert!(!loaded.whisparrot_link);
+        let root = temporary_directory("state-voice-composition");
+        let store = FileStateStore::at(&root);
+        let settings = Settings {
+            voice_composition: true,
+            whisparrot_link: true,
+            ..Settings::default()
+        };
+        SettingsRepository::store(&store, &settings).unwrap();
+        let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+        assert!(text.contains("whisparrot_link=false\nvoice_composition=true\n"));
         fs::remove_dir_all(root).unwrap();
     }
 

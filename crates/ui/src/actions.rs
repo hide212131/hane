@@ -315,6 +315,14 @@ command_actions! {
     SaveAs ("secondary-shift-s") => save_as |view, _window, cx| {
         if !view.inline_rename_active() { view.prompt_save_as(cx); }
     },
+    // Voice composition P1 (debug and review). Each does nothing unless the
+    // setting is on.
+    VoiceDebugStep ("f8") => voice_debug_step_action |view, _window, cx| { view.voice_debug_step(cx); },
+    VoiceDebugRun ("shift-f8") => voice_debug_run_action |view, _window, cx| { view.voice_debug_run(cx); },
+    VoiceDebugCancel ("alt-f8") => voice_debug_cancel_action |view, _window, cx| { view.voice_debug_cancel(cx); },
+    VoiceFocusNext ("f9") => voice_focus_next_action |view, _window, cx| { view.voice_focus_next(cx); },
+    VoiceCommitAll ("shift-f9") => voice_commit_all_action |view, _window, cx| { view.voice_commit_all(cx); },
+    VoiceDiscardAll ("alt-f9") => voice_discard_all_action |view, _window, cx| { view.voice_discard_all(cx); },
     ToggleAutosave ("secondary-alt-a") => toggle_autosave_action |view, _window, cx| { view.toggle_autosave(cx); },
     NextFileTab ("ctrl-tab") => next_file_tab_action |view, _window, cx| {
         if view.content_search_input_is_focused() || view.content_search_results_focused() || view.document_find_input_is_focused() || view.ai_selection_blocks_editor_keys() {
@@ -446,6 +454,14 @@ command_actions! {
     },
     Indent ("tab") => indent |view, window, cx| {
         if view.ai_selection_handle_tab(true, window, cx) {
+            return;
+        }
+        // A voice segment with the operation focus takes Tab (adopt the
+        // polished text); an IME composition and the body keep it otherwise.
+        if matches!(view.input_target(), InputTarget::Body)
+            && view.editor().ime().is_none()
+            && view.voice_handle_tab(cx)
+        {
             return;
         }
         if view.document_find_input_is_focused() {
@@ -847,6 +863,12 @@ command_actions! {
         }
         if view.document_find_should_leave_on_escape() {
             view.leave_document_find(window, cx);
+            return;
+        }
+        if matches!(view.input_target(), InputTarget::Body)
+            && view.editor().ime().is_none()
+            && view.voice_handle_escape(cx)
+        {
             return;
         }
         match view.input_target() {

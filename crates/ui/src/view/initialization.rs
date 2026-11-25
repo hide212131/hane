@@ -292,6 +292,7 @@ impl EditorView {
             joined_parse_jobs_running: 0,
             mermaid: MermaidStore::new(),
             drying_ink: drying_ink::DryingInkState::new(ink_epoch),
+            voice: voice_composition::VoiceViewState::default(),
             _mermaid_release_subscription: mermaid_release_subscription,
         }
     }

@@ -31,6 +31,7 @@ mod ime;
 mod movement;
 mod replace;
 mod selection;
+mod voice;
 
 pub use find::{
     FindNavigation, FindOptions, FindQuery, FindQueryError, FindResults, FindScan, MAX_MATCHES,
@@ -41,6 +42,11 @@ pub use replace::{ReplacePlan, ReplacePlanError, plan_replace_all};
 pub use ime::{ImeCancelOutcome, ImeState, utf16_range_to_byte};
 pub use movement::ForwardStop;
 pub use selection::Selection;
+pub use voice::{
+    EndStatus, IgnoreReason, MAX_HELD_BYTES, MAX_HELD_ITEMS, MAX_SEGMENT_BYTES, MAX_SEGMENTS,
+    OffsetMap, PolishMode, PolishResult, PolishState, RawStatus, VoiceApply, VoiceChoice,
+    VoiceComposition, VoiceEnvelope, VoiceError, VoiceEvent, VoiceSegment,
+};
 
 use hane_document::{BufferError, EditSummary, RopeBuffer, SourceOffset, SourceRange, TextBuffer};
 use hane_metrics::RollingWindow;
@@ -136,6 +142,9 @@ pub struct Editor {
     /// Rewrites that touched the composed region and so wait for the
     /// composition to end; see [`Editor::defer_rewrite`].
     deferred_rewrites: Vec<Arc<RewritePlan>>,
+    /// Unconfirmed voice segments; never part of the document (see `voice`).
+    pub(crate) voice: Option<VoiceComposition>,
+    pub(crate) voice_notice: Option<String>,
 }
 
 /// The document and history a rewrite is prepared from; see
@@ -198,6 +207,8 @@ impl Editor {
             pending_measurements: RollingWindow::new(2_048),
             history: History::default(),
             deferred_rewrites: Vec::new(),
+            voice: None,
+            voice_notice: None,
         }
     }
 
@@ -365,6 +376,10 @@ impl Editor {
         self.history.break_group();
         self.commit_composition();
         self.document.validate_range(range)?;
+        let map = self.voice_guard(range)?;
+        // Every confirmed segment sat inside `range`, so the replacement
+        // swallows it and `selection_after` is already in the new text's terms.
+        let range = map.map_range(range);
         let next_len = self
             .document
             .len_bytes()
@@ -728,6 +743,7 @@ impl Editor {
         kind: EditKind,
         now: Instant,
     ) -> Result<EditSummary, BufferError> {
+        self.voice_guard(self.selection.range())?;
         let before = self.selection;
         let summary = self.replace_selection(text)?;
         self.history
@@ -742,6 +758,8 @@ impl Editor {
         kind: EditKind,
         now: Instant,
     ) -> Result<EditSummary, BufferError> {
+        let map = self.voice_guard(self.selection.range())?;
+        let selection_before = map.map_selection(selection_before);
         let summary = self.replace_selection(text)?;
         self.history
             .record(&summary, text, selection_before, self.selection, kind, now);

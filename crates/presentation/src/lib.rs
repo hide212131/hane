@@ -43,6 +43,7 @@ mod layout;
 mod projection;
 mod source_map;
 pub mod testing;
+mod virtual_text;
 
 pub use hane_markdown::TableAlignment;
 
@@ -79,6 +80,9 @@ pub use projection::{
 // `layout` calls these directly as `crate::...`; keep them reachable crate-wide
 // without adding them to the public API above.
 use projection::{present_table_line, table_row_from_projection};
+pub use virtual_text::{
+    VirtualInsert, VirtualPlacement, accepts_virtual_text, splice_virtual_text, visual_position,
+};
 pub use source_map::{
     BoundarySide, MappingSegment, MarkerEdge, PositionCandidate, SourceMap, Visibility,
     VisualOffset, VisualRange,

@@ -139,6 +139,7 @@ use mermaid_diagrams::diagram_plan_matches;
 mod network_settings;
 pub use network_settings::NetworkSettingsApplier;
 mod plain_text_mode;
+mod voice_composition;
 mod whisparrot_link;
 pub use whisparrot_link::{LinkCall, LinkWindow, WhisparrotLinkController, run_link_call};
 use whisparrot_link::LinkViewState;
@@ -1343,6 +1344,9 @@ pub struct EditorView {
     /// as it dries (Issue #779). Display only, and emptied whenever another
     /// document replaces this one.
     drying_ink: drying_ink::DryingInkState,
+    /// Unconfirmed voice segments' view state (voice composition P1). Display
+    /// only: the segments live in the editor, never in the document.
+    voice: voice_composition::VoiceViewState,
     /// Hands the pictures back to the window when the view is released; dropping
     /// it would cancel the hook.
     _mermaid_release_subscription: Subscription,
@@ -2643,6 +2647,7 @@ impl EditorView {
 
     /// Rebuilds the view state that only makes sense for one document instance.
     fn on_document_replaced(&mut self) {
+        self.voice_on_document_replaced();
         // A running Paste conversion belongs to the document it started on. A
         // round trip A -> B -> A restores the same session, instance, revision
         // and selection, so the freshness check cannot tell it apart (Issue
@@ -2698,6 +2703,7 @@ impl EditorView {
         self.mermaid.reset();
         // Wet ranges and the timer belong to the document that was on screen.
         self.drying_ink.reset();
+        self.voice.stamps_reset();
     }
 
     /// Carries each ancestor folder's just-fetched real modified time into
@@ -2745,6 +2751,8 @@ impl EditorView {
     }
 
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
+        // Any edit or caret move hands Tab / Esc back to the body.
+        self.voice.focus = None;
         // Let the drying-ink ledger follow this edit before anything else
         // looks at the document.
         self.sync_drying_ink();
@@ -5426,7 +5434,9 @@ impl EditorView {
             // A plain-text block is always `Unsupported` and has no disclosure
             // or diagram to agree with, so only its identity and coverage count.
             let plain_reusable = self.plain_text() && cached.matches_plain(block);
+            let voice_stamp = self.voice_block_stamp(block.source_range);
             if reusable
+                && self.voice_stamp_matches(block.id, voice_stamp)
                 && if plain_reusable {
                     cached.covers(visible)
                 } else {
@@ -5465,6 +5475,12 @@ impl EditorView {
             },
             diagram.as_ref(),
         )?;
+        let mut presented = presented;
+        let voice_stamp = self.voice_block_stamp(block.source_range);
+        if voice_stamp != 0 {
+            self.voice_inject(block.source_range, &mut presented);
+        }
+        self.voice_record_stamp(block.id, voice_stamp);
         self.block_cache.insert(block.id, presented.clone());
         Some((presented, false))
     }

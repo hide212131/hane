@@ -24,6 +24,12 @@ pub enum Visibility {
     HiddenMarkup,
     Synthesized,
     ExpandedMarkup,
+    /// Text that is only drawn (voice composition), with an empty source
+    /// range. A source offset that has such text resolves to the visual
+    /// position in front of it, so the caret, a selection end and a typed
+    /// character land before the pending text; clicking inside the text
+    /// resolves to that same offset.
+    Virtual,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,7 +97,7 @@ impl SourceMap {
                     Bias::Before => segment.source_range.start,
                     Bias::After => segment.source_range.end,
                 },
-                Visibility::Synthesized => segment.source_range.start,
+                Visibility::Synthesized | Visibility::Virtual => segment.source_range.start,
             };
             Some(PositionCandidate {
                 source_offset: source,
@@ -134,9 +140,33 @@ impl SourceMap {
         source: SourceOffset,
         affinity: Bias,
     ) -> Option<PositionCandidate> {
+        // Text that is only drawn sits after the caret: the offset resolves to
+        // the start of the first such piece.
+        let virtual_start = self
+            .segments
+            .iter()
+            .filter(|segment| {
+                segment.visibility == Visibility::Virtual && segment.source_range.start == source
+            })
+            .map(|segment| segment.visual_range.start)
+            .min();
+        if let Some(visual_offset) = virtual_start {
+            return Some(PositionCandidate {
+                source_offset: source,
+                visual_offset,
+                affinity,
+                side: if affinity == Bias::Before {
+                    BoundarySide::Leading
+                } else {
+                    BoundarySide::Trailing
+                },
+                visibility: Visibility::Visible,
+            });
+        }
         let mut candidates = self
             .segments
             .iter()
+            .filter(|segment| segment.visibility != Visibility::Virtual)
             .filter_map(|segment| {
                 if source.0 < segment.source_range.start.0 || source.0 > segment.source_range.end.0
                 {
@@ -151,7 +181,7 @@ impl SourceMap {
                         Bias::Before => segment.visual_range.start,
                         Bias::After => segment.visual_range.end,
                     },
-                    Visibility::Synthesized => segment.visual_range.start,
+                    Visibility::Synthesized | Visibility::Virtual => segment.visual_range.start,
                 };
                 Some(PositionCandidate {
                     source_offset: source,
