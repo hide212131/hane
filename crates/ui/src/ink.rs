@@ -160,6 +160,7 @@ impl InkLedger {
             }
         }
         self.spans = next;
+        self.enforce_span_cap();
         self.pending_band = self
             .pending_band
             .and_then(|range| hull(rebase_range(range, delta)));
@@ -267,6 +268,11 @@ impl InkLedger {
         if index + 1 < self.spans.len() && self.mergeable(index, index + 1) {
             self.merge_into_previous(index + 1);
         }
+        self.enforce_span_cap();
+    }
+
+    /// Discards the oldest spans until at most `MAX_SPANS` remain.
+    fn enforce_span_cap(&mut self) {
         while self.spans.len() > MAX_SPANS {
             let oldest = self
                 .spans
@@ -857,6 +863,39 @@ mod tests {
         assert_eq!(ledger.spans.len(), MAX_SPANS);
         assert_eq!(ledger.spans[0].range.start.0, (600 - MAX_SPANS) * 2);
         assert_eq!(ledger.spans.last().unwrap().range.start.0, 599 * 2);
+    }
+
+    #[test]
+    fn splitting_edit_keeps_span_count_within_cap() {
+        let t = base();
+        let p = InkParams::default();
+        let mut buffer = doc(3000);
+        let mut ledger = InkLedger::new(t);
+        ledger.sync(owner(1), &buffer);
+        for i in 0..MAX_SPANS {
+            let start = i * 4;
+            let at = t + secs(10 * u64::try_from(i).unwrap());
+            ledger.record_commit(SourceRange::new(start, start + 3), "a", at, &p);
+        }
+        assert_eq!(ledger.spans.len(), MAX_SPANS);
+
+        // Inserting inside the span at 1200..1203 splits it in two.
+        buffer.edit(SourceRange::empty(1201), "X").unwrap();
+        ledger.sync(owner(1), &buffer);
+
+        assert_eq!(ledger.spans.len(), MAX_SPANS);
+        // The oldest span (0..3) was dropped.
+        assert_eq!(ledger.spans[0].range, SourceRange::new(4, 7));
+        let split_time = t + secs(10 * 300);
+        let pieces: Vec<_> = ledger
+            .spans
+            .iter()
+            .filter(|span| span.committed_at == split_time)
+            .map(|span| (span.range.start.0, span.range.end.0))
+            .collect();
+        assert_eq!(pieces, vec![(1200, 1201), (1202, 1204)]);
+        // Spans after the edit are shifted by one byte.
+        assert_eq!(ledger.spans.last().unwrap().range, SourceRange::new(2045, 2048));
     }
 
     // --- levels ---
