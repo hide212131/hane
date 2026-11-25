@@ -962,7 +962,14 @@ fn exit_top_level_item(source: &str, item: &ListEditItem) -> MarkdownEditPlan {
     let has_previous = line_start > 0;
     let has_following = after_line < source.len();
 
-    let left_separator = if has_previous && !previous_line_is_blank(source, line_start) {
+    // Nothing but ASCII space/tab and line terminators after this item: the
+    // exit is at the document tail, so only the marker is removed (#767).
+    let is_trailing = source.as_bytes()[after_line..]
+        .iter()
+        .all(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'));
+
+    let left_separator = if has_previous && !is_trailing && !previous_line_is_blank(source, line_start)
+    {
         line_terminator_before(source, line_start)
     } else {
         ""
@@ -1325,7 +1332,7 @@ mod tests {
         assert_edit("- abc\n- def", 11, enter, "- abc\n- def\n- ", 14);
         assert_edit("- abc\n+ def", 11, enter, "- abc\n+ def\n+ ", 14);
         assert_edit("1. abc\n2. def", 13, enter, "1. abc\n2. def\n3. ", 17);
-        assert_edit("- abc\n- ", 8, enter, "- abc\n\n", 7);
+        assert_edit("- abc\n- ", 8, enter, "- abc\n", 6);
         assert_edit("- abc", 4, enter, "- ab\n- c", 7);
     }
 
@@ -1743,37 +1750,50 @@ mod tests {
         assert_eq!(result, ListEditPlanResult::NotApplicable);
     }
 
-    /// Issue #460 / E01: exiting the trailing empty top-level item must make
-    /// the next typed line a real paragraph, not a lazy continuation of the
-    /// previous item's body.
+    /// Issue #767 / E01: exiting the trailing empty top-level item only removes
+    /// the marker; no separator line is inserted at the document tail.
     #[test]
-    fn backspace_on_trailing_empty_top_level_item_creates_paragraph_boundary() {
+    fn backspace_on_trailing_empty_top_level_item_removes_only_the_marker() {
         let text = "- abc\n- def\n- ";
         let (after_exit, caret) = replacement(text, text.len(), ListEditIntent::Backspace);
-        assert_eq!(after_exit, "- abc\n- def\n\n");
+        assert_eq!(after_exit, "- abc\n- def\n");
         assert_eq!(caret, after_exit.len());
+    }
 
-        let mut typed = after_exit;
-        typed.insert_str(caret, "ghi");
-        assert_eq!(typed, "- abc\n- def\n\nghi");
+    /// Issue #767: trailing exit cases (document tail, ASCII blank-only tail)
+    /// for both Enter and Backspace, with LF / CRLF / ordered markers.
+    #[test]
+    fn trailing_exit_removes_only_the_marker_without_separator() {
+        let cases: &[(&str, usize, &str, usize)] = &[
+            ("- abc\n- ", 8, "- abc\n", 6),
+            ("- abc\n- \n", 8, "- abc\n\n", 6),
+            ("- abc\r\n- ", 9, "- abc\r\n", 7),
+            ("- abc\r\n- \r\n", 9, "- abc\r\n\r\n", 7),
+            ("3. A\n4. ", 8, "3. A\n", 5),
+            ("3. A\n4. \n", 8, "3. A\n\n", 5),
+            ("- abc\n- \n\n \t", 8, "- abc\n\n\n \t", 6),
+        ];
+        for &(text, caret, expected, expected_caret) in cases {
+            for intent in [ListEditIntent::Backspace, ListEditIntent::Enter] {
+                assert_eq!(
+                    replacement(text, caret, intent),
+                    (expected.to_string(), expected_caret),
+                    "{text:?} {intent:?}"
+                );
+            }
+        }
+    }
 
-        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
-        let last_paragraph = parsed
-            .tree
-            .iter()
-            .rfind(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
-            .expect("expected a trailing paragraph for \"ghi\"");
-        assert!(
-            !parsed
-                .tree
-                .ancestors(last_paragraph.0)
-                .skip(1)
-                .any(|ancestor| matches!(
-                    parsed.tree.node(ancestor).map(|node| node.kind),
-                    Some(NodeKind::ListItem { .. })
-                )),
-            "the paragraph for \"ghi\" must not be a descendant of a ListItem"
-        );
+    /// Issue #767: a nested trailing empty item still just outdents.
+    #[test]
+    fn nested_trailing_empty_item_still_outdents() {
+        for intent in [ListEditIntent::Backspace, ListEditIntent::Enter] {
+            assert_eq!(
+                replacement("- A\n  - B\n  - ", 14, intent),
+                ("- A\n  - B\n- ".to_string(), 12),
+                "{intent:?}"
+            );
+        }
     }
 
     /// Issue #472: `pulldown_cmark` must look ahead past a trailing blank
@@ -1826,11 +1846,11 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_trailing_empty_top_level_item_creates_paragraph_boundary() {
+    fn enter_on_trailing_empty_top_level_item_removes_only_the_marker() {
         let text = "- abc\n- def\n- ";
         assert_eq!(
             replacement(text, text.len(), ListEditIntent::Enter),
-            ("- abc\n- def\n\n".into(), 13)
+            ("- abc\n- def\n".into(), 12)
         );
     }
 
@@ -1839,7 +1859,7 @@ mod tests {
         let text = "- abc\r\n- def\r\n- ";
         assert_eq!(
             replacement(text, text.len(), ListEditIntent::Backspace),
-            ("- abc\r\n- def\r\n\r\n".into(), 16)
+            ("- abc\r\n- def\r\n".into(), 14)
         );
     }
 
@@ -2297,8 +2317,8 @@ mod tests {
                 text: "- abc\n- def\n- ",
                 caret: 14,
                 range: (12, 14),
-                replacement: "\n",
-                caret_after: 13,
+                replacement: "",
+                caret_after: 12,
                 extra: ExitContractExtra::RetainsListItems(&["abc", "def"]),
             },
             // E02: the item is the entire document, so there is no line
@@ -2342,8 +2362,8 @@ mod tests {
                 text: "- abc\n- def\n- \n",
                 caret: 14,
                 range: (12, 14),
-                replacement: "\n",
-                caret_after: 13,
+                replacement: "",
+                caret_after: 12,
                 extra: ExitContractExtra::None,
             },
             // E06: an empty item between two unordered siblings needs a real
@@ -2387,8 +2407,8 @@ mod tests {
                 text: "- abc\r\n- def\r\n- ",
                 caret: 16,
                 range: (14, 16),
-                replacement: "\r\n",
-                caret_after: 16,
+                replacement: "",
+                caret_after: 14,
                 extra: ExitContractExtra::None,
             },
             // E10: bare CR line endings (no LF at all) on a middle item
@@ -2422,8 +2442,8 @@ mod tests {
                 text: "   - abc\n   - def\n   - ",
                 caret: 23,
                 range: (18, 23),
-                replacement: "\n",
-                caret_after: 19,
+                replacement: "",
+                caret_after: 18,
                 extra: ExitContractExtra::None,
             },
             // E13: multi-byte UTF-8 content on both sides, including a
@@ -2444,8 +2464,8 @@ mod tests {
                 text: "- abc\n- def\n-\n",
                 caret: 13,
                 range: (12, 13),
-                replacement: "\n",
-                caret_after: 13,
+                replacement: "",
+                caret_after: 12,
                 extra: ExitContractExtra::None,
             },
             // E15: plain prose (not a list marker) directly after the exit;
@@ -2519,6 +2539,15 @@ mod tests {
 
                 let typed_parsed =
                     parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+                // Document-tail exits (#767) only remove the marker, so text
+                // typed right after may be a lazy continuation of the previous
+                // item; the standalone-paragraph guarantee does not apply.
+                let is_trailing_exit = ["E01 ", "E05 ", "E09 ", "E12 ", "E14 "]
+                    .iter()
+                    .any(|prefix| case.label.starts_with(prefix));
+                if is_trailing_exit {
+                    continue;
+                }
                 let ghi_paragraph = typed_parsed
                     .tree
                     .iter()
