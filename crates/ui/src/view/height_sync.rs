@@ -603,12 +603,53 @@ impl EditorView {
             next_height_blocks.content_width_bits = Some(self.content_width.to_bits());
         }
         if granularity == Granularity::Blocks && self.granularity == Granularity::Blocks {
-            // A disclosure change alters block heights, so cross-revision
-            // carry-over is only allowed while the disclosure is unchanged.
-            let disclosure_unchanged = self
+            // A disclosure change alters only the heights of blocks with a
+            // fence or table projection, and only when their collapsed row
+            // count differs. The caret moving elsewhere (a different selection
+            // range) must not veto carry-over for every other block.
+            let previous_disclosure = self
                 .last_applied_height_disclosure
-                .map(|(_, disclosure)| disclosure)
-                == self.active_height_disclosure();
+                .map(|(_, disclosure)| disclosure);
+            let current_disclosure = self.active_height_disclosure();
+            let index = self.current_index();
+            let disclosure_keeps_height = |range: SourceRange| -> bool {
+                let Some(index) = index else {
+                    return false;
+                };
+                let Some(ordinal) = index.ordinal_at(range.start) else {
+                    return false;
+                };
+                let Some(block) = index.block(ordinal) else {
+                    return false;
+                };
+                let fence_projection = index.fence_height_projection(&block);
+                let table_projection = index.table_projection(&block);
+                if fence_projection.is_none() && table_projection.is_none() {
+                    return true;
+                }
+                if previous_disclosure == current_disclosure {
+                    return true;
+                }
+                let Some(previous) = previous_disclosure else {
+                    return false;
+                };
+                let block_is_final = ordinal + 1 == index.len();
+                let collapsed_rows = |disclosure: Option<SourceRange>| {
+                    let fence = fence_projection.map_or(0, |projection| {
+                        projection.inactive_rows_in(
+                            block.source_range,
+                            block.source_range,
+                            disclosure,
+                            block_is_final,
+                        )
+                    });
+                    let table = table_projection
+                        .filter(|projection| table_delimiter_is_collapsed(projection, disclosure))
+                        .map_or(0, |_| 1);
+                    fence + table
+                };
+                collapsed_rows(Some(previous)) == collapsed_rows(current_disclosure)
+            };
             let document = self.editor().document();
             preserve_measured_block_heights_with(
                 &self.height_blocks,
@@ -616,7 +657,7 @@ impl EditorView {
                 &next_height_blocks,
                 &mut heights,
                 |revision, range| {
-                    disclosure_unchanged && range_untouched_since(document, revision, range)
+                    disclosure_keeps_height(range) && range_untouched_since(document, revision, range)
                 },
             );
         }
