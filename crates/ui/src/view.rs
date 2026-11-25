@@ -1546,11 +1546,32 @@ fn rebase_ordinal_after_splice(
 /// must not inherit a measurement taken before the edit — its content may
 /// render at a different height even when range, line count, and initial
 /// estimate happen to match.
+#[cfg(test)]
 fn preserve_measured_block_heights(
     previous_blocks: &HeightBlocks,
     previous_heights: &HeightIndex,
     next_blocks: &HeightBlocks,
     next_heights: &mut HeightIndex,
+) {
+    preserve_measured_block_heights_with(
+        previous_blocks,
+        previous_heights,
+        next_blocks,
+        next_heights,
+        |_, _| false,
+    );
+}
+
+/// Same as `preserve_measured_block_heights`, but a block whose revision
+/// differs is also kept when `unchanged_since(previous_revision, range)` proves
+/// that no edit since that revision touched the block's bytes. Without that
+/// evidence the measurement is dropped as before.
+fn preserve_measured_block_heights_with(
+    previous_blocks: &HeightBlocks,
+    previous_heights: &HeightIndex,
+    next_blocks: &HeightBlocks,
+    next_heights: &mut HeightIndex,
+    unchanged_since: impl Fn(Revision, SourceRange) -> bool,
 ) {
     if previous_blocks.content_width_bits != next_blocks.content_width_bits {
         return;
@@ -1567,22 +1588,20 @@ fn preserve_measured_block_heights(
         measured.insert(
             (
                 block.id,
-                block.revision,
                 block.source_range.start.0,
                 block.source_range.end.0,
                 block.line_count,
                 block.estimated_height_bits,
             ),
-            height,
+            (block.revision, height),
         );
     }
     for ordinal in 0..next_blocks.len() {
         let Some(block) = next_blocks.get(ordinal) else {
             continue;
         };
-        let Some(height) = measured.get(&(
+        let Some((previous_revision, height)) = measured.get(&(
             block.id,
-            block.revision,
             block.source_range.start.0,
             block.source_range.end.0,
             block.line_count,
@@ -1590,8 +1609,26 @@ fn preserve_measured_block_heights(
         )) else {
             continue;
         };
+        if *previous_revision != block.revision
+            && !unchanged_since(*previous_revision, block.source_range)
+        {
+            continue;
+        }
         next_heights.update(ordinal, *height);
     }
+}
+
+/// True when every edit after `revision` lies at or beyond the end of `range`,
+/// so the bytes of `range` (and its offsets) are unchanged. A missing or
+/// non-contiguous delta history yields false.
+fn range_untouched_since(document: &RopeBuffer, revision: Revision, range: SourceRange) -> bool {
+    let Ok(deltas) = document.deltas_since(revision) else {
+        return false;
+    };
+    !deltas.is_empty()
+        && deltas
+            .iter()
+            .all(|delta| delta.edited_source_range_before.start.0 >= range.end.0)
 }
 
 #[derive(Clone, Debug)]

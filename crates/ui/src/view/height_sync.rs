@@ -603,11 +603,21 @@ impl EditorView {
             next_height_blocks.content_width_bits = Some(self.content_width.to_bits());
         }
         if granularity == Granularity::Blocks && self.granularity == Granularity::Blocks {
-            preserve_measured_block_heights(
+            // A disclosure change alters block heights, so cross-revision
+            // carry-over is only allowed while the disclosure is unchanged.
+            let disclosure_unchanged = self
+                .last_applied_height_disclosure
+                .map(|(_, disclosure)| disclosure)
+                == self.active_height_disclosure();
+            let document = self.editor().document();
+            preserve_measured_block_heights_with(
                 &self.height_blocks,
                 &self.heights,
                 &next_height_blocks,
                 &mut heights,
+                |revision, range| {
+                    disclosure_unchanged && range_untouched_since(document, revision, range)
+                },
             );
         }
         self.granularity = granularity;

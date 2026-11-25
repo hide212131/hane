@@ -63,9 +63,10 @@ ADR-0020 の物理行ベースの初期高さ、ADR-0021 の `BlockLayout` に�
 
 ## フェーズ A 帰属結果
 
-ワーカーにはシェル・テスト実行権限がないため、以下は**コードの静的読解に基づく帰属**であり、実測値ではない。回帰テスト `eof_enter_keeps_the_caret_visible_in_a_wrapped_document`（対照: `eof_enter_and_typing_keep_the_caret_visible_without_wrapping`）は `crates/ui/src/view.rs` に追加済みで、各 Enter の「first」「settled」「stable」の各段階で scroll_y・キャレットの y と高さ・viewport_height を失敗メッセージに出す。司令塔の focused テスト実行の出力で、下の仮の帰属を確定または訂正する。
+司令塔が `cargo test -p hane-ui --lib eof_enter_keeps_the_caret_visible_in_a_wrapped_document -- --nocapture` を実行して確定した結果。
 
-- **scroll_y が初めて減る時点**: 同期 splice（`apply_height_index_update`）は上端ブロックが置換窓より前にあるとき `scroll_y` を再計算するが、窓の外の高さは残るため、そこでは `scroll_y` は動かない。減る最初の箇所は、同じ Enter の描画で `render.rs:134` のクランプが、窓内の実測を失って縮んだ `H` の上限へ `scroll_y` を切り詰める点と読める。テストの `first` 段階がこれを捕らえる。正式公開（`install_heights`）は次の二次的な縮みを加え得る（`settled` 段階）。
-- **キャレットが外れたままになる主体**: 描画側のクランプ（`render.rs:134`）が捨てた位置は、後で `H` が実測で回復しても戻らない。キャレット補正（`render.rs:254` 付近）は現リビジョンのキャッシュがないと物理行ベースに落ちる。したがって損失の主体は「高さ索引の縮み」であり、描画側は結果を確定する役である。
-- **104px（2行分）の内訳として確認できた高さ差**: 設計書 §1 の式（`L − E` と切り詰め `2L`）は、最終段落と直前の折り返し段落が窓内で実測→推定に置換されることを前提にする。このテストの fixture では直前の折り返し段落（10 回反復の段落）がこの窓に入る。ブロックごとの実測→推定の具体的な差分は未計測で、司令塔のテスト出力（scroll_y の前後値とキャレット位置）で照合する。
-- **フェーズ B で修正すべき経路の結論（暫定）**: 第一に同期 splice（`height_sync.rs:703` の窓内置換。編集と表示が変わらない直前の段落の実測を引き継ぐ）。第二に、正式公開側（`preserve_measured_block_heights` がリビジョン違いで実測を落とす点）。いずれも、`first` 段階で失敗するなら同期 splice、`first` が通り `settled` だけ失敗するなら正式公開のみを修正対象にする。描画側の追加修正は、実測保持後もキャレット欠落が再現した場合に限る。
+- **失敗した段階**: テストは `[settled]` 段階でのみ失敗した。メッセージは `[settled] Enter #1: caret is not on screen (scroll_y 1799 -> 993, viewport_height 448)`。
+- **`[first]` 段階は通過**: 同期 splice と最初の描画では、この fixture のキャレットは失われない。同期 splice 経路（`apply_height_index_update`）は修正対象ではない。
+- **損失の主体**: 正式索引の公開（`install_heights`）。`preserve_measured_block_heights` がリビジョン違いを理由に、編集位置より前の折り返しブロックを含む実測高さを推定へ落とし、`scroll_y` が 1799 から 993 へ縮んだ。
+- **対照テスト**: `eof_enter_and_typing_keep_the_caret_visible_without_wrapping` は合格した。
+- **フェーズ B の修正**: 正式公開側のみ。リビジョンが異なるブロックでも、id・範囲・行数・推定高さ・内容幅が一致し、`RevisionDelta` の履歴で編集がすべてブロック末尾以降にあると確認でき、開示が変わっていない場合に限り実測を引き継ぐ。証拠が欠ける場合は従来どおり実測を落とす。描画側の追加修正は、実測保持後もキャレット欠落が再現した場合に限る。
