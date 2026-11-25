@@ -2526,34 +2526,33 @@ mod tests {
                 let is_trailing_exit = ["E01 ", "E05 ", "E09 ", "E12 ", "E14 "]
                     .iter()
                     .any(|prefix| case.label.starts_with(prefix));
-                if is_trailing_exit {
-                    continue;
-                }
-                let ghi_paragraph = typed_parsed
-                    .tree
-                    .iter()
-                    .find(|(_, node)| {
-                        matches!(node.kind, NodeKind::Paragraph)
-                            && typed[node.source_range.as_usize()].contains("ghi")
-                    })
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "{}: expected a paragraph containing \"ghi\" in {typed:?}",
-                            case.label
-                        )
-                    });
-                assert!(
-                    !typed_parsed
+                if !is_trailing_exit {
+                    let ghi_paragraph = typed_parsed
                         .tree
-                        .ancestors(ghi_paragraph.0)
-                        .skip(1)
-                        .any(|ancestor| matches!(
-                            typed_parsed.tree.node(ancestor).map(|node| node.kind),
-                            Some(NodeKind::ListItem { .. })
-                        )),
-                    "{}: the paragraph for \"ghi\" must not be a descendant of a ListItem in {typed:?}",
-                    case.label
-                );
+                        .iter()
+                        .find(|(_, node)| {
+                            matches!(node.kind, NodeKind::Paragraph)
+                                && typed[node.source_range.as_usize()].contains("ghi")
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "{}: expected a paragraph containing \"ghi\" in {typed:?}",
+                                case.label
+                            )
+                        });
+                    assert!(
+                        !typed_parsed
+                            .tree
+                            .ancestors(ghi_paragraph.0)
+                            .skip(1)
+                            .any(|ancestor| matches!(
+                                typed_parsed.tree.node(ancestor).map(|node| node.kind),
+                                Some(NodeKind::ListItem { .. })
+                            )),
+                        "{}: the paragraph for \"ghi\" must not be a descendant of a ListItem in {typed:?}",
+                        case.label
+                    );
+                }
 
                 match case.extra {
                     ExitContractExtra::None => {}
