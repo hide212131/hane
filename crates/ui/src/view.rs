@@ -12645,11 +12645,12 @@ mod tests {
             assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
             assert_eq!(
                 view.editor().document().full_text(),
-                "# 2026-11-10_test\n\n- abc\n\n"
+                "# 2026-11-10_test\n\n- abc\n"
             );
 
             let shaper = FixedAdvanceShaper::new(8.0);
-            for offset in [25, 26] {
+            {
+                let offset = 25;
                 view.editor_mut()
                     .set_selection(Selection::caret(SourceOffset(offset)))
                     .unwrap();
@@ -12716,8 +12717,8 @@ mod tests {
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
 
             assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
-            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\n\r\n");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(9)));
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
 
             view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
             assert_eq!(view.editor().document().full_text(), "- abc\r\n- \r\n");
@@ -12727,7 +12728,7 @@ mod tests {
             view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
             assert_eq!(view.editor().document().full_text(), "- abc\r\n- \r\n");
             view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
-            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\n\r\n");
+            assert_eq!(view.editor().document().full_text(), "- abc\r\n\r\n");
         });
     }
 
@@ -12828,35 +12829,15 @@ mod tests {
             assert_eq!(empty_item.body_range, SourceRange::new(14, 14));
 
             assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
-            // Exiting the trailing empty item must also establish the
-            // paragraph boundary the design requires: a bare "\n" would
-            // still make the next typed line a lazy continuation of "def",
-            // so the exit inserts the blank line that separates them.
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(13)));
-
-            let index = BlockIndex::from_buffer(view.editor().document());
-            let projection = index
-                .list_edit_projection_at(view.editor().document(), SourceOffset(13))
-                .expect("current projection after marker removal");
-            assert!(
-                projection.item_at(SourceOffset(13)).is_none(),
-                "the paragraph caret must no longer be owned by the preceding list item: {projection:#?}"
-            );
+            // Issue #767: exiting the trailing empty item at the document
+            // tail removes only the marker and inserts no separator line.
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(12)));
 
             view.editor_mut().insert_text("xyz").unwrap();
             view.after_input(cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\nxyz");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(16)));
-
-            let index = BlockIndex::from_buffer(view.editor().document());
-            let projection = index
-                .list_edit_projection_at(view.editor().document(), SourceOffset(16))
-                .expect("current projection after typing the following paragraph");
-            assert!(
-                projection.item_at(SourceOffset(16)).is_none(),
-                "the typed paragraph must belong to the document, not the preceding list item: {projection:#?}"
-            );
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\nxyz");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(15)));
         });
     }
 
@@ -12941,12 +12922,12 @@ mod tests {
             // source must see this as a top-level empty item and remove its
             // marker, not reuse any projection captured during the first call.
             assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
-            assert_eq!(view.editor().document().full_text(), "- A\n  - B\n\n");
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(11)));
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(10)));
 
             view.editor_mut().insert_text("ghi").unwrap();
             view.after_input(cx);
-            assert_eq!(view.editor().document().full_text(), "- A\n  - B\n\nghi");
+            assert_eq!(view.editor().document().full_text(), "- A\n  - B\nghi");
 
             let text = view.editor().document().full_text();
             let parsed =
@@ -12963,26 +12944,8 @@ mod tests {
             );
             assert!(text[list_items[0].1.source_range.as_usize()].contains('A'));
             assert!(text[list_items[1].1.source_range.as_usize()].contains('B'));
-
-            let ghi_paragraph = parsed
-                .tree
-                .iter()
-                .find(|(_, node)| {
-                    matches!(node.kind, hane_markdown::NodeKind::Paragraph)
-                        && text[node.source_range.as_usize()].contains("ghi")
-                })
-                .expect("expected a paragraph containing \"ghi\"");
-            assert!(
-                !parsed
-                    .tree
-                    .ancestors(ghi_paragraph.0)
-                    .skip(1)
-                    .any(|ancestor| matches!(
-                        parsed.tree.node(ancestor).map(|node| node.kind),
-                        Some(hane_markdown::NodeKind::ListItem { .. })
-                    )),
-                "the paragraph for \"ghi\" must not be a descendant of a ListItem"
-            );
+            // Issue #767: the tail exit leaves no separator, so "ghi" may be
+            // a lazy continuation of "B"; only the list structure is checked.
         });
     }
 
@@ -13004,9 +12967,9 @@ mod tests {
             assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
             assert_eq!(
                 view.editor().document().full_text(),
-                "- [ ] A\n  - [x] child\n\n"
+                "- [ ] A\n  - [x] child\n"
             );
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(23)));
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(22)));
 
             let text = view.editor().document().full_text();
             // The exit only touched its own trailing line; the parent and its
@@ -13069,9 +13032,9 @@ mod tests {
             );
             assert_eq!(
                 view.editor().document().full_text(),
-                "intro\n\n- \u{65e5}\u{672c}\n\n"
+                "intro\n\n- \u{65e5}\u{672c}\n"
             );
-            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(17)));
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(16)));
         });
     }
 
@@ -13094,20 +13057,20 @@ mod tests {
             view.editor_mut().set_selection(before_exit).unwrap();
 
             assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
-            let after_exit = Selection::caret(SourceOffset(13));
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            let after_exit = Selection::caret(SourceOffset(12));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n");
             assert_eq!(view.editor().selection(), after_exit);
 
             view.editor_mut().insert_text("xyz").unwrap();
             view.after_input(cx);
-            let after_typing = Selection::caret(SourceOffset(16));
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\nxyz");
+            let after_typing = Selection::caret(SourceOffset(15));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\nxyz");
             assert_eq!(view.editor().selection(), after_typing);
 
             view.dispatch(EditorCommand::Undo, cx);
             assert_eq!(
                 view.editor().document().full_text(),
-                "- abc\n- def\n\n",
+                "- abc\n- def\n",
                 "the first undo must unwind only the typed text"
             );
             assert_eq!(view.editor().selection(), after_exit);
@@ -13121,11 +13084,11 @@ mod tests {
             assert_eq!(view.editor().selection(), before_exit);
 
             view.dispatch(EditorCommand::Redo, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n");
             assert_eq!(view.editor().selection(), after_exit);
 
             view.dispatch(EditorCommand::Redo, cx);
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\nxyz");
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\nxyz");
             assert_eq!(view.editor().selection(), after_typing);
         });
     }
@@ -13143,7 +13106,7 @@ mod tests {
             let end = SourceOffset(view.editor().document().len_bytes().0);
             view.editor_mut().set_selection(Selection::caret(end)).unwrap();
             assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n");
 
             view.editor_mut()
                 .replace_and_mark_text(None, "\u{306b}", Some(1..1))
@@ -13152,31 +13115,13 @@ mod tests {
             view.editor_mut().commit_text(None, "\u{306b}").unwrap();
             view.after_input(cx);
 
+            // Issue #767: the tail exit leaves no separator, so the committed
+            // text lands on the line after the marker was removed (it may be a
+            // lazy continuation of the previous item) and never reintroduces
+            // a list prefix.
             assert!(view.editor().ime().is_none());
             let text = view.editor().document().full_text();
-            assert_eq!(text, "- abc\n- def\n\n\u{306b}");
-
-            let parsed =
-                hane_markdown::parse_document(Revision(1), SourceRange::new(0, text.len()), &text);
-            let committed_paragraph = parsed
-                .tree
-                .iter()
-                .find(|(_, node)| {
-                    matches!(node.kind, hane_markdown::NodeKind::Paragraph)
-                        && text[node.source_range.as_usize()].contains('\u{306b}')
-                })
-                .expect("expected a paragraph containing the committed text");
-            assert!(
-                !parsed
-                    .tree
-                    .ancestors(committed_paragraph.0)
-                    .skip(1)
-                    .any(|ancestor| matches!(
-                        parsed.tree.node(ancestor).map(|node| node.kind),
-                        Some(hane_markdown::NodeKind::ListItem { .. })
-                    )),
-                "the committed text must not be a descendant of a ListItem"
-            );
+            assert_eq!(text, "- abc\n- def\n\u{306b}");
         });
     }
 
@@ -13195,8 +13140,8 @@ mod tests {
             let end = SourceOffset(view.editor().document().len_bytes().0);
             view.editor_mut().set_selection(Selection::caret(end)).unwrap();
             assert!(view.apply_list_edit_intent(ListEditIntent::Backspace, cx));
-            let exited = Selection::caret(SourceOffset(13));
-            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n\n");
+            let exited = Selection::caret(SourceOffset(12));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- def\n");
             assert_eq!(view.editor().selection(), exited);
 
             view.editor_mut()
@@ -13209,7 +13154,7 @@ mod tests {
             assert!(view.editor().ime().is_none());
             assert_eq!(
                 view.editor().document().full_text(),
-                "- abc\n- def\n\n",
+                "- abc\n- def\n",
                 "cancel must restore exactly the exited source, not reintroduce a list marker"
             );
             assert_eq!(view.editor().selection(), exited);
@@ -13269,38 +13214,19 @@ mod tests {
         view.read_with(cx, |view, _| {
             assert_eq!(
                 view.editor().document().full_text(),
-                "- abc\n- def\n\n",
-                "a real Backspace keystroke must remove the trailing empty \
-                 item's marker and open the paragraph boundary the exit \
-                 contract requires"
+                "- abc\n- def\n",
+                "a real Backspace keystroke must remove only the trailing \
+                 empty item's marker (Issue #767: no separator at the tail)"
             );
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(12)));
         });
 
-        // Whatever is typed next, still through real key dispatch, must
-        // land in an ordinary paragraph, never back inside the exited
-        // ListItem.
+        // Typing afterwards, still through real key dispatch, lands at the
+        // caret on the line left behind by the exit.
         cx.simulate_input("ghi");
         cx.run_until_parked();
         let text = view.read_with(cx, |view, _| view.editor().document().full_text());
-        assert_eq!(text, "- abc\n- def\n\nghi");
-        let parsed =
-            hane_markdown::parse_document(Revision(1), SourceRange::new(0, text.len()), &text);
-        let last_paragraph = parsed
-            .tree
-            .iter()
-            .rfind(|(_, node)| matches!(node.kind, hane_markdown::NodeKind::Paragraph))
-            .expect("expected a trailing paragraph for \"ghi\"");
-        assert!(
-            !parsed
-                .tree
-                .ancestors(last_paragraph.0)
-                .skip(1)
-                .any(|ancestor| matches!(
-                    parsed.tree.node(ancestor).map(|node| node.kind),
-                    Some(hane_markdown::NodeKind::ListItem { .. })
-                )),
-            "the paragraph for \"ghi\" must not be a descendant of a ListItem"
-        );
+        assert_eq!(text, "- abc\n- def\nghi");
     }
 
     /// Issue #472 owner report (comment on #460): the owner's actual
