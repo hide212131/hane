@@ -631,6 +631,15 @@ impl EditorView {
                     view.set_syntax_highlight(*checked, cx);
                 });
             });
+        let drying_ink_view = cx.entity();
+        let drying_ink = Checkbox::new("settings-drying-ink")
+            .checked(self.drying_ink_enabled())
+            .label("確定した文字を、乾くまで少し濃く表示する")
+            .on_click(move |checked, _window, app| {
+                drying_ink_view.update(app, |view, cx| {
+                    view.set_drying_ink(*checked, cx);
+                });
+            });
         // Offered only where the link exists (the app attached a controller).
         let link_section = self.whisparrot_link_available().then(|| {
             let link_view = cx.entity();
@@ -704,6 +713,13 @@ impl EditorView {
                         card("settings-plain-text-card")
                             .child(plain_text)
                             .child(syntax_highlight),
+                    )
+                    .child(
+                        card("settings-drying-ink-card").child(drying_ink).child(
+                            div()
+                                .text_color(rgb(self.theme.quote_foreground))
+                                .child("文書には保存されません。タブの切り替えや再起動で消えます。"),
+                        ),
                     ),
             )
             .child(

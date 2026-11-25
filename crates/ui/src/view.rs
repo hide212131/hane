@@ -109,6 +109,7 @@ mod basic_editing_keys;
 mod clipboard;
 mod content_search;
 mod document_find;
+mod drying_ink;
 mod editor_context_menu;
 use editor_context_menu::EditorContextMenu;
 mod document_watch;
@@ -1338,6 +1339,10 @@ pub struct EditorView {
     /// drawn for them (Issue #587). Keyed like `block_cache`, and emptied
     /// whenever another document replaces this one.
     mermaid: MermaidStore,
+    /// Which text was just confirmed and when, plus the timer that redraws it
+    /// as it dries (Issue #779). Display only, and emptied whenever another
+    /// document replaces this one.
+    drying_ink: drying_ink::DryingInkState,
     /// Hands the pictures back to the window when the view is released; dropping
     /// it would cancel the hook.
     _mermaid_release_subscription: Subscription,
@@ -2691,6 +2696,8 @@ impl EditorView {
         // Same for the diagrams: stop their jobs, and let the window forget the
         // pictures on the next frame. A job that finishes later finds no entry.
         self.mermaid.reset();
+        // Wet ranges and the timer belong to the document that was on screen.
+        self.drying_ink.reset();
     }
 
     /// Carries each ancestor folder's just-fetched real modified time into
@@ -2738,6 +2745,9 @@ impl EditorView {
     }
 
     pub(crate) fn after_input(&mut self, cx: &mut Context<Self>) {
+        // Let the drying-ink ledger follow this edit before anything else
+        // looks at the document.
+        self.sync_drying_ink();
         // An edit makes the session dirty now; do not wait for the next frame
         // to tell the external-open receivers.
         self.sync_external_open_guard();

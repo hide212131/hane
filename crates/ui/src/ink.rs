@@ -7,7 +7,7 @@
 
 #![allow(
     dead_code,
-    reason = "phase P1 adds the model only; the view wiring lands in P2"
+    reason = "the band, boundary and tuning APIs are wired in phase P3"
 )]
 
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceRange, TextBuffer};

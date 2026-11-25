@@ -82,6 +82,10 @@ pub struct Settings {
     /// (`syntax_highlight` key, Issue #738). Independent of
     /// `plain_text_mode`. A missing or invalid value means `true`.
     pub syntax_highlight: bool,
+    /// Whether freshly confirmed text is drawn slightly emphasized until it
+    /// dries (`drying_ink` key, Issue #779). Display only. A missing or
+    /// invalid value means `true`.
+    pub drying_ink: bool,
     /// Whether Hane lets the whisparrot voice-input app read context from the
     /// open document and insert or replace text (`whisparrot_link` key). Off
     /// until the user turns it on; a missing key, any value other than `true`,
@@ -100,6 +104,7 @@ impl Default for Settings {
             auto_update_check: true,
             plain_text_mode: false,
             syntax_highlight: true,
+            drying_ink: true,
             whisparrot_link: false,
         }
     }
@@ -486,13 +491,14 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\nwhisparrot_link={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\nwhisparrot_link={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
             settings.auto_update_check,
             settings.plain_text_mode,
             settings.syntax_highlight,
+            settings.drying_ink,
             settings.whisparrot_link
         );
         if let Some(folder) = &settings.default_folder {
@@ -542,6 +548,8 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.plain_text_mode = value == "true";
                 } else if let Some(value) = line.strip_prefix("syntax_highlight=") {
                     settings.syntax_highlight = value != "false";
+                } else if let Some(value) = line.strip_prefix("drying_ink=") {
+                    settings.drying_ink = value != "false";
                 } else if let Some(value) = line.strip_prefix("whisparrot_link=") {
                     settings.whisparrot_link = value == "true";
                 }
@@ -902,6 +910,7 @@ mod tests {
             auto_update_check: false,
             plain_text_mode: true,
             syntax_highlight: false,
+            drying_ink: false,
             whisparrot_link: true,
         };
         SettingsRepository::store(&store, &settings).unwrap();
@@ -1112,6 +1121,7 @@ mod tests {
                     auto_update_check: true,
                     plain_text_mode: false,
                     syntax_highlight: true,
+                    drying_ink: true,
                     whisparrot_link: false,
                 })
                 .unwrap();
@@ -1203,6 +1213,36 @@ mod tests {
             assert_eq!(loaded, settings);
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drying_ink_survives_a_store_reload() {
+        let root = temporary_directory("state-drying-ink-round-trip");
+        let store = FileStateStore::at(&root);
+        for enabled in [false, true] {
+            let settings = Settings {
+                drying_ink: enabled,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+            assert!(text.contains(&format!("drying_ink={enabled}\n")));
+            let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+            assert_eq!(loaded.drying_ink, enabled);
+            assert_eq!(loaded, settings);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn drying_ink_defaults_to_true_when_missing_or_invalid() {
+        assert!(Settings::default().drying_ink);
+        assert!(load_after_writing("autosave=false\ntheme=dark\n").drying_ink);
+        for value in ["maybe", "", "FALSE", "0"] {
+            let loaded = load_after_writing(&format!("drying_ink={value}\n"));
+            assert!(loaded.drying_ink, "value {value:?}");
+        }
+        assert!(!load_after_writing("drying_ink=false\n").drying_ink);
     }
 
     #[test]
