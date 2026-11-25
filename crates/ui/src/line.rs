@@ -1642,6 +1642,7 @@ fn table_row_element(
     ink: &InkFrame,
 ) -> Div {
     let ink_visuals = row_ink_visuals(block, layout, row_index, ink);
+    let band_visual = row_band_visual(block, layout, row_index, ink);
     let hover_visuals = link_hover_visuals(line, link_hover);
     let all_link_visuals = link_boundary_visuals(line);
     let selection = editor.selection().range();

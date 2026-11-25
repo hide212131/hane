@@ -584,7 +584,7 @@ mod tests {
     /// Presses Enter in the body through the real action.
     fn enter(view: &TestView, cx: &mut TestCx) {
         cx.update(|window, app| {
-            view.read(app).focus_handle.clone().focus(window);
+            view.read(app).focus_handle.clone().focus(window, app);
             window.dispatch_action(Box::new(crate::actions::Newline), app);
         });
         cx.run_until_parked();

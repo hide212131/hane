@@ -19,6 +19,9 @@ pub(crate) fn system_reduce_motion() -> bool {
 
 #[cfg(target_os = "macos")]
 #[cfg_attr(test, allow(dead_code, reason = "tests never read the host's setting"))]
+// `objc` 0.2's `msg_send!` / `class!` expand to `cfg(feature = "cargo-clippy")`,
+// which rustc reports as an unexpected cfg value in this crate.
+#[allow(unexpected_cfgs)]
 fn platform_reduce_motion() -> bool {
     use objc::runtime::{BOOL, NO, Object};
     use objc::{class, msg_send, sel, sel_impl};
