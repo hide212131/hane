@@ -1546,11 +1546,32 @@ fn rebase_ordinal_after_splice(
 /// must not inherit a measurement taken before the edit — its content may
 /// render at a different height even when range, line count, and initial
 /// estimate happen to match.
+#[cfg(test)]
 fn preserve_measured_block_heights(
     previous_blocks: &HeightBlocks,
     previous_heights: &HeightIndex,
     next_blocks: &HeightBlocks,
     next_heights: &mut HeightIndex,
+) {
+    preserve_measured_block_heights_with(
+        previous_blocks,
+        previous_heights,
+        next_blocks,
+        next_heights,
+        |_, _| false,
+    );
+}
+
+/// Same as `preserve_measured_block_heights`, but a block whose revision
+/// differs is also kept when `unchanged_since(previous_revision, range)` proves
+/// that no edit since that revision touched the block's bytes. Without that
+/// evidence the measurement is dropped as before.
+fn preserve_measured_block_heights_with(
+    previous_blocks: &HeightBlocks,
+    previous_heights: &HeightIndex,
+    next_blocks: &HeightBlocks,
+    next_heights: &mut HeightIndex,
+    unchanged_since: impl Fn(Revision, SourceRange) -> bool,
 ) {
     if previous_blocks.content_width_bits != next_blocks.content_width_bits {
         return;
@@ -1567,22 +1588,20 @@ fn preserve_measured_block_heights(
         measured.insert(
             (
                 block.id,
-                block.revision,
                 block.source_range.start.0,
                 block.source_range.end.0,
                 block.line_count,
                 block.estimated_height_bits,
             ),
-            height,
+            (block.revision, height),
         );
     }
     for ordinal in 0..next_blocks.len() {
         let Some(block) = next_blocks.get(ordinal) else {
             continue;
         };
-        let Some(height) = measured.get(&(
+        let Some((previous_revision, height)) = measured.get(&(
             block.id,
-            block.revision,
             block.source_range.start.0,
             block.source_range.end.0,
             block.line_count,
@@ -1590,8 +1609,26 @@ fn preserve_measured_block_heights(
         )) else {
             continue;
         };
+        if *previous_revision != block.revision
+            && !unchanged_since(*previous_revision, block.source_range)
+        {
+            continue;
+        }
         next_heights.update(ordinal, *height);
     }
+}
+
+/// True when every edit after `revision` lies at or beyond the end of `range`,
+/// so the bytes of `range` (and its offsets) are unchanged. A missing or
+/// non-contiguous delta history yields false.
+fn range_untouched_since(document: &RopeBuffer, revision: Revision, range: SourceRange) -> bool {
+    let Ok(deltas) = document.deltas_since(revision) else {
+        return false;
+    };
+    !deltas.is_empty()
+        && deltas
+            .iter()
+            .all(|delta| delta.edited_source_range_before.start.0 >= range.end.0)
 }
 
 #[derive(Clone, Debug)]
@@ -10267,6 +10304,345 @@ mod tests {
             "badge would be clipped: caret bottom {}, viewport {viewport_height}",
             caret.y + caret.height
         );
+    }
+
+    /// What the Issue #773 regression tests read after each draw.
+    struct EofEnterObservation {
+        scroll_y: f32,
+        caret: Option<CaretGeometry>,
+        viewport_height: f32,
+        text_len: usize,
+        caret_offset: usize,
+    }
+
+    fn eof_enter_draw(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) {
+        view.update(cx, |_, cx| cx.notify());
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+    }
+
+    fn eof_enter_observe(
+        view: &gpui::Entity<EditorView>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> EofEnterObservation {
+        view.read_with(cx, |view, _| EofEnterObservation {
+            scroll_y: view.scroll_y,
+            caret: view.caret_geometry(),
+            viewport_height: view.viewport_height,
+            text_len: view.editor().document().len_bytes().0,
+            caret_offset: view.editor().selection().active.0,
+        })
+    }
+
+    /// Opens a focused view of `text` in a window of the given size, with the
+    /// formal index published and the top of the document measured.
+    fn open_eof_enter_view<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        text: &str,
+        width: f32,
+        height: f32,
+    ) -> (gpui::Entity<EditorView>, &'a mut gpui::VisualTestContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let text = text.to_owned();
+        let (view, cx) = cx.add_window_view(move |_, cx| EditorView::new(&text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(width), px(height)));
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        view.update_in(cx, |view, window, cx| {
+            window.focus(&view.focus_handle, cx);
+        });
+        cx.run_until_parked();
+        (view, cx)
+    }
+
+    /// Settles the formal parse for the current revision and draws again.
+    /// Returns whether the formal index describing the current revision was
+    /// actually published, so a failure cannot be a harness artifact.
+    fn eof_enter_settle(view: &gpui::Entity<EditorView>, cx: &mut gpui::VisualTestContext) -> bool {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        let formal = view.read_with(cx, |view, _| {
+            view.block_index.source() == Some(IndexSource::Formal)
+                && view
+                    .block_index
+                    .index()
+                    .is_some_and(|index| index.revision() == view.editor().document().revision())
+        });
+        eof_enter_draw(view, cx);
+        formal
+    }
+
+    fn eof_enter_assert_caret_and_scroll(
+        stage: &str,
+        step: usize,
+        scroll_before: f32,
+        line_height: f32,
+        observed: &EofEnterObservation,
+    ) {
+        let eps = CARET_VISIBILITY_TOLERANCE;
+        let scroll_after = observed.scroll_y;
+        let viewport_height = observed.viewport_height;
+        let caret = observed.caret.unwrap_or_else(|| {
+            panic!(
+                "[{stage}] Enter #{step}: caret is not on screen \
+                 (scroll_y {scroll_before} -> {scroll_after}, viewport_height {viewport_height})"
+            )
+        });
+        assert!(
+            caret.height > 0.0,
+            "[{stage}] Enter #{step}: caret has no height \
+             (scroll_y {scroll_before} -> {scroll_after}, caret y {} height {}, \
+             viewport_height {viewport_height})",
+            caret.y,
+            caret.height
+        );
+        assert!(
+            caret.y >= -eps
+                && caret.y + caret.height + CARET_MODE_BADGE_HEIGHT <= viewport_height + eps,
+            "[{stage}] Enter #{step}: caret left the viewport \
+             (scroll_y {scroll_before} -> {scroll_after}, caret y {} height {}, \
+             viewport_height {viewport_height})",
+            caret.y,
+            caret.height
+        );
+        let delta = scroll_after - scroll_before;
+        assert!(
+            delta >= -eps && delta <= line_height + eps,
+            "[{stage}] Enter #{step}: scroll_y moved by {delta} \
+             (allowed {}..={}; scroll_y {scroll_before} -> {scroll_after}, \
+             caret y {} height {}, viewport_height {viewport_height})",
+            -eps,
+            line_height + eps,
+            caret.y,
+            caret.height
+        );
+    }
+
+    // Issue #773 phase A: Enter at the end of a LF-terminated document whose
+    // paragraphs wrap must not push the caret out of the viewport or move the
+    // scroll position backwards, neither in the first frame after the key nor
+    // once the formal index for that revision has been published.
+    #[gpui::test]
+    fn eof_enter_keeps_the_caret_visible_in_a_wrapped_document(cx: &mut gpui::TestAppContext) {
+        const PHRASE: &str = "lorem ipsum dolor sit amet ";
+        let wrapping = PHRASE.repeat(10);
+        let mut paragraphs = vec![wrapping.trim_end().to_owned(); 14];
+        paragraphs.push("tail".to_owned());
+        let text = format!("{}\n", paragraphs.join("\n\n"));
+        let (view, cx) = open_eof_enter_view(cx, &text, 480.0, 520.0);
+
+        let document_end = if cfg!(target_os = "macos") {
+            "cmd-down"
+        } else {
+            "ctrl-end"
+        };
+        cx.simulate_keystrokes(document_end);
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        assert!(eof_enter_settle(&view, cx), "formal index before Enter");
+        eof_enter_draw(&view, cx);
+
+        // Preconditions: the failure below must come from the product, not
+        // from a fixture that does not wrap or an index that never published.
+        let line_height = view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            let scroll_y = view.scroll_y;
+            let grown_above = (0..view.heights.len()).any(|ordinal| {
+                let Some(block) = view.height_blocks.get(ordinal) else {
+                    return false;
+                };
+                let measured = view.heights.height(ordinal).unwrap_or_default();
+                let estimated = f32::from_bits(block.estimated_height_bits);
+                let bottom = view.heights.prefix_sum(ordinal) + measured;
+                measured > estimated + CARET_VISIBILITY_TOLERANCE && bottom <= scroll_y
+            });
+            assert!(
+                grown_above,
+                "a wrapped block above the viewport must be measured taller than its estimate \
+                 (scroll_y {scroll_y})"
+            );
+            assert!(scroll_y > 0.0, "the viewport must be scrolled to the end");
+            view.line_height()
+        });
+        let initial = eof_enter_observe(&view, cx);
+        assert_eq!(initial.caret_offset, initial.text_len);
+        let initial_caret = initial.caret.expect("initial caret is visible");
+        assert!(
+            initial_caret.y >= -CARET_VISIBILITY_TOLERANCE
+                && initial_caret.y + initial_caret.height + CARET_MODE_BADGE_HEIGHT
+                    <= initial.viewport_height + CARET_VISIBILITY_TOLERANCE,
+            "initial caret must be visible (caret y {} height {}, viewport_height {})",
+            initial_caret.y,
+            initial_caret.height,
+            initial.viewport_height
+        );
+
+        let mut scroll_before = initial.scroll_y;
+        let mut len_before = initial.text_len;
+        for step in 1..=3 {
+            cx.simulate_keystrokes("enter");
+            eof_enter_draw(&view, cx);
+            let first = eof_enter_observe(&view, cx);
+            assert_eq!(first.text_len, len_before + 1, "[first] Enter #{step}");
+            assert_eq!(first.caret_offset, first.text_len, "[first] Enter #{step}");
+            eof_enter_assert_caret_and_scroll("first", step, scroll_before, line_height, &first);
+
+            assert!(
+                eof_enter_settle(&view, cx),
+                "the formal index for Enter #{step} must be published"
+            );
+            let settled = eof_enter_observe(&view, cx);
+            eof_enter_assert_caret_and_scroll(
+                "settled",
+                step,
+                scroll_before,
+                line_height,
+                &settled,
+            );
+
+            // Drawing again without input must not move anything.
+            eof_enter_draw(&view, cx);
+            let stable = eof_enter_observe(&view, cx);
+            assert_eq!(
+                stable.scroll_y, settled.scroll_y,
+                "[stable] Enter #{step}: redraw moved scroll_y"
+            );
+            eof_enter_assert_caret_and_scroll("stable", step, scroll_before, line_height, &stable);
+
+            scroll_before = stable.scroll_y;
+            len_before = stable.text_len;
+        }
+    }
+
+    // Issue #773 phase B: the window is opened wide, measured, then narrowed
+    // before the caret goes to the end. Measurements taken at the old width must
+    // be dropped when the width changes, so the measurements taken afterwards
+    // survive the formal publication that follows Enter.
+    #[gpui::test]
+    fn eof_enter_keeps_the_caret_visible_after_narrowing_the_window(cx: &mut gpui::TestAppContext) {
+        const PHRASE: &str = "lorem ipsum dolor sit amet ";
+        let wrapping = PHRASE.repeat(10);
+        let mut paragraphs = vec![wrapping.trim_end().to_owned(); 14];
+        paragraphs.push("tail".to_owned());
+        let text = format!("{}\n", paragraphs.join("\n\n"));
+        let (view, cx) = open_eof_enter_view(cx, &text, 1600.0, 520.0);
+        assert!(eof_enter_settle(&view, cx), "formal index at the wide width");
+        eof_enter_draw(&view, cx);
+
+        cx.simulate_resize(gpui::size(px(480.0), px(520.0)));
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        assert!(eof_enter_settle(&view, cx), "formal index after narrowing");
+        eof_enter_draw(&view, cx);
+
+        let document_end = if cfg!(target_os = "macos") {
+            "cmd-down"
+        } else {
+            "ctrl-end"
+        };
+        cx.simulate_keystrokes(document_end);
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        assert!(eof_enter_settle(&view, cx), "formal index before Enter");
+        eof_enter_draw(&view, cx);
+
+        let line_height = view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            assert!(view.scroll_y > 0.0, "the viewport must be scrolled to the end");
+            view.line_height()
+        });
+        let initial = eof_enter_observe(&view, cx);
+        assert_eq!(initial.caret_offset, initial.text_len);
+
+        let mut scroll_before = initial.scroll_y;
+        let mut len_before = initial.text_len;
+        for step in 1..=3 {
+            cx.simulate_keystrokes("enter");
+            eof_enter_draw(&view, cx);
+            let first = eof_enter_observe(&view, cx);
+            assert_eq!(first.text_len, len_before + 1, "[first] Enter #{step}");
+            eof_enter_assert_caret_and_scroll("first", step, scroll_before, line_height, &first);
+
+            assert!(
+                eof_enter_settle(&view, cx),
+                "the formal index for Enter #{step} must be published"
+            );
+            let settled = eof_enter_observe(&view, cx);
+            eof_enter_assert_caret_and_scroll(
+                "settled",
+                step,
+                scroll_before,
+                line_height,
+                &settled,
+            );
+
+            eof_enter_draw(&view, cx);
+            let stable = eof_enter_observe(&view, cx);
+            assert_eq!(
+                stable.scroll_y, settled.scroll_y,
+                "[stable] Enter #{step}: redraw moved scroll_y"
+            );
+            eof_enter_assert_caret_and_scroll("stable", step, scroll_before, line_height, &stable);
+
+            scroll_before = stable.scroll_y;
+            len_before = stable.text_len;
+        }
+    }
+
+    // Issue #773 control: the same Enter and typing at the end of a document
+    // that does not wrap keeps the caret visible and never scrolls backwards.
+    #[gpui::test]
+    fn eof_enter_and_typing_keep_the_caret_visible_without_wrapping(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut paragraphs = (1..=40)
+            .map(|line| format!("line {line:02}"))
+            .collect::<Vec<_>>();
+        paragraphs.push("tail".to_owned());
+        let text = format!("{}\n", paragraphs.join("\n\n"));
+        let (view, cx) = open_eof_enter_view(cx, &text, 960.0, 520.0);
+
+        let document_end = if cfg!(target_os = "macos") {
+            "cmd-down"
+        } else {
+            "ctrl-end"
+        };
+        cx.simulate_keystrokes(document_end);
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        assert!(eof_enter_settle(&view, cx), "formal index before Enter");
+        eof_enter_draw(&view, cx);
+
+        let line_height = view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            view.line_height()
+        });
+        let mut scroll_before = eof_enter_observe(&view, cx).scroll_y;
+        for step in 1..=3 {
+            cx.simulate_keystrokes("enter");
+            eof_enter_draw(&view, cx);
+            let first = eof_enter_observe(&view, cx);
+            eof_enter_assert_caret_and_scroll("first", step, scroll_before, line_height, &first);
+            assert!(eof_enter_settle(&view, cx));
+            let settled = eof_enter_observe(&view, cx);
+            eof_enter_assert_caret_and_scroll(
+                "settled",
+                step,
+                scroll_before,
+                line_height,
+                &settled,
+            );
+            scroll_before = settled.scroll_y;
+        }
+
+        cx.simulate_input("x");
+        eof_enter_draw(&view, cx);
+        let typed = eof_enter_observe(&view, cx);
+        eof_enter_assert_caret_and_scroll("typed", 4, scroll_before, line_height, &typed);
     }
 
     #[gpui::test]
