@@ -210,8 +210,29 @@ impl EditorView {
                 Some(id)
             }
             Err(_) => {
-                self.voice.status = Some("音声入力はすでに進行中です".to_owned());
-                cx.notify();
+                // A finished session keeps its unconfirmed segments until they
+                // are confirmed or discarded; say so and point at the first.
+                let finished = self
+                    .sessions
+                    .active()
+                    .editor()
+                    .voice()
+                    .is_some_and(|voice| !voice.is_recording());
+                if finished {
+                    self.voice.status = Some(
+                        "前の音声入力の未確定分が残っています。確定または破棄してから開始してください"
+                            .to_owned(),
+                    );
+                    let mut ordered = self.voice_segments();
+                    ordered.sort_by_key(|segment| (segment.offset, segment.seq));
+                    if let Some(first) = ordered.first() {
+                        self.voice.focus = Some(first.seq);
+                    }
+                    self.voice_after_display_change(cx);
+                } else {
+                    self.voice.status = Some("音声入力はすでに進行中です".to_owned());
+                    cx.notify();
+                }
                 None
             }
         }
@@ -361,11 +382,6 @@ impl EditorView {
             return;
         }
         if self.voice.script.is_none() {
-            if self.sessions.active().editor().voice().is_some() {
-                self.voice.status = Some("音声入力はすでに進行中です".to_owned());
-                cx.notify();
-                return;
-            }
             let Some(session_id) = self.voice_begin_session(cx) else {
                 return;
             };
@@ -1168,6 +1184,46 @@ mod tests {
         view.read_with(cx, |view, _| assert!(view.editor().voice().is_none()));
         undo(&view, cx);
         assert_eq!(text_of(&view, cx), "今日はいい天気ですね。次の章です。");
+    }
+
+    #[gpui::test]
+    fn a_new_run_is_refused_with_the_reason_and_focus_while_leftovers_remain(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, SessionSet::with_untitled("", "Untitled"), true);
+        view.update(cx, |view, cx| view.voice_debug_run(cx));
+        settle(cx);
+        assert_eq!(pending_seqs(&view, cx), [1, 2, 3]);
+        view.update(cx, |view, cx| view.voice_debug_step(cx));
+        settle(cx);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.voice_focused(), Some(1));
+            assert_eq!(
+                view.voice.status.as_deref(),
+                Some("前の音声入力の未確定分が残っています。確定または破棄してから開始してください")
+            );
+        });
+        assert_eq!(pending_seqs(&view, cx), [1, 2, 3]);
+        // Once cleared, the next run starts.
+        view.update(cx, |view, cx| view.voice_discard_all(cx));
+        settle(cx);
+        view.update(cx, |view, cx| view.voice_debug_step(cx));
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().voice().unwrap().is_recording());
+        });
+    }
+
+    #[gpui::test]
+    fn a_recording_session_keeps_the_in_progress_message(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, SessionSet::with_untitled("", "Untitled"), true);
+        view.update(cx, |view, cx| view.voice_debug_step(cx));
+        view.update(cx, |view, cx| {
+            assert!(view.voice_begin_session(cx).is_none());
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.voice.status.as_deref(), Some("音声入力はすでに進行中です"));
+            assert_eq!(view.voice_focused(), None);
+        });
     }
 
     #[gpui::test]
