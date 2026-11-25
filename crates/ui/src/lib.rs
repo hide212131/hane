@@ -13,6 +13,7 @@ mod clipboard;
 mod clipboard_image;
 pub mod context_menu;
 mod icons;
+mod ink;
 mod input;
 mod input_mode;
 #[cfg(any(feature = "instrument", feature = "timing-probe"))]
