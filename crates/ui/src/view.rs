@@ -10518,6 +10518,81 @@ mod tests {
         }
     }
 
+    // Issue #773 phase B: the window is opened wide, measured, then narrowed
+    // before the caret goes to the end. Measurements taken at the old width must
+    // be dropped when the width changes, so the measurements taken afterwards
+    // survive the formal publication that follows Enter.
+    #[gpui::test]
+    fn eof_enter_keeps_the_caret_visible_after_narrowing_the_window(cx: &mut gpui::TestAppContext) {
+        const PHRASE: &str = "lorem ipsum dolor sit amet ";
+        let wrapping = PHRASE.repeat(10);
+        let mut paragraphs = vec![wrapping.trim_end().to_owned(); 14];
+        paragraphs.push("tail".to_owned());
+        let text = format!("{}\n", paragraphs.join("\n\n"));
+        let (view, cx) = open_eof_enter_view(cx, &text, 1600.0, 520.0);
+        assert!(eof_enter_settle(&view, cx), "formal index at the wide width");
+        eof_enter_draw(&view, cx);
+
+        cx.simulate_resize(gpui::size(px(480.0), px(520.0)));
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        assert!(eof_enter_settle(&view, cx), "formal index after narrowing");
+        eof_enter_draw(&view, cx);
+
+        let document_end = if cfg!(target_os = "macos") {
+            "cmd-down"
+        } else {
+            "ctrl-end"
+        };
+        cx.simulate_keystrokes(document_end);
+        cx.run_until_parked();
+        eof_enter_draw(&view, cx);
+        assert!(eof_enter_settle(&view, cx), "formal index before Enter");
+        eof_enter_draw(&view, cx);
+
+        let line_height = view.read_with(cx, |view, _| {
+            assert_eq!(view.granularity, Granularity::Blocks);
+            assert!(view.scroll_y > 0.0, "the viewport must be scrolled to the end");
+            view.line_height()
+        });
+        let initial = eof_enter_observe(&view, cx);
+        assert_eq!(initial.caret_offset, initial.text_len);
+
+        let mut scroll_before = initial.scroll_y;
+        let mut len_before = initial.text_len;
+        for step in 1..=3 {
+            cx.simulate_keystrokes("enter");
+            eof_enter_draw(&view, cx);
+            let first = eof_enter_observe(&view, cx);
+            assert_eq!(first.text_len, len_before + 1, "[first] Enter #{step}");
+            eof_enter_assert_caret_and_scroll("first", step, scroll_before, line_height, &first);
+
+            assert!(
+                eof_enter_settle(&view, cx),
+                "the formal index for Enter #{step} must be published"
+            );
+            let settled = eof_enter_observe(&view, cx);
+            eof_enter_assert_caret_and_scroll(
+                "settled",
+                step,
+                scroll_before,
+                line_height,
+                &settled,
+            );
+
+            eof_enter_draw(&view, cx);
+            let stable = eof_enter_observe(&view, cx);
+            assert_eq!(
+                stable.scroll_y, settled.scroll_y,
+                "[stable] Enter #{step}: redraw moved scroll_y"
+            );
+            eof_enter_assert_caret_and_scroll("stable", step, scroll_before, line_height, &stable);
+
+            scroll_before = stable.scroll_y;
+            len_before = stable.text_len;
+        }
+    }
+
     // Issue #773 control: the same Enter and typing at the end of a document
     // that does not wrap keeps the caret visible and never scrolls backwards.
     #[gpui::test]

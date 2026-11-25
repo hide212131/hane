@@ -120,6 +120,21 @@ impl EditorView {
             sidebar_width,
             self.theme.line_horizontal_padding,
         );
+        // Measurements taken at another width no longer describe the rows, and
+        // the stamp on `height_blocks` is only written on install. Reset to the
+        // estimates and stamp the new width now, before this frame measures
+        // anything, so every later measurement belongs to the current width and
+        // the width guard at publication does not discard fresh ones.
+        if self.granularity == Granularity::Blocks
+            && self
+                .height_blocks
+                .content_width_bits
+                .is_some_and(|bits| bits != self.content_width.to_bits())
+            && self.current_index().is_some()
+        {
+            let heights = HeightIndex::new(self.item_heights());
+            self.install_heights(Granularity::Blocks, heights);
+        }
         let shaper = WindowShaper::new(window, self.zoom);
         let font_revision = shaper.font_revision();
         if font_revision != self.layout_font_revision {
