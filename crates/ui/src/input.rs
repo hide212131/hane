@@ -5,7 +5,7 @@ use gpui::{
     GlobalElementId, IntoElement, LayoutId, PaintQuad, Pixels, ShapedLine, Size, Style, TextRun,
     UTF16Selection, UnderlineStyle, Window, fill, point, px, relative, rgba,
 };
-use hane_document::SourceRange;
+use hane_document::{SourceRange, TextBuffer};
 use std::ops::Range;
 
 /// The visible, one-line text field used by a sidebar inline rename. Keeping
