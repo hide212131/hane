@@ -780,9 +780,9 @@ mod tests {
             let summary = buffer
                 .edit(SourceRange::new(start, end), &replacement)
                 .unwrap();
-            if rng.draw() % 3 == 0 {
+            if rng.draw().is_multiple_of(3) {
                 ledger.sync(owner(1), &buffer);
-                if rng.draw() % 2 == 0 {
+                if rng.draw().is_multiple_of(2) {
                     let now = t + millis(step * 700);
                     ledger.record_commit(summary.range_after, &replacement, now, &p);
                 }
