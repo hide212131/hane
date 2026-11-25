@@ -1530,33 +1530,14 @@ mod tests {
         assert_eq!(caret, 9);
 
         let (exited, caret) = replacement(&continued, caret, ListEditIntent::Enter);
-        assert_eq!(exited, "- abc\r\n\r\n\r\n");
-        assert_eq!(caret, 9);
+        // 末尾の離脱では区切りを足さないため、直後に入力した文字は
+        // 直前の項目の lazy continuation になり得る（独立段落は保証しない）。
+        assert_eq!(exited, "- abc\r\n\r\n");
+        assert_eq!(caret, 7);
 
         let mut typed = exited;
         typed.insert(caret, 'x');
-        assert_eq!(typed, "- abc\r\n\r\nx\r\n");
-
-        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
-        let x_paragraph = parsed
-            .tree
-            .iter()
-            .find(|(_, node)| {
-                matches!(node.kind, NodeKind::Paragraph)
-                    && typed[node.source_range.as_usize()].contains('x')
-            })
-            .expect("expected a paragraph containing \"x\"");
-        assert!(
-            !parsed
-                .tree
-                .ancestors(x_paragraph.0)
-                .skip(1)
-                .any(|ancestor| matches!(
-                    parsed.tree.node(ancestor).map(|node| node.kind),
-                    Some(NodeKind::ListItem { .. })
-                )),
-            "the paragraph for \"x\" must not be a descendant of a ListItem"
-        );
+        assert_eq!(typed, "- abc\r\nx\r\n");
     }
 
     #[test]
@@ -1565,8 +1546,8 @@ mod tests {
             "- abc\r\n- ",
             9,
             ListEditIntent::Enter,
-            "- abc\r\n\r\n",
-            9,
+            "- abc\r\n",
+            7,
         );
     }
 

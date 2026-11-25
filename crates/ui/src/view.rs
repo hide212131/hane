@@ -12649,7 +12649,8 @@ mod tests {
             );
 
             let shaper = FixedAdvanceShaper::new(8.0);
-            for offset in [25] {
+            {
+                let offset = 25;
                 view.editor_mut()
                     .set_selection(Selection::caret(SourceOffset(offset)))
                     .unwrap();
