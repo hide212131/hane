@@ -317,6 +317,9 @@ command_actions! {
     },
     // Voice composition P1 (debug and review). Each does nothing unless the
     // setting is on.
+    // The recording command: start at the caret / stop. Needs the engine.
+    VoiceCapture ("f7") => voice_capture_action |view, _window, cx| { view.voice_capture_toggle(cx); },
+    VoiceCaptureCancel ("alt-f7") => voice_capture_cancel_action |view, _window, cx| { view.voice_debug_cancel(cx); },
     VoiceDebugStep ("f8") => voice_debug_step_action |view, _window, cx| { view.voice_debug_step(cx); },
     VoiceDebugRun ("shift-f8") => voice_debug_run_action |view, _window, cx| { view.voice_debug_run(cx); },
     VoiceDebugCancel ("alt-f8") => voice_debug_cancel_action |view, _window, cx| { view.voice_debug_cancel(cx); },

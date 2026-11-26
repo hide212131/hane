@@ -14,6 +14,7 @@ members = [
     "crates/ui",
     "crates/update",
     "crates/updater",
+    "crates/voice",
 ]
 resolver = "2"
 exclude = ["vendor/accesskit_windows", "vendor/gpui", "vendor/gpui-pre-macos", "vendor/gpui-pre-windows"]
@@ -37,6 +38,7 @@ hane-network = { path = "crates/network" }
 hane-presentation = { path = "crates/presentation" }
 hane-session = { path = "crates/session" }
 hane-ui = { path = "crates/ui" }
+hane-voice = { path = "crates/voice" }
 hane-update = { path = "crates/update" }
 gpui = { package = "gpui-pre", version = "=0.3.6" }
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["runtime_shaders", "font-kit", "wayland", "x11"] }

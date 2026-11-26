@@ -35,6 +35,7 @@ mod limited_start;
 mod network_state;
 #[cfg(target_os = "windows")]
 mod open_request;
+mod voice_engine;
 #[cfg(target_os = "windows")]
 mod whisparrot_link;
 #[cfg(test)]
@@ -993,6 +994,7 @@ pub(crate) fn open_editor(cx: &mut App, launch: EditorLaunch) {
     if let Some(setup) = whisparrot_link {
         whisparrot_link::start(cx, window, setup);
     }
+    voice_engine::start(cx, window);
     if let Some(service) = auto_update_service {
         // The first deadline counts from the window's creation, not from
         // process start, so a long document load cannot make the first request

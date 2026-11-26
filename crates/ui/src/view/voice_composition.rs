@@ -19,6 +19,8 @@ use hane_editor::{
     VoiceEnvelope, VoiceError, VoiceEvent,
 };
 use hane_presentation::{VirtualInsert, splice_virtual_text};
+use hane_voice::{Context as VoiceContext, Failure, Inbound, VoiceControl};
+use std::sync::Arc;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 
@@ -75,8 +77,19 @@ struct ScriptRun {
     cursor: usize,
 }
 
+/// A recording Hane started on the engine and has not yet seen end.
+struct EngineRun {
+    session_id: String,
+    /// `capture.stop` was sent: the remaining results are being drained.
+    stopping: bool,
+}
+
 #[derive(Default)]
 pub(super) struct VoiceViewState {
+    /// The engine, or `None` where there is none (the debug script still runs).
+    control: Option<Arc<dyn VoiceControl>>,
+    /// The engine recording in progress, until its `session.end`.
+    engine: Option<EngineRun>,
     /// The document the session belongs to: session id and generation.
     owner: Option<(SessionId, u64)>,
     /// The segment `Enter` / `Esc` act on. `None` leaves both keys to the body.
@@ -138,6 +151,13 @@ impl EditorView {
     /// Drops the session of the document that owns it and clears the view's
     /// share of the state.
     fn voice_cancel_everywhere(&mut self) {
+        // A recording on the engine ends with the local session: the local side
+        // stops listening now, the engine is told once.
+        if let Some(run) = self.voice.engine.take()
+            && let Some(control) = &self.voice.control
+        {
+            control.cancel(&run.session_id);
+        }
         if let Some((id, _)) = self.voice.owner.take()
             && let Some(session) = self.sessions.get_mut(id)
         {
@@ -394,7 +414,9 @@ impl EditorView {
     /// The debug command: sends the next event of the fixed script, starting a
     /// session first when none is running.
     pub fn voice_debug_step(&mut self, cx: &mut Context<Self>) {
-        if !self.settings.voice_composition {
+        // The script is for development without an engine; it never mixes into
+        // a recording that is running on one.
+        if !self.settings.voice_composition || self.voice.engine.is_some() {
             return;
         }
         if self.voice.script.is_none() {
@@ -438,9 +460,167 @@ impl EditorView {
         }
     }
 
-    /// The debug command: ends the session as cancelled.
+    /// Cancels the session (a recording on the engine, or the debug script).
+    /// Confirmed text stays; everything unconfirmed is dropped.
     pub fn voice_debug_cancel(&mut self, cx: &mut Context<Self>) {
         self.voice_cancel_everywhere();
+        self.voice_after_display_change(cx);
+    }
+
+    /// The explicit engine executable from the settings, when one is set.
+    pub fn voice_engine_path(&self) -> Option<std::path::PathBuf> {
+        self.settings.voice_engine_path.clone()
+    }
+
+    /// Installs the engine that recordings run on. Without one the setting
+    /// still works with the debug script.
+    pub fn attach_voice_control(&mut self, control: Option<Arc<dyn VoiceControl>>) {
+        self.voice.control = control;
+    }
+
+    /// Whether a recording is running on the engine.
+    pub fn voice_recording(&self) -> bool {
+        self.voice.engine.is_some()
+    }
+
+    /// The text around the caret handed to the engine as a fixed snapshot when
+    /// the user allowed it: up to 1,200 scalars before and 200 after, of the
+    /// confirmed text only. No path, version, selection or whole document.
+    fn voice_context(&mut self) -> Option<VoiceContext> {
+        if !self.settings.voice_document_context {
+            return None;
+        }
+        let editor = self.sessions.active().editor();
+        let document = editor.document();
+        let caret = editor.selection().active.0;
+        let end = document.len_bytes().0;
+        // Byte windows wide enough for the scalar limits. Only the far end of
+        // each is arbitrary, so it is moved off the middle of a character.
+        let before_start = caret.saturating_sub(1200 * 4);
+        let before_window = (0..4)
+            .filter(|skip| before_start + skip <= caret)
+            .find_map(|skip| {
+                document
+                    .text(SourceRange::new(before_start + skip, caret))
+                    .ok()
+            })
+            .unwrap_or_default();
+        let after_stop = (caret + 200 * 4).min(end);
+        let after_window = (0..4)
+            .filter_map(|skip| after_stop.checked_sub(skip).filter(|stop| *stop >= caret))
+            .find_map(|stop| document.text(SourceRange::new(caret, stop)).ok())
+            .unwrap_or_default();
+        let scalars: Vec<char> = before_window.chars().collect();
+        let before: String = scalars[scalars.len().saturating_sub(1200)..].iter().collect();
+        let after: String = after_window.chars().take(200).collect();
+        (!before.is_empty() || !after.is_empty()).then_some(VoiceContext { before, after })
+    }
+
+    /// The recording command: starts recording at the caret, or stops a
+    /// recording that is running (the remaining results still arrive).
+    pub fn voice_capture_toggle(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.voice_composition {
+            return;
+        }
+        let Some(control) = self.voice.control.clone() else {
+            self.voice.status = Some("この環境には音声エンジンがありません".to_owned());
+            cx.notify();
+            return;
+        };
+        if let Some(run) = self.voice.engine.as_mut() {
+            if !run.stopping {
+                run.stopping = true;
+                control.stop(&run.session_id);
+                self.voice.status = Some("録音を停止しています…".to_owned());
+                cx.notify();
+            }
+            return;
+        }
+        if self.voice.script.is_some() {
+            self.voice.status = Some("デバッグ台本の実行中です。取消してから録音してください".to_owned());
+            cx.notify();
+            return;
+        }
+        let context = self.voice_context();
+        let Some(session_id) = self.voice_begin_session(cx) else {
+            return;
+        };
+        match control.begin(&session_id, context) {
+            Ok(()) => {
+                self.voice.engine = Some(EngineRun {
+                    session_id,
+                    stopping: false,
+                });
+                self.voice.status = Some("音声エンジンを準備しています…".to_owned());
+            }
+            Err(reason) => {
+                // Nothing was recorded: say why and where to go.
+                self.voice_cancel_everywhere();
+                self.voice.status = Some(reason);
+            }
+        }
+        self.voice_after_display_change(cx);
+    }
+
+    /// One message from the engine link, in arrival order. Events are applied
+    /// as display updates; a lost link cancels a recording that has not ended.
+    pub fn voice_engine_inbound(&mut self, inbound: Inbound, cx: &mut Context<Self>) {
+        match inbound {
+            Inbound::Event(envelope) => {
+                let ours = self
+                    .voice
+                    .engine
+                    .as_ref()
+                    .is_some_and(|run| run.session_id == envelope.session_id);
+                if !ours {
+                    // A recording that was cancelled here, or never started
+                    // here: not taken into the current session.
+                    return;
+                }
+                let session_id = envelope.session_id.clone();
+                let started = matches!(envelope.event, VoiceEvent::SessionStart);
+                let ends = matches!(envelope.event, VoiceEvent::SessionEnd { .. });
+                match self.voice_apply_event(envelope, cx) {
+                    Ok(_) => {
+                        if started {
+                            self.voice.status = None;
+                        }
+                        if ends {
+                            self.voice.engine = None;
+                        }
+                    }
+                    Err(error) => {
+                        // The editor already dropped the session. The recording
+                        // is released and the connection closed.
+                        self.voice.engine = None;
+                        if let Some(control) = &self.voice.control {
+                            control.cancel(&session_id);
+                            control.disconnect();
+                        }
+                        self.voice.status = Some(match error {
+                            VoiceError::Contract(_) => {
+                                "音声エンジンが契約に違反したため、録音を取り消しました".to_owned()
+                            }
+                            _ => "音声入力を続けられなくなったため、録音を取り消しました".to_owned(),
+                        });
+                        self.voice_cancel_everywhere();
+                        self.voice_after_display_change(cx);
+                    }
+                }
+            }
+            Inbound::Lost(failure) => self.voice_engine_lost(failure, cx),
+        }
+    }
+
+    fn voice_engine_lost(&mut self, failure: Failure, cx: &mut Context<Self>) {
+        let message = failure.message();
+        if self.voice.engine.is_some() {
+            // The recording did not reach its end: unconfirmed text is dropped,
+            // what was confirmed stays.
+            self.voice_cancel_everywhere();
+        }
+        // A review after a normal end continues without the engine.
+        self.voice.status = Some(message);
         self.voice_after_display_change(cx);
     }
 
@@ -577,6 +757,30 @@ impl EditorView {
                 el.child(div().child(format!("認識できなかった区間 {failed} 件")))
             })
             .children(notice.map(|notice| div().text_color(rgb(theme.quote_foreground)).child(notice)));
+        if let Some(run) = &self.voice.engine {
+            let stop = view.clone();
+            let cancel = view.clone();
+            if !run.stopping {
+                header = header.child(
+                    Button::new("voice-stop")
+                        .label("録音を停止")
+                        .small()
+                        .ghost()
+                        .on_click(move |_, _window, app| {
+                            stop.update(app, |view, cx| view.voice_capture_toggle(cx));
+                        }),
+                );
+            }
+            header = header.child(
+                Button::new("voice-cancel")
+                    .label("取消")
+                    .small()
+                    .ghost()
+                    .on_click(move |_, _window, app| {
+                        cancel.update(app, |view, cx| view.voice_debug_cancel(cx));
+                    }),
+            );
+        }
         if !segments.is_empty() {
             let all = view.clone();
             let none = view.clone();
@@ -1378,5 +1582,421 @@ mod tests {
         view.update(cx, |view, _| {
             assert!(view.editor().voice().is_none());
         });
+    }
+
+    // ---- the engine as the event source ----------------------------------
+
+    /// Records what the editor asked of the engine, and answers `begin` as
+    /// scripted. Stands in for the real engine: the events then come in through
+    /// `voice_engine_inbound` exactly as the app's pump delivers them.
+    #[derive(Default)]
+    struct FakeControl {
+        calls: std::sync::Mutex<Vec<String>>,
+        contexts: std::sync::Mutex<Vec<Option<VoiceContext>>>,
+        refuse: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakeControl {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl VoiceControl for FakeControl {
+        fn begin(&self, session_id: &str, context: Option<VoiceContext>) -> Result<(), String> {
+            if let Some(reason) = self.refuse.lock().unwrap().clone() {
+                return Err(reason);
+            }
+            self.calls.lock().unwrap().push(format!("begin {session_id}"));
+            self.contexts.lock().unwrap().push(context);
+            Ok(())
+        }
+
+        fn stop(&self, session_id: &str) {
+            self.calls.lock().unwrap().push(format!("stop {session_id}"));
+        }
+
+        fn cancel(&self, session_id: &str) {
+            self.calls.lock().unwrap().push(format!("cancel {session_id}"));
+        }
+
+        fn disconnect(&self) {
+            self.calls.lock().unwrap().push("disconnect".to_owned());
+        }
+
+        fn shutdown(&self) {
+            self.calls.lock().unwrap().push("shutdown".to_owned());
+        }
+    }
+
+    fn with_engine<'a>(
+        cx: &'a mut gpui::TestAppContext,
+        source: &str,
+        caret: usize,
+    ) -> (TestView, &'a mut TestCx, Arc<FakeControl>) {
+        let (view, cx) = open_view(cx, SessionSet::with_untitled(source, "Untitled"), true);
+        let control = Arc::new(FakeControl::default());
+        view.update(cx, |view, _| {
+            view.attach_voice_control(Some(control.clone()));
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(caret)))
+                .unwrap();
+        });
+        (view, cx, control)
+    }
+
+    fn toggle(view: &TestView, cx: &mut TestCx) {
+        view.update(cx, |view, cx| view.voice_capture_toggle(cx));
+        settle(cx);
+    }
+
+    fn session_of(view: &TestView, cx: &mut TestCx) -> String {
+        view.read_with(cx, |view, _| {
+            view.editor().voice().expect("a session").session_id().to_owned()
+        })
+    }
+
+    fn inbound(view: &TestView, cx: &mut TestCx, session: &str, no: u64, event: VoiceEvent) {
+        let envelope = VoiceEnvelope {
+            session_id: session.to_owned(),
+            event_no: no,
+            event,
+        };
+        view.update(cx, |view, cx| view.voice_engine_inbound(Inbound::Event(envelope), cx));
+        settle(cx);
+    }
+
+    fn lost(view: &TestView, cx: &mut TestCx, failure: Failure) {
+        view.update(cx, |view, cx| view.voice_engine_inbound(Inbound::Lost(failure), cx));
+        settle(cx);
+    }
+
+    fn status_of(view: &TestView, cx: &mut TestCx) -> Option<String> {
+        view.read_with(cx, |view, _| {
+            view.editor()
+                .voice_notice()
+                .map(str::to_owned)
+                .or_else(|| view.voice.status.clone())
+        })
+    }
+
+    #[gpui::test]
+    fn the_recording_command_starts_stops_and_reviews_through_the_engine(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, control) = with_engine(cx, "前文。", "前文。".len());
+        toggle(&view, cx);
+        let session = session_of(&view, cx);
+        assert_eq!(control.calls(), [format!("begin {session}")]);
+        assert!(view.read_with(cx, |view, _| view.voice_recording()));
+        // Starting again while recording does not start another recording.
+        view.update(cx, |view, cx| {
+            view.voice_begin_session(cx);
+        });
+        assert_eq!(control.calls().len(), 1);
+
+        inbound(&view, cx, &session, 1, VoiceEvent::SessionStart);
+        inbound(
+            &view,
+            cx,
+            &session,
+            2,
+            VoiceEvent::SegmentRaw {
+                seq: 1,
+                status: RawStatus::Ok {
+                    text: "一つ目".into(),
+                    polish: PolishMode::Off,
+                },
+            },
+        );
+        assert_eq!(visual_lines(&view, cx), ["前文。一つ目"]);
+        assert_eq!(text_of(&view, cx), "前文。", "unconfirmed text is not in the document");
+
+        // The command again stops the recording; the engine is told once.
+        toggle(&view, cx);
+        toggle(&view, cx);
+        assert_eq!(control.calls(), [format!("begin {session}"), format!("stop {session}")]);
+        inbound(
+            &view,
+            cx,
+            &session,
+            3,
+            VoiceEvent::SessionEnd {
+                status: EndStatus::Completed,
+                last_seq: 1,
+            },
+        );
+        // The review continues without the engine.
+        assert!(!view.read_with(cx, |view, _| view.voice_recording()));
+        view.update(cx, |view, cx| view.voice_commit_all(cx));
+        settle(cx);
+        assert_eq!(text_of(&view, cx), "前文。一つ目");
+    }
+
+    #[gpui::test]
+    fn an_engine_that_cannot_be_used_records_nothing_and_says_why(cx: &mut gpui::TestAppContext) {
+        let (view, cx, control) = with_engine(cx, "前文。", "前文。".len());
+        *control.refuse.lock().unwrap() =
+            Some("whisparrot が見つかりません。whisparrot をインストールまたは更新してください".into());
+        toggle(&view, cx);
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().voice().is_none(), "no session is left behind");
+            assert!(!view.voice_recording());
+        });
+        assert!(status_of(&view, cx).unwrap().contains("インストール"));
+        // Not even a cancel was sent: nothing was started.
+        assert!(control.calls().is_empty());
+        // Without an engine at all (no control attached) there is a reason too.
+        view.update(cx, |view, _| view.attach_voice_control(None));
+        toggle(&view, cx);
+        assert!(status_of(&view, cx).unwrap().contains("音声エンジン"));
+    }
+
+    #[gpui::test]
+    fn losing_the_engine_midway_drops_the_unconfirmed_and_keeps_the_confirmed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, control) = with_engine(cx, "前文。", "前文。".len());
+        toggle(&view, cx);
+        let session = session_of(&view, cx);
+        inbound(&view, cx, &session, 1, VoiceEvent::SessionStart);
+        for (no, seq, text) in [(2, 1, "確定する"), (3, 2, "消える")] {
+            inbound(
+                &view,
+                cx,
+                &session,
+                no,
+                VoiceEvent::SegmentRaw {
+                    seq,
+                    status: RawStatus::Ok {
+                        text: text.into(),
+                        polish: PolishMode::Off,
+                    },
+                },
+            );
+        }
+        view.update(cx, |view, cx| {
+            view.voice_commit(1, cx);
+        });
+        lost(&view, cx, Failure::Disconnected(Some(1)));
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().voice().is_none());
+            assert!(!view.voice_recording());
+        });
+        assert_eq!(text_of(&view, cx), "前文。確定する");
+        assert!(status_of(&view, cx).unwrap().contains("音声エンジンが終了しました"));
+        // The recording is released: a new one can start (a new launch).
+        toggle(&view, cx);
+        assert!(view.read_with(cx, |view, _| view.voice_recording()));
+        assert_eq!(control.calls().iter().filter(|call| call.starts_with("begin")).count(), 2);
+    }
+
+    #[gpui::test]
+    fn losing_the_engine_after_a_normal_end_keeps_the_review(cx: &mut gpui::TestAppContext) {
+        let (view, cx, _control) = with_engine(cx, "", 0);
+        toggle(&view, cx);
+        let session = session_of(&view, cx);
+        inbound(&view, cx, &session, 1, VoiceEvent::SessionStart);
+        inbound(
+            &view,
+            cx,
+            &session,
+            2,
+            VoiceEvent::SegmentRaw {
+                seq: 1,
+                status: RawStatus::Ok {
+                    text: "残る".into(),
+                    polish: PolishMode::Off,
+                },
+            },
+        );
+        inbound(
+            &view,
+            cx,
+            &session,
+            3,
+            VoiceEvent::SessionEnd {
+                status: EndStatus::Completed,
+                last_seq: 1,
+            },
+        );
+        lost(&view, cx, Failure::Disconnected(Some(0)));
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.voice_segments().len(), 1, "the segment can still be reviewed");
+        });
+        view.update(cx, |view, cx| {
+            view.voice_commit(1, cx);
+        });
+        settle(cx);
+        assert_eq!(text_of(&view, cx), "残る");
+    }
+
+    #[gpui::test]
+    fn a_broken_event_sequence_cancels_the_recording_and_closes_the_connection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, control) = with_engine(cx, "前文。", "前文。".len());
+        toggle(&view, cx);
+        let session = session_of(&view, cx);
+        inbound(&view, cx, &session, 1, VoiceEvent::SessionStart);
+        // A raw segment that skips seq 1.
+        inbound(
+            &view,
+            cx,
+            &session,
+            2,
+            VoiceEvent::SegmentRaw {
+                seq: 2,
+                status: RawStatus::Ok {
+                    text: "飛んだ".into(),
+                    polish: PolishMode::Off,
+                },
+            },
+        );
+        view.read_with(cx, |view, _| {
+            assert!(view.editor().voice().is_none());
+            assert!(!view.voice_recording());
+        });
+        let calls = control.calls();
+        assert!(calls.contains(&format!("cancel {session}")), "{calls:?}");
+        assert!(calls.contains(&"disconnect".to_owned()), "{calls:?}");
+        assert_eq!(text_of(&view, cx), "前文。");
+        assert!(status_of(&view, cx).is_some());
+    }
+
+    #[gpui::test]
+    fn cancelling_closes_the_local_side_at_once_and_late_events_do_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx, control) = with_engine(cx, "前文。", "前文。".len());
+        toggle(&view, cx);
+        let session = session_of(&view, cx);
+        inbound(&view, cx, &session, 1, VoiceEvent::SessionStart);
+        view.update(cx, |view, cx| view.voice_debug_cancel(cx));
+        view.update(cx, |view, cx| view.voice_debug_cancel(cx));
+        assert_eq!(
+            control.calls().iter().filter(|call| call.starts_with("cancel")).count(),
+            1,
+            "the engine is told once"
+        );
+        let before = doc_state(&view, cx);
+        for (no, event) in [
+            (
+                2,
+                VoiceEvent::SegmentRaw {
+                    seq: 1,
+                    status: RawStatus::Ok {
+                        text: "遅れて届く".into(),
+                        polish: PolishMode::Off,
+                    },
+                },
+            ),
+            (
+                3,
+                VoiceEvent::SessionEnd {
+                    status: EndStatus::Cancelled,
+                    last_seq: 1,
+                },
+            ),
+        ] {
+            inbound(&view, cx, &session, no, event);
+        }
+        view.read_with(cx, |view, _| assert!(view.editor().voice().is_none()));
+        assert_eq!(doc_state(&view, cx), before);
+        // Events of an id this window never issued are not taken in either.
+        toggle(&view, cx);
+        let current = session_of(&view, cx);
+        inbound(&view, cx, &session, 1, VoiceEvent::SessionStart);
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.editor().voice().unwrap().session_id(), current);
+            assert!(!view.editor().voice().unwrap().is_resolved(1));
+        });
+    }
+
+    #[gpui::test]
+    fn the_debug_script_stays_for_use_without_an_engine(cx: &mut gpui::TestAppContext) {
+        let (view, cx, control) = with_engine(cx, "", 0);
+        // No recording: F8 steps the script as before.
+        view.update(cx, |view, cx| view.voice_debug_step(cx));
+        view.read_with(cx, |view, _| assert!(view.editor().voice().is_some()));
+        // While the script runs, the recording command refuses to start.
+        toggle(&view, cx);
+        assert!(control.calls().is_empty());
+        assert!(status_of(&view, cx).unwrap().contains("デバッグ台本"));
+        // And a recording on the engine is not mixed with the script.
+        view.update(cx, |view, cx| view.voice_debug_cancel(cx));
+        toggle(&view, cx);
+        let before = view.read_with(cx, |view, _| view.editor().voice().unwrap().segments().len());
+        view.update(cx, |view, cx| view.voice_debug_step(cx));
+        let after = view.read_with(cx, |view, _| view.editor().voice().unwrap().segments().len());
+        assert_eq!(before, after);
+    }
+
+    /// What a run leaves: the lines drawn while unconfirmed, the segments
+    /// shown, and the text after confirming everything.
+    type Outcome = (Vec<String>, Vec<(u64, String)>, String);
+
+    fn outcome_of(view: &TestView, cx: &mut TestCx) -> Outcome {
+        let lines = visual_lines(view, cx);
+        let shown = view.read_with(cx, |view, _| {
+            view.voice_segments()
+                .iter()
+                .map(|segment| (segment.seq, segment.shown.clone()))
+                .collect()
+        });
+        view.update(cx, |view, cx| view.voice_commit_all(cx));
+        settle(cx);
+        (lines, shown, text_of(view, cx))
+    }
+
+    #[gpui::test]
+    fn the_script_through_the_engine_path_matches_the_debug_script(cx: &mut gpui::TestAppContext) {
+        let direct = {
+            let (view, cx, _control) = with_engine(cx, "前文。", "前文。".len());
+            for _ in 0..script_events().len() {
+                view.update(cx, |view, cx| view.voice_debug_step(cx));
+            }
+            settle(cx);
+            outcome_of(&view, cx)
+        };
+        let engine = {
+            let (view, cx, _control) = with_engine(cx, "前文。", "前文。".len());
+            toggle(&view, cx);
+            let session = session_of(&view, cx);
+            for (index, event) in script_events().into_iter().enumerate() {
+                inbound(&view, cx, &session, index as u64 + 1, event);
+            }
+            outcome_of(&view, cx)
+        };
+        assert_eq!(engine, direct);
+        assert!(!direct.1.is_empty());
+    }
+
+    #[gpui::test]
+    fn the_context_is_sent_only_when_allowed_and_is_cut_at_the_limits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let long: String = "あ".repeat(1500) + "ここ" + &"い".repeat(300);
+        let caret = "あ".repeat(1500).len() + "ここ".len();
+        let (view, cx, control) = with_engine(cx, &long, caret);
+        toggle(&view, cx);
+        assert_eq!(control.contexts.lock().unwrap().as_slice(), [None]);
+        view.update(cx, |view, cx| view.voice_debug_cancel(cx));
+        view.update(cx, |view, _| view.settings.voice_document_context = true);
+        toggle(&view, cx);
+        let sent = control.contexts.lock().unwrap().last().cloned().unwrap().unwrap();
+        assert_eq!(sent.before.chars().count(), 1200);
+        assert!(sent.before.ends_with("ここ"));
+        assert_eq!(sent.after.chars().count(), 200);
+        assert!(sent.after.chars().all(|c| c == 'い'));
+        // Near the start and end of a short document the sides are just shorter.
+        view.update(cx, |view, cx| view.voice_debug_cancel(cx));
+        view.update(cx, |view, _| {
+            view.editor_mut().set_selection(Selection::caret(SourceOffset(0))).unwrap();
+        });
+        toggle(&view, cx);
+        let sent = control.contexts.lock().unwrap().last().cloned().unwrap().unwrap();
+        assert!(sent.before.is_empty());
+        assert_eq!(sent.after.chars().count(), 200);
     }
 }

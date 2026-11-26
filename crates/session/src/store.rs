@@ -187,6 +187,14 @@ pub struct Settings {
     /// it: when a file says `true` for both, voice composition wins and the
     /// link is off.
     pub voice_composition: bool,
+    /// An explicit whisparrot executable for the voice engine
+    /// (`voice_engine_path` key), for development and verification. Unset:
+    /// the installed one is found through its registration.
+    pub voice_engine_path: Option<PathBuf>,
+    /// Whether the text around the caret may be sent to the engine as polish
+    /// context (`voice_document_context` key). Off until the user turns it on;
+    /// nothing is sent to the engine's cloud polish otherwise.
+    pub voice_document_context: bool,
 }
 
 impl Default for Settings {
@@ -206,6 +214,8 @@ impl Default for Settings {
             drying_ink_strength: DryingInkStrength::default(),
             whisparrot_link: false,
             voice_composition: false,
+            voice_engine_path: None,
+            voice_document_context: false,
         }
     }
 }
@@ -605,6 +615,15 @@ impl SettingsRepository for FileStateStore {
             settings.whisparrot_link && !settings.voice_composition,
             settings.voice_composition
         );
+        if let Some(path) = &settings.voice_engine_path {
+            contents.push_str("voice_engine_path=");
+            contents.push_str(&escape_line(&path.to_string_lossy()));
+            contents.push('\n');
+        }
+        contents.push_str(&format!(
+            "voice_document_context={}\n",
+            settings.voice_document_context
+        ));
         if let Some(folder) = &settings.default_folder {
             contents.push_str("default_folder=");
             contents.push_str(&escape_line(&folder.to_string_lossy()));
@@ -664,6 +683,11 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.whisparrot_link = value == "true";
                 } else if let Some(value) = line.strip_prefix("voice_composition=") {
                     settings.voice_composition = value == "true";
+                } else if let Some(value) = line.strip_prefix("voice_engine_path=") {
+                    let path = unescape_line(value);
+                    settings.voice_engine_path = (!path.is_empty()).then(|| PathBuf::from(path));
+                } else if let Some(value) = line.strip_prefix("voice_document_context=") {
+                    settings.voice_document_context = value == "true";
                 }
             }
             if settings.voice_composition {
@@ -1031,6 +1055,8 @@ mod tests {
             drying_ink_strength: DryingInkStrength::Strong,
             whisparrot_link: true,
             voice_composition: false,
+            voice_engine_path: None,
+            voice_document_context: false,
         };
         SettingsRepository::store(&store, &settings).unwrap();
         assert_eq!(
@@ -1246,6 +1272,8 @@ mod tests {
                     drying_ink_strength: DryingInkStrength::Standard,
                     whisparrot_link: false,
                     voice_composition: false,
+                    voice_engine_path: None,
+                    voice_document_context: false,
                 })
                 .unwrap();
         }
@@ -1507,6 +1535,30 @@ mod tests {
         SettingsRepository::store(&store, &settings).unwrap();
         let text = fs::read_to_string(root.join("settings.conf")).unwrap();
         assert!(text.contains("whisparrot_link=false\nvoice_composition=true\n"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_voice_engine_settings_default_to_detection_and_no_context_and_round_trip() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.voice_engine_path, None);
+        assert!(!defaults.voice_document_context);
+        assert_eq!(load_after_writing("voice_engine_path=\n").voice_engine_path, None);
+        for value in ["false", "", "TRUE", "1"] {
+            let loaded = load_after_writing(&format!("voice_document_context={value}\n"));
+            assert!(!loaded.voice_document_context, "value {value:?}");
+        }
+        let root = temporary_directory("state-voice-engine");
+        let store = FileStateStore::at(&root);
+        let settings = Settings {
+            voice_engine_path: Some(PathBuf::from("C:\\tools\\whisparrot.exe")),
+            voice_document_context: true,
+            ..Settings::default()
+        };
+        SettingsRepository::store(&store, &settings).unwrap();
+        let loaded = SettingsRepository::load(&store);
+        assert_eq!(loaded.voice_engine_path, settings.voice_engine_path);
+        assert!(loaded.voice_document_context);
         fs::remove_dir_all(root).unwrap();
     }
 
