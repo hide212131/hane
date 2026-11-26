@@ -646,7 +646,7 @@ impl Editor {
             });
             let _ = match held {
                 Held::Event(event) => self.voice_apply_now(event).map(|_| ()),
-                Held::Commit(seq) => self.voice_commit_now(seq).map(|_| ()),
+                Held::Commit(seq) => self.voice_commit_now(seq, true).map(|_| ()),
                 Held::Discard(seq) => self.voice_discard_now(seq),
                 Held::CommitAll => self.voice_commit_all_now(),
                 Held::DiscardAll => self.voice_discard_all_now(),
@@ -655,7 +655,7 @@ impl Editor {
     }
 
     /// Commits one segment with the sentence it currently shows.
-    /// One undoable insertion; the focus and unrelated selection stay put.
+    /// One undoable insertion; the caret moves to the end of the sentence.
     pub fn voice_commit(&mut self, seq: u64) -> Result<(), VoiceError> {
         self.voice_sync();
         let voice = self.voice.as_ref().ok_or(VoiceError::NoSession)?;
@@ -666,7 +666,7 @@ impl Editor {
             self.voice_hold(Held::Commit(seq), 0)?;
             return Ok(());
         }
-        self.voice_commit_now(seq).map(|_| ())
+        self.voice_commit_now(seq, true).map(|_| ())
     }
 
     pub fn voice_discard(&mut self, seq: u64) -> Result<(), VoiceError> {
@@ -718,7 +718,7 @@ impl Editor {
                 return Ok(());
             };
             let seq = segment.seq;
-            self.voice_commit_now(seq)?;
+            self.voice_commit_now(seq, true)?;
         }
     }
 
@@ -755,8 +755,11 @@ impl Editor {
     }
 
     /// The insertion itself. The history step, selection and every other
-    /// segment's offset are settled here, in one go.
-    fn voice_commit_now(&mut self, seq: u64) -> Result<OffsetMap, VoiceError> {
+    /// segment's offset are settled here, in one go. With `move_caret` the
+    /// caret goes to the end of the confirmed sentence, as when an IME commits;
+    /// without it the selection only follows the text (the edit that caused
+    /// the confirmation still needs the selection it was issued against).
+    fn voice_commit_now(&mut self, seq: u64, move_caret: bool) -> Result<OffsetMap, VoiceError> {
         self.voice_sync();
         let voice = self.voice.as_ref().ok_or(VoiceError::NoSession)?;
         let segment = voice
@@ -772,7 +775,11 @@ impl Editor {
         let summary = self.document.edit(SourceRange::empty(at), &text)?;
         let mut map = OffsetMap::default();
         map.push(at, len);
-        let selection_after = map.map_selection(selection_before);
+        let selection_after = if move_caret {
+            Selection::caret(SourceOffset(at + len))
+        } else {
+            map.map_selection(selection_before)
+        };
         self.selection = selection_after;
         self.preferred_grapheme_column = None;
         self.preferred_visual_x = None;
@@ -837,7 +844,7 @@ impl Editor {
             .collect();
         touched.sort_unstable();
         for seq in touched {
-            match self.voice_commit_now(seq) {
+            match self.voice_commit_now(seq, false) {
                 Ok(step) => map.0.extend(step.0),
                 Err(VoiceError::Buffer(error)) => return Err(error),
                 Err(_) => {}
@@ -864,7 +871,7 @@ impl Editor {
             .map(|segment| segment.seq)
             .collect();
         for seq in touched {
-            match self.voice_commit_now(seq) {
+            match self.voice_commit_now(seq, false) {
                 Ok(_) => {}
                 Err(VoiceError::Buffer(error)) => return Err(error),
                 Err(_) => {}

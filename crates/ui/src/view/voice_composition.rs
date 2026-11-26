@@ -676,7 +676,7 @@ impl EditorView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::EntityInputHandler;
+    use gpui::{EntityInputHandler, MouseButton};
     use hane_session::DraftId;
 
     type TestView = gpui::Entity<EditorView>;
@@ -1225,6 +1225,81 @@ mod tests {
         view.read_with(cx, |view, _| assert!(view.editor().voice().is_none()));
         undo(&view, cx);
         assert_eq!(text_of(&view, cx), "今日はいい天気ですね。次の章です。");
+    }
+
+    fn press(cx: &mut TestCx, keys: &str) {
+        cx.simulate_keystrokes(keys);
+        cx.run_until_parked();
+    }
+
+    fn caret_of(view: &TestView, cx: &mut TestCx) -> usize {
+        view.read_with(cx, |view, _| view.editor().selection().active.0)
+    }
+
+    #[gpui::test]
+    fn enter_confirms_after_the_whole_script_has_arrived_through_the_key_path(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = open_view(cx, SessionSet::with_untitled("", "Untitled"), true);
+        // Focus the body the way a click into the document does, then drive
+        // the whole script with F8 as on a real machine.
+        let point = cx.debug_bounds("row-0-0").expect("first row painted").center();
+        cx.simulate_mouse_down(point, MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_up(point, MouseButton::Left, gpui::Modifiers::none());
+        settle(cx);
+        for _ in 0..8 {
+            press(cx, "f8");
+        }
+        assert_eq!(pending_seqs(&view, cx), [1, 2, 3]);
+        press(cx, "enter");
+        assert_eq!(text_of(&view, cx), "今日はいい天気ですね。");
+        assert_eq!(pending_seqs(&view, cx), [2, 3]);
+        press(cx, "enter");
+        assert_eq!(text_of(&view, cx), "今日はいい天気ですね。次の章です。");
+        assert_eq!(pending_seqs(&view, cx), [3]);
+        press(cx, "enter");
+        assert_eq!(
+            text_of(&view, cx),
+            "今日はいい天気ですね。次の章です。Hello, voice composition."
+        );
+        assert!(pending_seqs(&view, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn the_caret_lands_after_the_confirmed_sentence(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = untitled(cx, "前後", "前".len());
+        let mut feed = Feed(1);
+        feed.start(&view, cx);
+        feed.raw(&view, cx, 1, "あ");
+        feed.raw(&view, cx, 2, "い");
+        view.update(cx, |view, cx| assert!(view.voice_handle_enter(cx)));
+        assert_eq!(text_of(&view, cx), "前あ後");
+        assert_eq!(caret_of(&view, cx), "前あ".len());
+        view.update(cx, |view, cx| assert!(view.voice_handle_enter(cx)));
+        assert_eq!(text_of(&view, cx), "前あい後");
+        assert_eq!(caret_of(&view, cx), "前あい".len());
+        undo(&view, cx);
+        assert_eq!(caret_of(&view, cx), "前あ".len());
+        undo(&view, cx);
+        assert_eq!(caret_of(&view, cx), "前".len());
+        redo(&view, cx);
+        assert_eq!(caret_of(&view, cx), "前あ".len());
+    }
+
+    #[gpui::test]
+    fn commit_all_puts_the_caret_after_the_last_confirmed_sentence(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = untitled(cx, "前後", "前".len());
+        let mut feed = Feed(1);
+        feed.start(&view, cx);
+        feed.raw(&view, cx, 1, "あ");
+        feed.raw(&view, cx, 2, "い");
+        view.update(cx, |view, cx| view.voice_commit_all(cx));
+        settle(cx);
+        assert_eq!(text_of(&view, cx), "前あい後");
+        assert_eq!(caret_of(&view, cx), "前あい".len());
     }
 
     #[gpui::test]
