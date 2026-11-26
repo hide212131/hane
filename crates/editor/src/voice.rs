@@ -286,6 +286,17 @@ impl VoiceComposition {
         &self.session_id
     }
 
+    /// Whether `offset` lies in the stretch this session works on: from the
+    /// start of its confirmed text (or the segment's anchor) to its tail.
+    pub fn region_contains(&self, anchor: usize, offset: usize) -> bool {
+        let start = self
+            .marks
+            .iter()
+            .map(|mark| mark.start)
+            .fold(anchor, usize::min);
+        (start..=self.tail.max(anchor)).contains(&offset)
+    }
+
     /// The unconfirmed segments in `seq` order.
     pub fn segments(&self) -> &[VoiceSegment] {
         &self.segments

@@ -239,6 +239,7 @@ impl EditorView {
     ) -> Result<VoiceApply, VoiceError> {
         let result = self.sessions.active_mut().editor_mut().voice_apply(envelope);
         self.voice_after_display_change(cx);
+        self.voice_focus_on_arrival();
         result
     }
 
@@ -255,6 +256,34 @@ impl EditorView {
         }
         self.resync_heights();
         cx.notify();
+    }
+
+    /// Speech that arrived while no segment has the operation focus gives it
+    /// to the first segment in drawing order, so `Enter` / `Esc` work at once.
+    /// Only arrivals do this: moving the focus past the last segment (`F9`)
+    /// keeps handing the keys back to the body.
+    fn voice_focus_on_arrival(&mut self) {
+        if self.voice.focus.is_none() {
+            self.voice.focus = self.voice_next_after(None);
+        }
+    }
+
+    /// The focused segment when the caret sits where it is composed (within the stretch the session
+    /// works on: its confirmed text, the anchor and the tail). Enter and
+    /// Esc elsewhere (the caret moved to another paragraph) are plain editing.
+    fn voice_caret_at_focus(&mut self) -> Option<u64> {
+        self.voice_sync_active();
+        let seq = self.voice.focus?;
+        let editor = self.sessions.active().editor();
+        let voice = editor.voice()?;
+        let anchor = voice
+            .segments()
+            .iter()
+            .find(|segment| segment.seq == seq)?
+            .offset();
+        let selection = editor.selection();
+        let at = selection.active.0;
+        (selection.range().is_empty() && voice.region_contains(anchor, at)).then_some(seq)
     }
 
     fn voice_after_commit(&mut self, next_focus: Option<u64>, cx: &mut Context<Self>) {
@@ -346,16 +375,16 @@ impl EditorView {
     /// whether the key was taken; without a focused segment it belongs to the
     /// body.
     pub(crate) fn voice_handle_enter(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.voice.focus.is_none() {
+        let Some(seq) = self.voice_caret_at_focus() else {
             return false;
-        }
-        self.voice_commit_focused(cx);
+        };
+        self.voice_commit(seq, cx);
         true
     }
 
     /// `Esc` with a focused segment: discard it.
     pub(crate) fn voice_handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(seq) = self.voice.focus else {
+        let Some(seq) = self.voice_caret_at_focus() else {
             return false;
         };
         self.voice_discard(seq, cx);
@@ -938,23 +967,56 @@ mod tests {
     }
 
     #[gpui::test]
-    fn enter_and_escape_belong_to_the_body_unless_a_segment_has_the_focus(
+    fn an_arriving_segment_takes_the_focus_so_enter_confirms_and_esc_discards(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = untitled(cx, "本文", "本文".len());
         let mut feed = Feed(1);
         feed.start(&view, cx);
         feed.raw(&view, cx, 1, "音声");
+        view.read_with(cx, |view, _| assert_eq!(view.voice_focused(), Some(1)));
+        view.update(cx, |view, cx| assert!(view.voice_handle_enter(cx)));
+        assert_eq!(text_of(&view, cx), "本文音声");
+        feed.raw(&view, cx, 2, "次");
+        view.read_with(cx, |view, _| assert_eq!(view.voice_focused(), Some(2)));
+        view.update(cx, |view, cx| assert!(view.voice_handle_escape(cx)));
+        assert_eq!(text_of(&view, cx), "本文音声");
+        assert!(pending_seqs(&view, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn enter_and_escape_return_to_the_body_when_the_caret_is_elsewhere_or_focus_passed_on(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = untitled(cx, "本文\n別段落", "本文".len());
+        let mut feed = Feed(1);
+        feed.start(&view, cx);
+        feed.raw(&view, cx, 1, "音声");
+        // The caret moves to another paragraph: the focus stays, the keys go back.
+        select(&view, cx, "本文\n別".len(), "本文\n別".len());
         view.update(cx, |view, cx| {
+            assert_eq!(view.voice_focused(), Some(1));
             assert!(!view.voice_handle_enter(cx));
             assert!(!view.voice_handle_escape(cx));
         });
-        assert_eq!(text_of(&view, cx), "本文");
-        // Typing hands the keys back to the body again.
-        view.update(cx, |view, cx| view.voice_set_focus(1, cx));
+        assert_eq!(pending_seqs(&view, cx), [1]);
+        // Back at the composition position they act again.
+        select(&view, cx, "本文".len(), "本文".len());
+        view.update(cx, |view, cx| assert!(view.voice_handle_escape(cx)));
+        assert!(pending_seqs(&view, cx).is_empty());
+        // F9 past the last segment hands the keys back to the body.
+        feed.raw(&view, cx, 2, "二");
+        view.update(cx, |view, cx| {
+            view.voice_focus_next(cx);
+            assert_eq!(view.voice_focused(), None);
+            assert!(!view.voice_handle_enter(cx));
+            assert!(!view.voice_handle_escape(cx));
+        });
+        // Typing hands the keys back to the body as well.
+        view.update(cx, |view, cx| view.voice_set_focus(2, cx));
         replace_in(&view, cx, None, "X");
         view.read_with(cx, |view, _| assert_eq!(view.voice_focused(), None));
-        assert_eq!(pending_seqs(&view, cx), [1]);
+        assert_eq!(pending_seqs(&view, cx), [2]);
     }
 
     #[gpui::test]
