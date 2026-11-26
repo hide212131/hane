@@ -39,6 +39,9 @@ impl EditorView {
                 let (image, _reservation) = retired.into_parts();
                 app.drop_image(image, None);
             }
+            if let Some(image) = view.paper_texture.take_image() {
+                app.drop_image(image, None);
+            }
         });
         // The caret's mode badge (see `caret_input_mode`) has to
         // update the moment the user switches IME mode, even if nothing else
@@ -292,6 +295,7 @@ impl EditorView {
             joined_parse_jobs_running: 0,
             mermaid: MermaidStore::new(),
             drying_ink: drying_ink::DryingInkState::new(ink_epoch),
+            paper_texture: paper_texture::PaperTextureState::new(),
             _mermaid_release_subscription: mermaid_release_subscription,
         }
     }

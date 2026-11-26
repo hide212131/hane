@@ -1,5 +1,5 @@
 use super::*;
-use hane_session::{DryingInkSpeed, DryingInkStrength};
+use hane_session::{DryingInkSpeed, DryingInkStrength, PaperTextureStrength};
 
 impl EditorView {
     pub(crate) fn toggle_autosave(&mut self, cx: &mut Context<Self>) {
@@ -632,6 +632,37 @@ impl EditorView {
                     view.set_syntax_highlight(*checked, cx);
                 });
             });
+        let paper_texture_view = cx.entity();
+        let paper_texture = Checkbox::new("settings-paper-texture")
+            .checked(self.paper_texture_enabled())
+            .label("背景に紙・壁の質感を敷く")
+            .on_click(move |checked, _window, app| {
+                paper_texture_view.update(app, |view, cx| {
+                    view.set_paper_texture(*checked, cx);
+                });
+            });
+        // The strength only matters while the texture is on.
+        let paper_texture_on = self.paper_texture_enabled();
+        let current_texture_strength = self.paper_texture_strength();
+        let texture_strength_view = cx.entity();
+        let texture_strength_buttons = [
+            (PaperTextureStrength::Weak, "弱"),
+            (PaperTextureStrength::Standard, "標準"),
+            (PaperTextureStrength::Strong, "強"),
+        ]
+        .map(|(strength, label)| {
+            let view = texture_strength_view.clone();
+            Button::new(format!("settings-paper-texture-strength-{}", strength.as_str()))
+                .label(label)
+                .ghost()
+                .disabled(!paper_texture_on)
+                .selected(current_texture_strength == strength)
+                .on_click(move |_, _window, app| {
+                    view.update(app, |view, cx| {
+                        view.set_paper_texture_strength(strength, cx);
+                    });
+                })
+        });
         let drying_ink_view = cx.entity();
         let drying_ink = Checkbox::new("settings-drying-ink")
             .checked(self.drying_ink_enabled())
@@ -651,6 +682,16 @@ impl EditorView {
             .on_click(move |checked, _window, app| {
                 band_view.update(app, |view, cx| {
                     view.set_drying_ink_band(*checked, cx);
+                });
+            });
+        let soak_view = cx.entity();
+        let drying_ink_soak = Checkbox::new("settings-drying-ink-soak")
+            .checked(self.drying_ink_soak_enabled())
+            .disabled(!drying_ink_on)
+            .label("確定した文字の背後を、乾くまで紙が濡れたように少し沈ませる（質感と組み合わせると見えやすい）")
+            .on_click(move |checked, _window, app| {
+                soak_view.update(app, |view, cx| {
+                    view.set_drying_ink_soak(*checked, cx);
                 });
             });
         let current_speed = self.drying_ink_speed();
@@ -759,6 +800,35 @@ impl EditorView {
                             ),
                     )
                     .child(
+                        card("settings-paper-texture-card")
+                            .child(paper_texture)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .when(!paper_texture_on, |element| element.opacity(0.5))
+                                    .child(
+                                        div()
+                                            .text_color(rgb(self.theme.quote_foreground))
+                                            .child("質感の強さ"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .flex_wrap()
+                                            .gap_2()
+                                            .children(texture_strength_buttons),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(self.theme.quote_foreground))
+                                    .child("本文の背景だけに敷きます。サイドバーやタブには敷きません。"),
+                            ),
+                    )
+                    .child(
                         card("settings-plain-text-card")
                             .child(plain_text)
                             .child(syntax_highlight),
@@ -773,6 +843,7 @@ impl EditorView {
                                     .gap_2()
                                     .when(!drying_ink_on, |element| element.opacity(0.5))
                                     .child(drying_ink_band)
+                                    .child(drying_ink_soak)
                                     .child(
                                         div()
                                             .text_color(rgb(self.theme.quote_foreground))

@@ -137,6 +137,7 @@ mod measurement;
 mod mermaid_diagrams;
 use mermaid_diagrams::diagram_plan_matches;
 mod network_settings;
+mod paper_texture;
 pub use network_settings::NetworkSettingsApplier;
 mod plain_text_mode;
 mod whisparrot_link;
@@ -1343,6 +1344,9 @@ pub struct EditorView {
     /// as it dries (Issue #779). Display only, and emptied whenever another
     /// document replaces this one.
     drying_ink: drying_ink::DryingInkState,
+    /// The generated paper / wall texture image and the generation that will
+    /// replace it (Issue #788). Display only.
+    paper_texture: paper_texture::PaperTextureState,
     /// Hands the pictures back to the window when the view is released; dropping
     /// it would cancel the hook.
     _mermaid_release_subscription: Subscription,
