@@ -532,8 +532,10 @@ impl Element for PaperTexture {
                 px((x as f32 + EDGE_EPSILON) / scale),
                 px((y as f32 + EDGE_EPSILON) / scale),
             );
+            let tile_bounds = Bounds::new(origin, gpui::size(edge, edge));
             let _ = window.paint_image(
-                Bounds::new(origin, gpui::size(edge, edge)),
+                tile_bounds,
+                tile_bounds,
                 Corners::default(),
                 self.image.clone(),
                 0,
