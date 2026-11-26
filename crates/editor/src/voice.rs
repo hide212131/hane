@@ -102,14 +102,8 @@ pub enum PolishState {
     Failed(String),
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VoiceChoice {
-    Raw,
-    Polished,
-}
-
-/// One unconfirmed segment. `raw` is what the body shows; a polished text only
-/// ever lives beside it.
+/// One unconfirmed segment. It shows exactly one sentence: the raw text at
+/// first, replaced in place by the polished text once that arrives.
 #[derive(Clone, Debug)]
 pub struct VoiceSegment {
     pub seq: u64,
@@ -127,9 +121,15 @@ impl VoiceSegment {
         self.offset
     }
 
-    /// The text drawn in the body: the separator and the raw text.
+    /// The sentence currently shown: the polished text once it arrived,
+    /// the raw text until then.
+    pub fn shown(&self) -> &str {
+        self.polished().unwrap_or(&self.raw)
+    }
+
+    /// The text drawn in the body: the separator and the shown sentence.
     pub fn display_text(&self) -> String {
-        format!("{}{}", self.lead, self.raw)
+        format!("{}{}", self.lead, self.shown())
     }
 
     pub fn polished(&self) -> Option<&str> {
@@ -139,13 +139,6 @@ impl VoiceSegment {
         }
     }
 
-    fn text_for(&self, choice: VoiceChoice) -> Option<String> {
-        let body = match choice {
-            VoiceChoice::Raw => &self.raw,
-            VoiceChoice::Polished => self.polished()?,
-        };
-        Some(format!("{}{}", self.lead, body))
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -158,7 +151,7 @@ struct Mark {
 #[derive(Clone, Debug)]
 enum Held {
     Event(VoiceEnvelope),
-    Commit(u64, VoiceChoice),
+    Commit(u64),
     Discard(u64),
     CommitAll,
     DiscardAll,
@@ -208,7 +201,6 @@ pub enum VoiceError {
     NoSession,
     Busy,
     UnknownSegment(u64),
-    NoPolished(u64),
     /// The engine broke the contract; the session was dropped.
     Contract(&'static str),
     /// The positions could no longer be followed; the session was dropped.
@@ -484,7 +476,7 @@ impl VoiceComposition {
                     }
                     PolishResult::Failed(code) => PolishState::Failed(code.clone()),
                 };
-                // A segment already confirmed or discarded takes no candidate.
+                // A segment already confirmed or discarded takes no polished text.
                 if let Some(segment) = self.segments.iter_mut().find(|s| s.seq == *seq) {
                     segment.polish = state;
                 }
@@ -643,7 +635,7 @@ impl Editor {
             });
             let _ = match held {
                 Held::Event(event) => self.voice_apply_now(event).map(|_| ()),
-                Held::Commit(seq, choice) => self.voice_commit_now(seq, choice).map(|_| ()),
+                Held::Commit(seq) => self.voice_commit_now(seq).map(|_| ()),
                 Held::Discard(seq) => self.voice_discard_now(seq),
                 Held::CommitAll => self.voice_commit_all_now(),
                 Held::DiscardAll => self.voice_discard_all_now(),
@@ -651,24 +643,19 @@ impl Editor {
         }
     }
 
-    /// Commits one segment: raw text, or the polished text when it arrived.
+    /// Commits one segment with the sentence it currently shows.
     /// One undoable insertion; the focus and unrelated selection stay put.
-    pub fn voice_commit(&mut self, seq: u64, choice: VoiceChoice) -> Result<(), VoiceError> {
+    pub fn voice_commit(&mut self, seq: u64) -> Result<(), VoiceError> {
         self.voice_sync();
         let voice = self.voice.as_ref().ok_or(VoiceError::NoSession)?;
-        let segment = voice
-            .segments
-            .iter()
-            .find(|segment| segment.seq == seq)
-            .ok_or(VoiceError::UnknownSegment(seq))?;
-        if choice == VoiceChoice::Polished && segment.polished().is_none() {
-            return Err(VoiceError::NoPolished(seq));
+        if !voice.segments.iter().any(|segment| segment.seq == seq) {
+            return Err(VoiceError::UnknownSegment(seq));
         }
         if self.ime.is_some() {
-            self.voice_hold(Held::Commit(seq, choice), 0)?;
+            self.voice_hold(Held::Commit(seq), 0)?;
             return Ok(());
         }
-        self.voice_commit_now(seq, choice).map(|_| ())
+        self.voice_commit_now(seq).map(|_| ())
     }
 
     pub fn voice_discard(&mut self, seq: u64) -> Result<(), VoiceError> {
@@ -684,8 +671,8 @@ impl Editor {
         self.voice_discard_now(seq)
     }
 
-    /// Commits every segment in `seq` order: the polished text where there is
-    /// one, the raw text otherwise. Each is its own history step.
+    /// Commits every segment in `seq` order with the sentence it currently
+    /// shows. Each is its own history step.
     pub fn voice_commit_all(&mut self) -> Result<(), VoiceError> {
         self.voice_sync();
         if self.voice.is_none() {
@@ -719,13 +706,8 @@ impl Editor {
             else {
                 return Ok(());
             };
-            let choice = if segment.polished().is_some() {
-                VoiceChoice::Polished
-            } else {
-                VoiceChoice::Raw
-            };
             let seq = segment.seq;
-            self.voice_commit_now(seq, choice)?;
+            self.voice_commit_now(seq)?;
         }
     }
 
@@ -763,7 +745,7 @@ impl Editor {
 
     /// The insertion itself. The history step, selection and every other
     /// segment's offset are settled here, in one go.
-    fn voice_commit_now(&mut self, seq: u64, choice: VoiceChoice) -> Result<OffsetMap, VoiceError> {
+    fn voice_commit_now(&mut self, seq: u64) -> Result<OffsetMap, VoiceError> {
         self.voice_sync();
         let voice = self.voice.as_ref().ok_or(VoiceError::NoSession)?;
         let segment = voice
@@ -771,9 +753,7 @@ impl Editor {
             .iter()
             .find(|segment| segment.seq == seq)
             .ok_or(VoiceError::UnknownSegment(seq))?;
-        let text = segment
-            .text_for(choice)
-            .ok_or(VoiceError::NoPolished(seq))?;
+        let text = segment.display_text();
         let at = segment.offset;
         let len = text.len();
         let selection_before = self.selection;
@@ -820,8 +800,9 @@ impl Editor {
         Ok(map)
     }
 
-    /// Before a user edit of `range`: commits, in `seq` order and as raw text,
-    /// every segment the edit reaches, and drops their polish candidates. A
+    /// Before a user edit of `range`: commits, in `seq` order and with the
+    /// sentence each shows, every segment the edit reaches; a polished text
+    /// arriving later finds no segment and is dropped. A
     /// segment sits at one source offset, so a range reaches it when it
     /// covers the offset or begins exactly there. Returns how offsets moved so
     /// the caller can carry its own ranges to the new text.
@@ -845,7 +826,7 @@ impl Editor {
             .collect();
         touched.sort_unstable();
         for seq in touched {
-            match self.voice_commit_now(seq, VoiceChoice::Raw) {
+            match self.voice_commit_now(seq) {
                 Ok(step) => map.0.extend(step.0),
                 Err(VoiceError::Buffer(error)) => return Err(error),
                 Err(_) => {}
@@ -872,7 +853,7 @@ impl Editor {
             .map(|segment| segment.seq)
             .collect();
         for seq in touched {
-            match self.voice_commit_now(seq, VoiceChoice::Raw) {
+            match self.voice_commit_now(seq) {
                 Ok(_) => {}
                 Err(VoiceError::Buffer(error)) => return Err(error),
                 Err(_) => {}
@@ -1012,16 +993,16 @@ mod tests {
         feed.raw(&mut editor, 2, "二つ目。");
         feed.polished(&mut editor, 2, "二つ目、整文。");
         feed.polished(&mut editor, 1, "一つ目、整文。");
-        editor.voice_commit(2, VoiceChoice::Polished).unwrap();
+        editor.voice_commit(2).unwrap();
         // The earlier segment stays in front of the confirmed later one.
         assert_eq!(text(&editor), "二つ目、整文。");
-        assert_eq!(pending(&mut editor), vec![(1, 0, "一つ目。".into())]);
+        assert_eq!(pending(&mut editor), vec![(1, 0, "一つ目、整文。".into())]);
         feed.raw(&mut editor, 3, "三つ目。");
         assert_eq!(
             pending(&mut editor),
-            vec![(1, 0, "一つ目。".into()), (3, 21, "三つ目。".into())]
+            vec![(1, 0, "一つ目、整文。".into()), (3, 21, "三つ目。".into())]
         );
-        editor.voice_commit(1, VoiceChoice::Polished).unwrap();
+        editor.voice_commit(1).unwrap();
         assert_eq!(text(&editor), "一つ目、整文。二つ目、整文。");
         feed.send(
             &mut editor,
@@ -1031,8 +1012,8 @@ mod tests {
             },
         )
         .unwrap();
-        editor.voice_commit(3, VoiceChoice::Raw).unwrap();
-        assert_eq!(text(&editor), "一つ目、整文。二つ目、整文。三つ目。");
+        editor.voice_commit(3).unwrap();
+        assert_eq!(text(&editor), "一つ目、整文。二つ目、整文。三つ目、整文。");
         // Each commit is its own Undo step, newest confirmation first.
         editor.dispatch(crate::EditorCommand::Undo).unwrap();
         assert_eq!(text(&editor), "一つ目、整文。二つ目、整文。");
@@ -1045,7 +1026,7 @@ mod tests {
         editor.dispatch(crate::EditorCommand::Redo).unwrap();
         editor.dispatch(crate::EditorCommand::Redo).unwrap();
         editor.dispatch(crate::EditorCommand::Redo).unwrap();
-        assert_eq!(text(&editor), "一つ目、整文。二つ目、整文。三つ目。");
+        assert_eq!(text(&editor), "一つ目、整文。二つ目、整文。三つ目、整文。");
         assert!(pending(&mut editor).is_empty());
     }
 
@@ -1056,7 +1037,7 @@ mod tests {
         feed.start(&mut editor);
         feed.raw(&mut editor, 1, "あ");
         feed.raw(&mut editor, 2, "い");
-        editor.voice_commit(2, VoiceChoice::Raw).unwrap();
+        editor.voice_commit(2).unwrap();
         editor.dispatch(crate::EditorCommand::Undo).unwrap();
         assert_eq!(text(&editor), "");
         assert_eq!(pending(&mut editor), vec![(1, 0, "あ".into())]);
@@ -1067,13 +1048,28 @@ mod tests {
     }
 
     #[test]
+    fn a_polished_text_replaces_the_shown_sentence_in_place() {
+        let mut editor = editor_with("", 0);
+        let mut feed = Feed::new();
+        feed.start(&mut editor);
+        feed.raw(&mut editor, 1, "あ");
+        feed.raw(&mut editor, 2, "い");
+        assert_eq!(pending(&mut editor)[0].2, "あ");
+        feed.polished(&mut editor, 1, "亜");
+        assert_eq!(pending(&mut editor)[0].2, "亜");
+        // Confirming all uses what each segment shows: polished or raw.
+        editor.voice_commit_all().unwrap();
+        assert_eq!(text(&editor), "亜い");
+    }
+
+    #[test]
     fn a_late_polish_for_a_committed_segment_is_not_applied() {
         let mut editor = editor_with("", 0);
         let mut feed = Feed::new();
         feed.start(&mut editor);
         feed.raw(&mut editor, 1, "あ");
         feed.raw(&mut editor, 2, "い");
-        editor.voice_commit(1, VoiceChoice::Raw).unwrap();
+        editor.voice_commit(1).unwrap();
         feed.polished(&mut editor, 1, "亜");
         assert_eq!(text(&editor), "あ");
         assert!(editor.voice().unwrap().is_resolved(1));
@@ -1117,7 +1113,7 @@ mod tests {
     }
 
     #[test]
-    fn typing_inside_the_span_confirms_the_raw_text_first() {
+    fn typing_inside_the_span_confirms_the_shown_text_first() {
         // "ab" + [seg] + "cd": a replace across the boundary reaches the segment.
         let mut editor = editor_with("abcd", 2);
         let mut feed = Feed::new();
@@ -1131,13 +1127,13 @@ mod tests {
             })
             .unwrap();
         editor.insert_text("Z").unwrap();
-        // The raw text was confirmed (not the polished one), then swallowed by
-        // the replacement of the selected span.
+        // The shown (polished) text was confirmed, then swallowed by the
+        // replacement of the selected span.
         assert_eq!(text(&editor), "aZd");
         assert!(pending(&mut editor).is_empty());
-        // Undo 1: the replacement is undone, the raw text is back.
+        // Undo 1: the replacement is undone, the shown text is back.
         editor.dispatch(crate::EditorCommand::Undo).unwrap();
-        assert_eq!(text(&editor), "ab音声cd");
+        assert_eq!(text(&editor), "ab整文cd");
         // Undo 2: the segment's own confirmation.
         editor.dispatch(crate::EditorCommand::Undo).unwrap();
         assert_eq!(text(&editor), "abcd");
@@ -1241,7 +1237,7 @@ mod tests {
         feed.start(&mut editor);
         feed.raw(&mut editor, 1, "音声");
         editor.replace_and_mark_text(Some(0..1), "か", None).unwrap();
-        editor.voice_commit(1, VoiceChoice::Raw).unwrap();
+        editor.voice_commit(1).unwrap();
         assert_eq!(pending(&mut editor).len(), 1);
         editor.commit_composition();
         assert!(pending(&mut editor).is_empty());
@@ -1255,7 +1251,7 @@ mod tests {
         feed.start(&mut editor);
         feed.raw(&mut editor, 1, "あ");
         feed.raw(&mut editor, 2, "い");
-        editor.voice_commit(1, VoiceChoice::Raw).unwrap();
+        editor.voice_commit(1).unwrap();
         feed.send(
             &mut editor,
             VoiceEvent::SessionEnd {
@@ -1422,7 +1418,7 @@ mod tests {
         feed.raw(&mut editor, 3, "世界");
         let shown: Vec<_> = pending(&mut editor).into_iter().map(|s| s.2).collect();
         assert_eq!(shown, ["hello", " world", "世界"]);
-        editor.voice_commit(2, VoiceChoice::Raw).unwrap();
+        editor.voice_commit(2).unwrap();
         assert_eq!(text(&editor), " world");
         editor.dispatch(crate::EditorCommand::Undo).unwrap();
         assert_eq!(text(&editor), "");

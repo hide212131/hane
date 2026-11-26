@@ -44,7 +44,7 @@ pub use movement::ForwardStop;
 pub use selection::Selection;
 pub use voice::{
     EndStatus, IgnoreReason, MAX_HELD_BYTES, MAX_HELD_ITEMS, MAX_SEGMENT_BYTES, MAX_SEGMENTS,
-    OffsetMap, PolishMode, PolishResult, PolishState, RawStatus, VoiceApply, VoiceChoice,
+    OffsetMap, PolishMode, PolishResult, PolishState, RawStatus, VoiceApply,
     VoiceComposition, VoiceEnvelope, VoiceError, VoiceEvent, VoiceSegment,
 };
 

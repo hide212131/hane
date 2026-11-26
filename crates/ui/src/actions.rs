@@ -377,6 +377,14 @@ command_actions! {
             view.ai_selection_handle_enter(window, cx);
             return;
         }
+        // A voice segment with the operation focus takes Enter (confirm the
+        // shown sentence); an IME composition and the body keep it otherwise.
+        if matches!(view.input_target(), InputTarget::Body)
+            && view.editor().ime().is_none()
+            && view.voice_handle_enter(cx)
+        {
+            return;
+        }
         match view.input_target() {
             InputTarget::SidebarFilter => {
                 if view.sidebar_filter_has_composition() {
@@ -454,14 +462,6 @@ command_actions! {
     },
     Indent ("tab") => indent |view, window, cx| {
         if view.ai_selection_handle_tab(true, window, cx) {
-            return;
-        }
-        // A voice segment with the operation focus takes Tab (adopt the
-        // polished text); an IME composition and the body keep it otherwise.
-        if matches!(view.input_target(), InputTarget::Body)
-            && view.editor().ime().is_none()
-            && view.voice_handle_tab(cx)
-        {
             return;
         }
         if view.document_find_input_is_focused() {

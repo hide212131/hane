@@ -4,9 +4,10 @@
 //! The segments live in the editor (`Editor::voice`), never in the document.
 //! This file is the view's side: it splices the segments into the presented
 //! lines so they lay out, wrap and paint with the surrounding text, lists them
-//! with their polish candidates in a strip below the body, and routes the
-//! keys (`Tab` adopts the polished text, `Esc` confirms the raw text) when a
-//! segment has the operation focus.
+//! in a strip below the body, and routes the keys (`Enter` confirms the shown
+//! sentence, `Esc` discards the segment, as with an IME) when a segment has
+//! the operation focus. A segment shows one sentence: the raw text, replaced
+//! in place by the polished text once that arrives.
 //!
 //! Nothing here calls [`EditorView::after_input`] for speech that only
 //! arrives, is polished or is discarded: that path starts the autosave, draft
@@ -14,7 +15,7 @@
 
 use super::*;
 use hane_editor::{
-    EndStatus, PolishMode, PolishResult, PolishState, RawStatus, VoiceApply, VoiceChoice,
+    EndStatus, PolishMode, PolishResult, RawStatus, VoiceApply,
     VoiceEnvelope, VoiceError, VoiceEvent,
 };
 use hane_presentation::{VirtualInsert, splice_virtual_text};
@@ -78,7 +79,7 @@ struct ScriptRun {
 pub(super) struct VoiceViewState {
     /// The document the session belongs to: session id and generation.
     owner: Option<(SessionId, u64)>,
-    /// The segment `Tab` / `Esc` act on. `None` leaves both keys to the body.
+    /// The segment `Enter` / `Esc` act on. `None` leaves both keys to the body.
     pub(super) focus: Option<u64>,
     /// The voice stamp each cached block was presented with.
     stamps: HashMap<BlockId, u64>,
@@ -106,16 +107,8 @@ struct SegmentView {
     seq: u64,
     offset: usize,
     text: String,
-    raw: String,
-    polish: PolishState,
-}
-
-fn polish_label(polish: &PolishState) -> &'static str {
-    match polish {
-        PolishState::Waiting => "整文待ち",
-        PolishState::Ready(_) => "整文あり",
-        PolishState::Off | PolishState::Failed(_) => "原文のみ",
-    }
+    /// The sentence the segment currently shows (without its separator).
+    shown: String,
 }
 
 impl EditorView {
@@ -186,8 +179,7 @@ impl EditorView {
                         seq: segment.seq,
                         offset: segment.offset(),
                         text: segment.display_text(),
-                        raw: segment.raw.clone(),
-                        polish: segment.polish.clone(),
+                        shown: segment.shown().to_owned(),
                     })
                     .collect()
             })
@@ -302,30 +294,24 @@ impl EditorView {
         self.voice.focus
     }
 
-    /// Commits the focused segment. Does nothing for a polished choice that has
-    /// not arrived yet.
-    pub fn voice_commit_focused(&mut self, choice: VoiceChoice, cx: &mut Context<Self>) -> bool {
+    /// Commits the focused segment with the sentence it shows.
+    pub fn voice_commit_focused(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(seq) = self.voice.focus else {
             return false;
         };
-        self.voice_commit(seq, choice, cx)
+        self.voice_commit(seq, cx)
     }
 
-    pub fn voice_commit(&mut self, seq: u64, choice: VoiceChoice, cx: &mut Context<Self>) -> bool {
+    pub fn voice_commit(&mut self, seq: u64, cx: &mut Context<Self>) -> bool {
         if !self.body_editable() {
             return false;
         }
         let next = self.voice_next_after(Some(seq));
-        let result = self.sessions.active_mut().editor_mut().voice_commit(seq, choice);
+        let result = self.sessions.active_mut().editor_mut().voice_commit(seq);
         match result {
             Ok(()) => {
                 self.voice_after_commit(next.filter(|next| *next != seq), cx);
                 true
-            }
-            Err(VoiceError::NoPolished(_)) => {
-                self.voice.status = Some("整文はまだ届いていません".to_owned());
-                cx.notify();
-                false
             }
             Err(_) => false,
         }
@@ -339,7 +325,7 @@ impl EditorView {
         }
     }
 
-    /// Review: every segment in order, polished where there is a polished text.
+    /// Review: every segment in order, each with the sentence it shows.
     pub fn voice_commit_all(&mut self, cx: &mut Context<Self>) {
         if !self.body_editable() {
             return;
@@ -356,22 +342,23 @@ impl EditorView {
         }
     }
 
-    /// `Tab` with a focused segment: adopt its polished text. Returns whether
-    /// the key was taken; without a focused segment it belongs to the body.
-    pub(crate) fn voice_handle_tab(&mut self, cx: &mut Context<Self>) -> bool {
+    /// `Enter` with a focused segment: confirm the sentence it shows. Returns
+    /// whether the key was taken; without a focused segment it belongs to the
+    /// body.
+    pub(crate) fn voice_handle_enter(&mut self, cx: &mut Context<Self>) -> bool {
         if self.voice.focus.is_none() {
             return false;
         }
-        self.voice_commit_focused(VoiceChoice::Polished, cx);
+        self.voice_commit_focused(cx);
         true
     }
 
-    /// `Esc` with a focused segment: confirm its raw text.
+    /// `Esc` with a focused segment: discard it.
     pub(crate) fn voice_handle_escape(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.voice.focus.is_none() {
+        let Some(seq) = self.voice.focus else {
             return false;
-        }
-        self.voice_commit_focused(VoiceChoice::Raw, cx);
+        };
+        self.voice_discard(seq, cx);
         true
     }
 
@@ -517,9 +504,9 @@ fn segment_in_block(offset: usize, range: SourceRange, doc_len: usize) -> bool {
 }
 
 impl EditorView {
-    /// The strip below the body: every unconfirmed segment with its state, the
-    /// polish candidate beside it, and the operations. It is the reference
-    /// display; the body itself keeps showing the raw text.
+    /// The strip below the body: every unconfirmed segment with the sentence
+    /// it shows, and the operations. It is the reference display for segments
+    /// the body cannot draw inline.
     pub(super) fn voice_strip_element(&mut self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.settings.voice_composition {
             return None;
@@ -588,11 +575,7 @@ impl EditorView {
         let rows = segments.iter().take(8).map(|segment| {
             let seq = segment.seq;
             let focused = focus == Some(seq);
-            let polished = match &segment.polish {
-                PolishState::Ready(text) => Some(text.clone()),
-                _ => None,
-            };
-            let label = format!("#{seq}  {}  （{}）", segment.raw, polish_label(&segment.polish));
+            let label = format!("#{seq}  {}", segment.shown);
             let pick = view.clone();
             let chip = div()
                 .id(("voice-segment", seq))
@@ -605,10 +588,9 @@ impl EditorView {
                 .on_click(move |_, _window, app| {
                     pick.update(app, |view, cx| view.voice_set_focus(seq, cx));
                 });
-            let adopt = view.clone();
-            let raw = view.clone();
+            let confirm = view.clone();
             let drop = view.clone();
-            let mut row = div()
+            let row = div()
                 .flex()
                 .flex_col()
                 .gap_0p5()
@@ -619,27 +601,14 @@ impl EditorView {
                         .items_center()
                         .gap_2()
                         .child(chip)
-                        .when(polished.is_some(), |el| {
-                            el.child(
-                                Button::new(("voice-adopt", seq))
-                                    .label("整文を採用")
-                                    .small()
-                                    .ghost()
-                                    .on_click(move |_, _window, app| {
-                                        adopt.update(app, |view, cx| {
-                                            view.voice_commit(seq, VoiceChoice::Polished, cx);
-                                        });
-                                    }),
-                            )
-                        })
                         .child(
-                            Button::new(("voice-raw", seq))
-                                .label("原文で確定")
+                            Button::new(("voice-confirm", seq))
+                                .label("確定")
                                 .small()
                                 .ghost()
                                 .on_click(move |_, _window, app| {
-                                    raw.update(app, |view, cx| {
-                                        view.voice_commit(seq, VoiceChoice::Raw, cx);
+                                    confirm.update(app, |view, cx| {
+                                        view.voice_commit(seq, cx);
                                     });
                                 }),
                         )
@@ -653,14 +622,6 @@ impl EditorView {
                                 }),
                         ),
                 );
-            if let Some(text) = polished {
-                row = row.child(
-                    div()
-                        .pl_4()
-                        .text_color(rgb(theme.quote_foreground))
-                        .child(format!("整文: {text}")),
-                );
-            }
             row
         });
         Some(
@@ -865,9 +826,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn the_polished_text_is_beside_the_segment_while_the_body_keeps_the_raw_text(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    fn the_polished_text_replaces_the_shown_raw_text_in_place(cx: &mut gpui::TestAppContext) {
         let (view, cx) = untitled(cx, "", 0);
         let mut feed = Feed(1);
         feed.start(&view, cx);
@@ -878,13 +837,11 @@ mod tests {
         assert!(cx.debug_bounds("voice-strip").is_some());
         feed.polished(&view, cx, 1, "次の章です。");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.voice_segments()[0].raw, "つぎのしょうです");
-            assert_eq!(view.voice_segments()[0].text, "つぎのしょうです");
-            assert!(matches!(view.voice_segments()[0].polish, PolishState::Ready(_)));
+            assert_eq!(view.voice_segments()[0].text, "次の章です。");
+            assert_eq!(view.voice_segments()[0].shown, "次の章です。");
         });
-        for lines in visual_lines(&view, cx) {
-            assert!(!lines.contains("次の章です"), "{lines}");
-        }
+        // One sentence only: the raw text is gone from the line.
+        assert_eq!(visual_lines(&view, cx), ["次の章です。"]);
         assert_eq!(text_of(&view, cx), "");
     }
 
@@ -928,38 +885,60 @@ mod tests {
         feed.raw(&view, cx, 2, "二つ目");
         feed.polished(&view, cx, 2, "二つ目。");
         feed.polished(&view, cx, 1, "一つ目。");
-        // Focus the second segment, then Tab adopts its polished text.
+        // Focus the second segment, then Enter confirms the sentence it shows.
         view.update(cx, |view, cx| {
             view.voice_set_focus(2, cx);
-            assert!(view.voice_handle_tab(cx));
+            assert!(view.voice_handle_enter(cx));
         });
         settle(cx);
         assert_eq!(text_of(&view, cx), "二つ目。");
         assert_eq!(pending_seqs(&view, cx), [1]);
         feed.raw(&view, cx, 3, "三つ目");
         feed.polished(&view, cx, 3, "三つ目。");
-        // Esc on the first one confirms the raw text.
+        // Esc on the first one discards it; nothing is written.
         view.update(cx, |view, cx| {
             view.voice_set_focus(1, cx);
             assert!(view.voice_handle_escape(cx));
         });
         settle(cx);
-        assert_eq!(text_of(&view, cx), "一つ目二つ目。");
+        assert_eq!(text_of(&view, cx), "二つ目。");
+        assert_eq!(pending_seqs(&view, cx), [3]);
+        view.update(cx, |view, cx| {
+            view.voice_set_focus(3, cx);
+            assert!(view.voice_handle_enter(cx));
+        });
+        settle(cx);
+        assert_eq!(text_of(&view, cx), "二つ目。三つ目。");
         assert!(view.read_with(cx, |view, _| view.sessions.active().is_dirty()));
         undo(&view, cx);
         assert_eq!(text_of(&view, cx), "二つ目。");
         undo(&view, cx);
         assert_eq!(text_of(&view, cx), "");
         // Unconfirmed text did not come back with the Undo.
-        assert_eq!(pending_seqs(&view, cx), [3]);
+        assert!(pending_seqs(&view, cx).is_empty());
         redo(&view, cx);
         redo(&view, cx);
-        assert_eq!(text_of(&view, cx), "一つ目二つ目。");
-        assert_eq!(pending_seqs(&view, cx), [3]);
+        assert_eq!(text_of(&view, cx), "二つ目。三つ目。");
+        assert!(pending_seqs(&view, cx).is_empty());
     }
 
     #[gpui::test]
-    fn tab_and_escape_belong_to_the_body_unless_a_segment_has_the_focus(
+    fn a_polished_text_after_confirmation_is_dropped(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = untitled(cx, "", 0);
+        let mut feed = Feed(1);
+        feed.start(&view, cx);
+        feed.raw(&view, cx, 1, "あ");
+        view.update(cx, |view, cx| {
+            view.voice_set_focus(1, cx);
+            assert!(view.voice_handle_enter(cx));
+        });
+        feed.polished(&view, cx, 1, "亜");
+        assert_eq!(text_of(&view, cx), "あ");
+        assert!(pending_seqs(&view, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn enter_and_escape_belong_to_the_body_unless_a_segment_has_the_focus(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = untitled(cx, "本文", "本文".len());
@@ -967,7 +946,7 @@ mod tests {
         feed.start(&view, cx);
         feed.raw(&view, cx, 1, "音声");
         view.update(cx, |view, cx| {
-            assert!(!view.voice_handle_tab(cx));
+            assert!(!view.voice_handle_enter(cx));
             assert!(!view.voice_handle_escape(cx));
         });
         assert_eq!(text_of(&view, cx), "本文");
@@ -979,7 +958,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn editing_inside_a_segment_confirms_the_raw_text_then_applies_the_edit(
+    fn editing_inside_a_segment_confirms_the_shown_text_then_applies_the_edit(
         cx: &mut gpui::TestAppContext,
     ) {
         let (view, cx) = untitled(cx, "前😀\r\n後", "前".len());
@@ -993,7 +972,7 @@ mod tests {
         assert_eq!(text_of(&view, cx), "Z\r\n後");
         assert!(pending_seqs(&view, cx).is_empty());
         undo(&view, cx);
-        assert_eq!(text_of(&view, cx), "前音声😀\r\n後");
+        assert_eq!(text_of(&view, cx), "前整文😀\r\n後");
         undo(&view, cx);
         assert_eq!(text_of(&view, cx), "前😀\r\n後");
     }
@@ -1037,7 +1016,7 @@ mod tests {
         });
         // A commit during the composition waits as well.
         view.update(cx, |view, cx| {
-            assert!(view.voice_commit(1, VoiceChoice::Raw, cx));
+            assert!(view.voice_commit(1, cx));
         });
         assert_eq!(text_of(&view, cx), "かbc");
         cx.update(|window, app| {
@@ -1098,7 +1077,7 @@ mod tests {
         assert_eq!(pending_seqs(&view, cx), [1]);
         // Confirm B, then a manual save writes it.
         view.update(cx, |view, cx| {
-            assert!(view.voice_commit(1, VoiceChoice::Polished, cx));
+            assert!(view.voice_commit(1, cx));
             view.save_or_prompt(cx);
         });
         cx.run_until_parked();

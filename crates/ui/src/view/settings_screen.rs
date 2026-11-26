@@ -628,7 +628,7 @@ impl EditorView {
                             .text_color(rgb(self.theme.quote_foreground))
                             .child(
                                 "認識した音声を、確定前の仮表示として本文の行内に出します。\
-                                 区間ごとに Tab で整文を採用、Esc で原文を確定できます。\
+                                 整文が届くと仮表示がその場で整文に置き換わり、区間ごとに Enter で確定、Esc で破棄できます。\
                                  既定ではオフで、whisparrot とのローカル連携とは同時に使えません。",
                             ),
                     ),
