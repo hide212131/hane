@@ -660,7 +660,7 @@ mod tests {
                 // and the brightest in a dark one.
                 let mut worst = if dark { f64::MIN } else { f64::MAX };
                 let mut worst_rgb = theme.editor_background;
-                for pixel in tile.bgra.chunks_exact(4) {
+                for pixel in tile.bgra.as_chunks::<4>().0 {
                     let rgb = (u32::from(pixel[2]) << 16)
                         | (u32::from(pixel[1]) << 8)
                         | u32::from(pixel[0]);
@@ -729,7 +729,7 @@ mod tests {
             assert_eq!(first.size, key.tile_px());
             assert_eq!(first.bgra.len(), first.size * first.size * 4);
             assert_eq!(fnv1a(&first.bgra), fnv1a(&second.bgra));
-            assert!(first.bgra.chunks_exact(4).all(|pixel| pixel[3] == 0xff));
+            assert!(first.bgra.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0xff));
         }
         let standard = PaperTextureStrength::Standard;
         let light_bg = DEFAULT_THEME.editor_background;

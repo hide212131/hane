@@ -183,10 +183,10 @@ mod tests {
         cx.run_until_parked();
     }
 
-    fn open_view<'a>(
-        cx: &'a mut gpui::TestAppContext,
+    fn open_view(
+        cx: &mut gpui::TestAppContext,
         stores: StateStores,
-    ) -> (TestView, &'a mut TestCx) {
+    ) -> (TestView, &mut TestCx) {
         let (view, cx) = cx.add_window_view(move |_, cx| {
             EditorView::from_sessions(
                 SessionSet::with_untitled("# Title\n\nbody\n", "Untitled"),
