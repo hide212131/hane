@@ -1198,6 +1198,12 @@ fn segment_band_opacity(
         .filter(|_| segment_shows_band(segment) && !params.soak_enabled)
 }
 
+/// Whether the band lies behind the segment, whichever layer draws it. The
+/// inline-code background is held back then, so it does not hide the band.
+fn segment_in_band(segment: &LineSegment, band: Option<&(Range<usize>, f32)>) -> bool {
+    band_opacity_for(&segment.visual_range, band).is_some() && segment_shows_band(segment)
+}
+
 /// Most soak patches one frame draws. Past it, each row folds its patches into
 /// one bounding stretch per opacity.
 const MAX_SOAK_PATCHES: usize = 256;
@@ -1281,22 +1287,19 @@ fn row_soak_patches(
     patches
 }
 
-/// Folds a row's patches into one bounding stretch per opacity.
+/// Folds a row's patches into one patch over their bounding stretch, at the
+/// strongest opacity among them. One patch per row cannot overlap another, so
+/// the composite never passes the caps `soak_alpha` keeps each patch within.
 fn coalesce_soak_patches(patches: Vec<SoakPatch>) -> Vec<SoakPatch> {
-    let mut merged: Vec<SoakPatch> = Vec::new();
-    for patch in patches {
-        match merged
-            .iter_mut()
-            .find(|candidate| (candidate.alpha - patch.alpha).abs() < 1e-6)
-        {
-            Some(existing) => {
-                existing.visual = existing.visual.start.min(patch.visual.start)
-                    ..existing.visual.end.max(patch.visual.end);
-            }
-            None => merged.push(patch),
-        }
-    }
-    merged
+    let mut iter = patches.into_iter();
+    let Some(first) = iter.next() else {
+        return Vec::new();
+    };
+    let folded = iter.fold(first, |acc, patch| SoakPatch {
+        visual: acc.visual.start.min(patch.visual.start)..acc.visual.end.max(patch.visual.end),
+        alpha: acc.alpha.max(patch.alpha),
+    });
+    vec![folded]
 }
 
 /// Opacities of the three stacked layers that soften a patch's edge, outermost
@@ -1747,7 +1750,8 @@ pub(crate) fn row_element(
                     // `text_bg` paints above `bg`, so inside the band it would
                     // hide the band.
                     .when(
-                        segment_shows_code_background(segment) && band_opacity.is_none(),
+                        segment_shows_code_background(segment)
+                            && !segment_in_band(segment, band_visual.as_ref()),
                         |element| element.text_bg(rgb(theme.code_background)),
                     )
                     // Before the link color, so a link (hover included) wins if
@@ -3009,7 +3013,7 @@ mod tests {
     }
 
     #[test]
-    fn too_many_patches_fold_into_one_stretch_per_opacity() {
+    fn too_many_patches_fold_into_one_stretch_per_row() {
         let patches = vec![
             SoakPatch {
                 visual: 0..2,
@@ -3025,9 +3029,74 @@ mod tests {
             },
         ];
         let folded = coalesce_soak_patches(patches);
-        assert_eq!(folded.len(), 2);
+        assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].visual, 0..8);
-        assert_eq!(folded[1].visual, 3..5);
+        assert!((folded[0].alpha - 0.72).abs() < 1e-6);
+        assert!(coalesce_soak_patches(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn folded_patches_never_overlap_or_pass_the_alpha_cap() {
+        let patches = vec![
+            SoakPatch {
+                visual: 0..20,
+                alpha: 0.72,
+            },
+            SoakPatch {
+                visual: 30..50,
+                alpha: 0.36,
+            },
+            SoakPatch {
+                visual: 60..80,
+                alpha: 0.72,
+            },
+        ];
+        let folded = coalesce_soak_patches(patches);
+        for pair in folded.windows(2) {
+            assert!(pair[0].visual.end <= pair[1].visual.start);
+        }
+        for strength in [
+            hane_session::DryingInkStrength::Weak,
+            hane_session::DryingInkStrength::Standard,
+            hane_session::DryingInkStrength::Strong,
+        ] {
+            for dark in [false, true] {
+                let cap = crate::ink::soak_alpha_cap(strength, dark);
+                for at in [10, 40, 70] {
+                    let transparent = folded
+                        .iter()
+                        .filter(|patch| patch.visual.start <= at && at < patch.visual.end)
+                        .fold(1.0_f32, |rest, patch| rest * (1.0 - patch.alpha));
+                    assert!(1.0 - transparent <= cap + 1e-6, "{at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inline_code_background_is_held_back_inside_the_band_with_the_soak_on() {
+        let band = (0..4, 1.0_f32);
+        let inside = LineSegment {
+            visual_range: 1..3,
+            ..plain_segment()
+        };
+        assert!(segment_in_band(&inside, Some(&band)));
+        // Soak on: the segment itself shows no band, yet the band is behind it.
+        assert_eq!(
+            segment_band_opacity(&inside, Some(&band), &soak_params(true)),
+            None
+        );
+        let outside = LineSegment {
+            visual_range: 3..6,
+            ..plain_segment()
+        };
+        assert!(!segment_in_band(&outside, Some(&band)));
+        let selected = LineSegment {
+            selected: true,
+            ..inside
+        };
+        assert!(!segment_in_band(&selected, Some(&band)));
+        assert!(!segment_in_band(&outside, None));
     }
 
     #[test]
