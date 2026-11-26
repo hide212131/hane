@@ -577,22 +577,21 @@ pub fn plan_list_edit(
                     selection_after: selection,
                 }));
             }
-            if let Some(plan) = plan_ordered_move(
+            let plan = plan_ordered_move(
                 &source,
                 projection,
                 item,
                 intent,
                 previous.body_indent_columns,
                 selection,
-            ) {
-                return Ok(ListEditPlanResult::Handled(plan));
+            )
+            .unwrap_or_else(|| transform_subtree(&source, item, delta as isize, caret));
+            if !indent_keeps_empty_item(&source, projection, item, previous, &plan) {
+                return Ok(ListEditPlanResult::Handled(MarkdownEditPlan::NoOp {
+                    selection_after: selection,
+                }));
             }
-            Ok(ListEditPlanResult::Handled(transform_subtree(
-                &source,
-                item,
-                delta as isize,
-                caret,
-            )))
+            Ok(ListEditPlanResult::Handled(plan))
         }
         ListEditIntent::Outdent => {
             if !on_opening_line || item.depth <= 1 {
@@ -703,6 +702,82 @@ pub fn plan_list_edit(
             }))
         }
     }
+}
+
+/// Whether an Indent candidate keeps an empty marker-only item a formal list
+/// item under its previous sibling once the block is parsed again.
+///
+/// CommonMark lets an empty item neither interrupt a paragraph nor survive as
+/// a list item there (`- abc\n  - ` becomes a setext heading), so such a
+/// candidate is verified against the parser. Only items whose opening line is
+/// the marker followed by ASCII space/tab (or nothing) are checked; every other
+/// candidate is accepted unchanged.
+fn indent_keeps_empty_item(
+    source: &str,
+    projection: &ListEditProjection,
+    item: &ListEditItem,
+    previous: &ListEditItem,
+    plan: &MarkdownEditPlan,
+) -> bool {
+    let MarkdownEditPlan::Replace {
+        range, replacement, ..
+    } = plan
+    else {
+        return true;
+    };
+    let bytes = source.as_bytes();
+    let item_line_start = line_start(bytes, item.marker_range.start.0);
+    let item_line_end = line_end(bytes, item_line_start);
+    let Some(line) = source.get(item_line_start..item_line_end) else {
+        return true;
+    };
+    let Some((_, marker_end, _)) = raw_list_marker(line) else {
+        return true;
+    };
+    if !is_ascii_blank(&line[marker_end..]) {
+        return true;
+    }
+
+    let base = projection.source_range.start.0;
+    let block_end = projection.source_range.end.0;
+    if range.start.0 < base
+        || range.end.0 > block_end
+        || previous.marker_range.start.0 < base
+        || source.get(base..block_end).is_none()
+    {
+        return true;
+    }
+    let mut block = source[base..block_end].to_owned();
+    block.replace_range(range.start.0 - base..range.end.0 - base, replacement);
+    let leading = replacement
+        .bytes()
+        .take_while(|byte| matches!(byte, b' ' | b'\t'))
+        .count();
+    let moved_marker = range.start.0 + leading;
+    let previous_marker = previous.marker_range.start.0;
+
+    let parsed = crate::parse_document(
+        hane_document::Revision(0),
+        SourceRange::new(base, base + block.len()),
+        &block,
+    );
+    let item_id_at = |offset: usize| {
+        parsed
+            .list_item_markers
+            .iter()
+            .find(|(marker, _)| marker.start.0 == offset)
+            .map(|(_, id)| *id)
+    };
+    let Some(moved_id) = item_id_at(moved_marker) else {
+        return false;
+    };
+    let Some((list_id, _)) = parsed.tree.list_item_ordinal(moved_id) else {
+        return false;
+    };
+    let Some(parent_id) = parsed.tree.node(list_id).and_then(|node| node.parent) else {
+        return false;
+    };
+    item_id_at(previous_marker) == Some(parent_id)
 }
 
 /// Enter / Shift+Enter decided by the source line the caret is on and the
@@ -2801,6 +2876,54 @@ mod tests {
     /// (rather than through `plan_list_edit`) so the terminator bytes in the
     /// source are exact and not an artifact of how the parser happens to
     /// report ranges.
+    #[test]
+    fn indent_of_empty_item_that_would_not_reparse_as_item_is_noop() {
+        for text in [
+            "- abc\n- ",
+            "- [ ] abc\n- ",
+            "- abc\n  def\n- ",
+            "1. abc\n2. ",
+            "- abc\r\n- ",
+            "- abc\n-\t",
+        ] {
+            assert_eq!(
+                plan(text, text.len(), ListEditIntent::Indent),
+                MarkdownEditPlan::NoOp {
+                    selection_after: SourceSelection::caret(SourceOffset(text.len())),
+                },
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn indent_of_empty_item_that_reparses_as_child_is_replaced() {
+        let indent = ListEditIntent::Indent;
+        for (text, expected) in [
+            ("- abc\n\n- ", "- abc\n\n  - "),
+            ("- abc\n  - x\n- ", "- abc\n  - x\n  - "),
+        ] {
+            assert_edit(text, text.len(), indent, expected, expected.len());
+            let items = reparsed_items(expected);
+            let last = items.last().unwrap();
+            assert!(last.is_parser_item, "{expected:?}");
+            assert_eq!(last.depth, 2, "{expected:?}");
+            assert_eq!(items[0].depth, 1, "{expected:?}");
+        }
+    }
+
+    #[test]
+    fn indent_of_empty_ordered_item_after_child_list_keeps_item() {
+        let text = "1. abc\n   1. x\n2. ";
+        let (indented, _) = replacement(text, text.len(), ListEditIntent::Indent);
+        assert_eq!(indented, "1. abc\n   1. x\n   2. ");
+        let items = reparsed_items(&indented);
+        assert_eq!(items.len(), 3);
+        let last = items.last().unwrap();
+        assert!(last.is_parser_item);
+        assert_eq!(last.depth, 2);
+    }
+
     #[test]
     fn transform_subtree_preserves_mixed_line_endings() {
         let source = "- A\r\n  - B\r    - C\n";

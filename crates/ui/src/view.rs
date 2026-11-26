@@ -13086,6 +13086,23 @@ mod tests {
         });
     }
 
+    /// Issue #784: Tab on an empty item whose nested form would reparse as a
+    /// setext heading is consumed without changing the document or selection.
+    #[gpui::test]
+    fn tab_on_empty_item_that_cannot_nest_leaves_document_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc\n- ", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(8)))
+                .unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Indent, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(8)));
+        });
+    }
+
     /// Issue #714: Enter on a CRLF list keeps CRLF for the continuation and
     /// the exit, and each step is its own undo / redo entry.
     #[gpui::test]
