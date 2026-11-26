@@ -3002,7 +3002,10 @@ mod tests {
     #[test]
     fn no_soak_patch_is_made_without_ink_or_band() {
         let params = soak_params(true);
-        assert!(row_soak_patches(&[], None, &[0..3], &params, false).is_empty());
+        let range = 0..3;
+        assert!(
+            row_soak_patches(&[], None, std::slice::from_ref(&range), &params, false).is_empty()
+        );
     }
 
     #[test]
