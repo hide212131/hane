@@ -539,15 +539,22 @@ fn shift_lightness(rgb: u32, delta: f64) -> u32 {
     from_oklab((lightness + delta).clamp(0.0, 1.0), a, b)
 }
 
+/// Multiplier applied to the text `delta_l` in dark themes. The dark text color
+/// already sits near OKLab lightness 0.92, so the same `delta_l` that is clearly
+/// visible on dark ink in light themes moves it by only ~13/255 in sRGB and the
+/// drying effect is hard to see (#782). Doubling it makes the effect visible.
+const DARK_DELTA_L_FACTOR: f64 = 2.0;
+
 /// Text color for a wet range (3.3): the base color with its OKLab lightness
-/// moved toward more contrast by `delta_l * level / 4`. Light themes darken,
-/// dark themes lighten. Level 0 returns `base` untouched.
+/// moved toward more contrast by `delta_l * level / 4`. Light themes darken;
+/// dark themes lighten by `DARK_DELTA_L_FACTOR` times that amount (lightness is
+/// clamped to 1.0). Level 0 returns `base` untouched.
 pub(crate) fn ink_color(base: u32, level: u8, delta_l: f32, dark: bool) -> u32 {
     if level == 0 {
         return base;
     }
     let level = level.min(WET_LEVELS);
-    let direction = if dark { 1.0 } else { -1.0 };
+    let direction = if dark { DARK_DELTA_L_FACTOR } else { -1.0 };
     let amount = direction * f64::from(delta_l) * f64::from(level) / f64::from(WET_LEVELS);
     shift_lightness(base, amount)
 }
@@ -1232,16 +1239,56 @@ mod tests {
                     let result = ink_color(base_color, level, delta_l, dark);
                     let (dl, da, db) = lab_distance_parts(base_color, result);
                     let expected = f64::from(delta_l) * f64::from(level) / 4.0;
-                    let expected = if dark { expected } else { -expected };
+                    let expected = if dark {
+                        expected * DARK_DELTA_L_FACTOR
+                    } else {
+                        -expected
+                    };
+                    let base_l = to_oklab(base_color)[0];
+                    // Lightness is clamped at 1.0, so the expected shift is
+                    // the clamped target minus the original lightness.
+                    let expected = (base_l + expected).min(1.0) - base_l;
                     assert!(
                         (dl - expected).abs() <= 0.005,
                         "{base_color:06x} level {level} delta {delta_l}: dL {dl} vs {expected}"
                     );
+                    // Near white the sRGB gamut collapses to neutral, so chroma
+                    // is reduced; only the lightness shift is checked there.
+                    if base_l + expected > 0.96 {
+                        continue;
+                    }
                     assert!(da <= 0.005, "{base_color:06x} da {da}");
                     assert!(db <= 0.005, "{base_color:06x} db {db}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn ink_color_dark_doubles_the_lightness_shift() {
+        let base_color = 0xe8e5df_u32;
+        let result = ink_color(base_color, 4, 0.04, true);
+        // +0.08 requested; lightness is clamped at 1.0.
+        let expected = (to_oklab(base_color)[0] + 0.08).min(1.0) - to_oklab(base_color)[0];
+        let (dl, _, _) = lab_distance_parts(base_color, result);
+        assert!((dl - expected).abs() <= 0.005, "dL {dl} vs {expected}");
+        // Clearly stronger than the undoubled shift.
+        let undoubled = shift_lightness(base_color, 0.04);
+        assert!(to_oklab(result)[0] > to_oklab(undoubled)[0]);
+    }
+
+    #[test]
+    fn ink_color_light_keeps_the_original_shift() {
+        let base_color = 0x262626_u32;
+        let result = ink_color(base_color, 4, 0.04, false);
+        let (dl, da, db) = lab_distance_parts(base_color, result);
+        assert!((dl + 0.04).abs() <= 0.005, "dL {dl}");
+        assert!(da <= 0.005 && db <= 0.005);
+    }
+
+    #[test]
+    fn ink_color_level_zero_is_exact_in_dark() {
+        assert_eq!(ink_color(0xe8e5df, 0, 0.04, true), 0xe8e5df);
     }
 
     #[test]
