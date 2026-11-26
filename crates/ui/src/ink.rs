@@ -1244,17 +1244,19 @@ mod tests {
                     } else {
                         -expected
                     };
-                    // Near white the sRGB gamut collapses to neutral, so chroma
-                    // is reduced and the lightness-only contract no longer
-                    // applies; only check that the text did not get darker.
-                    if to_oklab(base_color)[0] + expected > 0.96 {
-                        assert!(dl >= 0.0, "{base_color:06x} level {level}: dL {dl}");
-                        continue;
-                    }
+                    let base_l = to_oklab(base_color)[0];
+                    // Lightness is clamped at 1.0, so the expected shift is
+                    // the clamped target minus the original lightness.
+                    let expected = (base_l + expected).min(1.0) - base_l;
                     assert!(
                         (dl - expected).abs() <= 0.005,
                         "{base_color:06x} level {level} delta {delta_l}: dL {dl} vs {expected}"
                     );
+                    // Near white the sRGB gamut collapses to neutral, so chroma
+                    // is reduced; only the lightness shift is checked there.
+                    if base_l + expected > 0.96 {
+                        continue;
+                    }
                     assert!(da <= 0.005, "{base_color:06x} da {da}");
                     assert!(db <= 0.005, "{base_color:06x} db {db}");
                 }
