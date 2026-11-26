@@ -2912,6 +2912,55 @@ mod tests {
         }
     }
 
+    /// The real edit path builds the projection from `BlockIndex` at a
+    /// non-zero block start, so the empty-item guard must also hold there.
+    #[test]
+    fn indent_of_empty_item_mid_document_uses_block_index_projection() {
+        use crate::BlockIndex;
+
+        let indent_at_end = |text: &str| {
+            let buffer = RopeBuffer::from_text(text);
+            let index = BlockIndex::from_buffer(&buffer);
+            let projection = index
+                .list_edit_projection_at(&buffer, SourceOffset(text.len()))
+                .expect("current edit projection");
+            match plan_list_edit(
+                &buffer,
+                &projection,
+                SourceSelection::caret(SourceOffset(text.len())),
+                ListEditIntent::Indent,
+            )
+            .unwrap()
+            {
+                ListEditPlanResult::Handled(plan) => plan,
+                ListEditPlanResult::NotApplicable => panic!("list edit was not applicable"),
+            }
+        };
+
+        let text = "# head\n\n- other\n- abc\n  - x\n- ";
+        let MarkdownEditPlan::Replace {
+            range,
+            replacement,
+            selection_after,
+        } = indent_at_end(text)
+        else {
+            panic!("expected replacement for {text:?}");
+        };
+        let mut edited = text.to_owned();
+        edited.replace_range(range.as_usize(), &replacement);
+        let expected = "# head\n\n- other\n- abc\n  - x\n  - ";
+        assert_eq!(edited, expected);
+        assert_eq!(selection_after.active.0, expected.len());
+
+        let text = "# head\n\n- abc\n- ";
+        assert_eq!(
+            indent_at_end(text),
+            MarkdownEditPlan::NoOp {
+                selection_after: SourceSelection::caret(SourceOffset(text.len())),
+            }
+        );
+    }
+
     #[test]
     fn indent_of_empty_ordered_item_after_child_list_keeps_item() {
         let text = "1. abc\n   1. x\n2. ";
