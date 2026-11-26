@@ -684,6 +684,16 @@ impl EditorView {
                     view.set_drying_ink_band(*checked, cx);
                 });
             });
+        let soak_view = cx.entity();
+        let drying_ink_soak = Checkbox::new("settings-drying-ink-soak")
+            .checked(self.drying_ink_soak_enabled())
+            .disabled(!drying_ink_on)
+            .label("確定した文字の背後を、乾くまで紙が濡れたように少し沈ませる（質感と組み合わせると見えやすい）")
+            .on_click(move |checked, _window, app| {
+                soak_view.update(app, |view, cx| {
+                    view.set_drying_ink_soak(*checked, cx);
+                });
+            });
         let current_speed = self.drying_ink_speed();
         let speed_view = cx.entity();
         let speed_buttons = [
@@ -833,6 +843,7 @@ impl EditorView {
                                     .gap_2()
                                     .when(!drying_ink_on, |element| element.opacity(0.5))
                                     .child(drying_ink_band)
+                                    .child(drying_ink_soak)
                                     .child(
                                         div()
                                             .text_color(rgb(self.theme.quote_foreground))

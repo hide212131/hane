@@ -121,6 +121,16 @@ impl DryingInkStrength {
         }
     }
 
+    /// How far the soak color sits below the editor background in OKLab
+    /// lightness (Issue #788): `(light theme, dark theme)`.
+    pub fn soak_depth(self) -> (f32, f32) {
+        match self {
+            Self::Weak => (0.033, 0.030),
+            Self::Standard => (0.050, 0.045),
+            Self::Strong => (0.075, 0.065),
+        }
+    }
+
     /// OKLab lightness difference of the band background.
     pub fn band_delta_l(self) -> f32 {
         match self {
@@ -209,6 +219,9 @@ pub struct Settings {
     /// Whether a band is drawn behind a just-confirmed sentence
     /// (`drying_ink_band` key). A missing or invalid value means `true`.
     pub drying_ink_band: bool,
+    /// Whether wet ink soaks the paper behind it (`drying_ink_soak` key,
+    /// Issue #788). Display only. A missing or invalid value means `true`.
+    pub drying_ink_soak: bool,
     /// How long the ink takes to dry (`drying_ink_speed` key).
     pub drying_ink_speed: DryingInkSpeed,
     /// How strongly the ink and band stand out (`drying_ink_strength` key).
@@ -240,6 +253,7 @@ impl Default for Settings {
             syntax_highlight: true,
             drying_ink: true,
             drying_ink_band: true,
+            drying_ink_soak: true,
             drying_ink_speed: DryingInkSpeed::default(),
             drying_ink_strength: DryingInkStrength::default(),
             paper_texture: false,
@@ -630,7 +644,7 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\ndrying_ink_band={}\ndrying_ink_speed={}\ndrying_ink_strength={}\npaper_texture={}\npaper_texture_strength={}\nwhisparrot_link={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\ndrying_ink_band={}\ndrying_ink_soak={}\ndrying_ink_speed={}\ndrying_ink_strength={}\npaper_texture={}\npaper_texture_strength={}\nwhisparrot_link={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
@@ -639,6 +653,7 @@ impl SettingsRepository for FileStateStore {
             settings.syntax_highlight,
             settings.drying_ink,
             settings.drying_ink_band,
+            settings.drying_ink_soak,
             settings.drying_ink_speed.as_str(),
             settings.drying_ink_strength.as_str(),
             settings.paper_texture,
@@ -696,6 +711,8 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.drying_ink = value != "false";
                 } else if let Some(value) = line.strip_prefix("drying_ink_band=") {
                     settings.drying_ink_band = value != "false";
+                } else if let Some(value) = line.strip_prefix("drying_ink_soak=") {
+                    settings.drying_ink_soak = value != "false";
                 } else if let Some(value) = line.strip_prefix("drying_ink_speed=") {
                     settings.drying_ink_speed = DryingInkSpeed::parse(value);
                 } else if let Some(value) = line.strip_prefix("drying_ink_strength=") {
@@ -1066,6 +1083,7 @@ mod tests {
             syntax_highlight: false,
             drying_ink: false,
             drying_ink_band: false,
+            drying_ink_soak: false,
             drying_ink_speed: DryingInkSpeed::Slow,
             drying_ink_strength: DryingInkStrength::Strong,
             paper_texture: true,
@@ -1282,6 +1300,7 @@ mod tests {
                     syntax_highlight: true,
                     drying_ink: true,
                     drying_ink_band: true,
+                    drying_ink_soak: true,
                     drying_ink_speed: DryingInkSpeed::Standard,
                     drying_ink_strength: DryingInkStrength::Standard,
                     paper_texture: false,
@@ -1433,6 +1452,39 @@ mod tests {
             assert!(loaded.drying_ink_band, "value {value:?}");
         }
         assert!(!load_after_writing("drying_ink_band=false\n").drying_ink_band);
+    }
+
+    #[test]
+    fn drying_ink_soak_round_trips_and_defaults_to_true() {
+        let root = temporary_directory("state-drying-ink-soak-round-trip");
+        let store = FileStateStore::at(&root);
+        for enabled in [false, true] {
+            let settings = Settings {
+                drying_ink_soak: enabled,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+            assert!(text.contains(&format!("drying_ink_soak={enabled}\n")));
+            let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+            assert_eq!(loaded.drying_ink_soak, enabled);
+            assert_eq!(loaded, settings);
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(Settings::default().drying_ink_soak);
+        assert!(load_after_writing("autosave=false\n").drying_ink_soak);
+        for value in ["maybe", "", "FALSE", "0"] {
+            let loaded = load_after_writing(&format!("drying_ink_soak={value}\n"));
+            assert!(loaded.drying_ink_soak, "value {value:?}");
+        }
+        assert!(!load_after_writing("drying_ink_soak=false\n").drying_ink_soak);
+    }
+
+    #[test]
+    fn soak_depth_follows_the_drying_ink_strength() {
+        assert_eq!(DryingInkStrength::Weak.soak_depth(), (0.033, 0.030));
+        assert_eq!(DryingInkStrength::Standard.soak_depth(), (0.050, 0.045));
+        assert_eq!(DryingInkStrength::Strong.soak_depth(), (0.075, 0.065));
     }
 
     #[test]

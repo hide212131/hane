@@ -7,7 +7,7 @@
     reason = "line rendering keeps GPUI-facing arguments and run assembly together"
 )]
 
-use crate::ink::{InkFrame, band_color, ink_color};
+use crate::ink::{InkFrame, band_color, ink_color, soak_alpha, soak_color};
 use crate::input_mode::KeyboardInputMode;
 use crate::mermaid::DiagramPaint;
 use crate::ranges::partition;
@@ -1187,6 +1187,164 @@ fn segment_shows_band(segment: &LineSegment) -> bool {
     !segment.selected && !segment.find_match
 }
 
+/// Opacity of the band as a segment background. With the soak on, the band is
+/// drawn by the soak layer instead, so segments show none of it.
+fn segment_band_opacity(
+    segment: &LineSegment,
+    band: Option<&(Range<usize>, f32)>,
+    params: &crate::ink::InkParams,
+) -> Option<f32> {
+    band_opacity_for(&segment.visual_range, band)
+        .filter(|_| segment_shows_band(segment) && !params.soak_enabled)
+}
+
+/// Most soak patches one frame draws. Past it, each row folds its patches into
+/// one bounding stretch per opacity.
+const MAX_SOAK_PATCHES: usize = 256;
+/// Blur extent of a soak patch, as a fraction of the row height.
+const SOAK_BLUR_FRACTION: f32 = 0.25;
+/// How much of the soak's opacity the outer, middle and inner layer have
+/// reached once drawn (cumulative coverage).
+const SOAK_LAYER_COVERAGE: [f32; 3] = [0.30, 0.65, 1.0];
+
+/// One soft patch of the soak layer: a stretch of a row's visual text and the
+/// opacity of the soak behind it.
+#[derive(Clone, Debug, PartialEq)]
+struct SoakPatch {
+    visual: Range<usize>,
+    alpha: f32,
+}
+
+/// Whether this frame has more ranges than `MAX_SOAK_PATCHES`, so each row
+/// folds its patches together. The ranges are what a frame can turn into
+/// patches; counting them needs no layout.
+fn soak_exceeds_budget(ink: &InkFrame) -> bool {
+    ink.wet.len() + usize::from(ink.band.is_some()) > MAX_SOAK_PATCHES
+}
+
+/// The soak patches of one row: every stretch with a different wetness or band
+/// coverage gets the opacity [`soak_alpha`] gives it, and neighbors with the
+/// same opacity are joined. The band's share stays off `excluded` stretches
+/// (selection and find matches), like the segment band does. A stretch that is
+/// dry and outside the band gets no patch.
+fn row_soak_patches(
+    ink: &[(Range<usize>, u8)],
+    band: Option<&(Range<usize>, f32)>,
+    excluded: &[Range<usize>],
+    params: &crate::ink::InkParams,
+    dark: bool,
+) -> Vec<SoakPatch> {
+    let mut cuts = Vec::new();
+    for (range, _) in ink {
+        cuts.push(range.start);
+        cuts.push(range.end);
+    }
+    if let Some((range, _)) = band {
+        cuts.push(range.start);
+        cuts.push(range.end);
+        for range in excluded {
+            cuts.push(range.start);
+            cuts.push(range.end);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut patches: Vec<SoakPatch> = Vec::new();
+    for pair in cuts.windows(2) {
+        let interval = pair[0]..pair[1];
+        let band_opacity = band_opacity_for(&interval, band)
+            .filter(|_| {
+                !excluded
+                    .iter()
+                    .any(|range| interval.start < range.end && range.start < interval.end)
+            })
+            .unwrap_or(0.0);
+        let alpha = soak_alpha(
+            ink_level_for(&interval, ink),
+            band_opacity,
+            params.strength,
+            dark,
+        );
+        if alpha <= 0.0 {
+            continue;
+        }
+        match patches.last_mut() {
+            Some(last) if last.visual.end == interval.start && (last.alpha - alpha).abs() < 1e-6 => {
+                last.visual.end = interval.end;
+            }
+            _ => patches.push(SoakPatch {
+                visual: interval,
+                alpha,
+            }),
+        }
+    }
+    patches
+}
+
+/// Folds a row's patches into one bounding stretch per opacity.
+fn coalesce_soak_patches(patches: Vec<SoakPatch>) -> Vec<SoakPatch> {
+    let mut merged: Vec<SoakPatch> = Vec::new();
+    for patch in patches {
+        match merged
+            .iter_mut()
+            .find(|candidate| (candidate.alpha - patch.alpha).abs() < 1e-6)
+        {
+            Some(existing) => {
+                existing.visual = existing.visual.start.min(patch.visual.start)
+                    ..existing.visual.end.max(patch.visual.end);
+            }
+            None => merged.push(patch),
+        }
+    }
+    merged
+}
+
+/// Opacities of the three stacked layers that soften a patch's edge, outermost
+/// first. Painted one over another they add up to `alpha` in the middle.
+fn soak_layer_alphas(alpha: f32) -> [f32; 3] {
+    let mut previous = 0.0;
+    SOAK_LAYER_COVERAGE.map(|share| {
+        let covered = alpha * share;
+        let layer = (covered - previous) / (1.0 - previous);
+        previous = covered;
+        layer
+    })
+}
+
+/// The layers of one patch between `x0` and `x1` (row-local, before the
+/// horizontal padding). Each layer is a pill, narrower and shorter than the one
+/// below, so the edge fades over [`SOAK_BLUR_FRACTION`] of the row height. All
+/// of it stays inside the row vertically.
+fn soak_patch_divs(
+    alpha: f32,
+    x0: f32,
+    x1: f32,
+    row_height: f32,
+    padding: f32,
+    color: u32,
+) -> Vec<Div> {
+    let step = row_height * SOAK_BLUR_FRACTION / 3.0;
+    soak_layer_alphas(alpha)
+        .into_iter()
+        .enumerate()
+        .map(|(index, layer)| {
+            let outset = step * (2 - index) as f32;
+            let inset = step * (index as f32 + 0.5);
+            let height = (row_height - 2.0 * inset).max(1.0);
+            let width = (x1 - x0) + 2.0 * outset;
+            let alpha8 = (layer.clamp(0.0, 1.0) * 255.0).round() as u32;
+            div()
+                .absolute()
+                .left(px(padding + x0 - outset))
+                .top(px(inset))
+                .w(px(width))
+                .h(px(height))
+                .rounded(px(height / 2.0))
+                .bg(rgba((color << 8) | alpha8))
+        })
+        .collect()
+}
+
 /// The wettest ink level covering the whole of `range`, or 0.
 fn ink_level_for(range: &Range<usize>, ink: &[(Range<usize>, u8)]) -> u8 {
     ink.iter()
@@ -1483,6 +1641,45 @@ pub(crate) fn row_element(
     let ink_visuals = row_ink_visuals(block, layout, row_index, ink);
     let band_visual = row_band_visual(block, layout, row_index, ink);
     let ink_edges = ink_split_edges(&ink_visuals, band_visual.as_ref());
+    // The soak layer: soft patches under the first segment. With it on, the
+    // band is one of these patches rather than a segment background.
+    let soak_layer = if ink.params.soak_enabled {
+        let dark = theme_is_dark(&theme);
+        let mut excluded: Vec<Range<usize>> = match_visuals.clone();
+        excluded.extend(current_match_visual.clone());
+        excluded.extend(selected_visual.clone());
+        let mut patches =
+            row_soak_patches(&ink_visuals, band_visual.as_ref(), &excluded, &ink.params, dark);
+        if soak_exceeds_budget(ink) {
+            patches = coalesce_soak_patches(patches);
+        }
+        let (light_depth, dark_depth) = ink.params.strength.soak_depth();
+        let color = soak_color(
+            theme.editor_background,
+            if dark { dark_depth } else { light_depth },
+        );
+        patches
+            .iter()
+            .flat_map(|patch| {
+                layout
+                    .visual_spans_on_row(block, row_index, patch.visual.clone(), shaper)
+                    .into_iter()
+                    .flat_map(|span| {
+                        soak_patch_divs(
+                            patch.alpha,
+                            span.x0,
+                            span.x1,
+                            row.height,
+                            theme.line_horizontal_padding,
+                            color,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let segments = line_segments_with_ink(
         row.line_visual_range.clone(),
         visual_cursor.map(|offset| offset.0),
@@ -1508,8 +1705,11 @@ pub(crate) fn row_element(
             elements.push(cursor_overlay(theme, caret_input_mode).into_any_element());
         }
         if !segment.visual_range.is_empty() {
-            let band_opacity = band_opacity_for(&segment.visual_range, band_visual.as_ref())
-                .filter(|_| segment_shows_band(segment));
+            let band_opacity = segment_band_opacity(
+                segment,
+                band_visual.as_ref(),
+                &ink.params,
+            );
             elements.push(
                 div()
                     // Selection wins outright over a match highlight when
@@ -1602,6 +1802,8 @@ pub(crate) fn row_element(
         theme,
         zoom,
     )
+    // First child, so the soak paints under every segment.
+    .children(soak_layer)
     .children(quote_bar(
         row,
         current_quote_bar,
@@ -2696,6 +2898,165 @@ mod tests {
             ..plain_segment()
         };
         assert!(!segment_shows_band(&current));
+    }
+
+    fn soak_params(soak_enabled: bool) -> crate::ink::InkParams {
+        crate::ink::InkParams {
+            soak_enabled,
+            ..crate::ink::InkParams::default()
+        }
+    }
+
+    #[test]
+    fn the_band_is_a_segment_background_only_while_the_soak_is_off() {
+        let band = (0..4, 1.0_f32);
+        let segment = LineSegment {
+            visual_range: 1..3,
+            ..plain_segment()
+        };
+        assert_eq!(
+            segment_band_opacity(&segment, Some(&band), &soak_params(false)),
+            Some(1.0)
+        );
+        assert_eq!(
+            segment_band_opacity(&segment, Some(&band), &soak_params(true)),
+            None
+        );
+        let selected = LineSegment {
+            selected: true,
+            ..segment
+        };
+        assert_eq!(
+            segment_band_opacity(&selected, Some(&band), &soak_params(false)),
+            None
+        );
+    }
+
+    #[test]
+    fn soak_patches_follow_the_level_and_skip_dry_stretches() {
+        let params = soak_params(true);
+        let ink = [(2..4, 4_u8), (4..6, 3), (6..8, 2), (8..10, 1)];
+        let patches = row_soak_patches(&ink, None, &[], &params, false);
+        let alphas = patches
+            .iter()
+            .map(|patch| (patch.visual.clone(), patch.alpha))
+            .collect::<Vec<_>>();
+        assert_eq!(alphas.len(), 4);
+        for ((range, alpha), (expected_range, expected)) in alphas.iter().zip([
+            (2..4, 0.72_f32),
+            (4..6, 0.54),
+            (6..8, 0.36),
+            (8..10, 0.18),
+        ]) {
+            assert_eq!(*range, expected_range);
+            assert!((alpha - expected).abs() < 1e-6, "{range:?}: {alpha}");
+        }
+        // Nothing wet, nothing to draw.
+        assert!(row_soak_patches(&[], None, &[], &params, false).is_empty());
+    }
+
+    #[test]
+    fn soak_patches_join_neighbors_with_the_same_opacity() {
+        let params = soak_params(true);
+        let patches = row_soak_patches(&[(0..3, 2), (3..6, 2)], None, &[], &params, true);
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].visual, 0..6);
+    }
+
+    #[test]
+    fn the_band_tops_up_the_soak_and_covers_dry_stretches() {
+        let params = soak_params(true);
+        let band = (0..6, 1.0_f32);
+        let patches = row_soak_patches(&[(2..4, 2)], Some(&band), &[], &params, false);
+        let alphas = patches
+            .iter()
+            .map(|patch| (patch.visual.clone(), patch.alpha))
+            .collect::<Vec<_>>();
+        assert_eq!(alphas.len(), 3);
+        // Dry parts inside the band get the band's share alone.
+        assert_eq!(alphas[0].0, 0..2);
+        assert!((alphas[0].1 - 0.25).abs() < 1e-6);
+        assert_eq!(alphas[1].0, 2..4);
+        assert!((alphas[1].1 - 0.61).abs() < 1e-6);
+        assert_eq!(alphas[2].0, 4..6);
+    }
+
+    #[test]
+    fn the_band_top_up_stays_off_selection_and_find_matches() {
+        let params = soak_params(true);
+        let band = (0..6, 1.0_f32);
+        let patches = row_soak_patches(&[(2..4, 2)], Some(&band), &[2..3, 5..6], &params, false);
+        let alpha_at = |at: usize| {
+            patches
+                .iter()
+                .find(|patch| patch.visual.start <= at && at < patch.visual.end)
+                .map(|patch| patch.alpha)
+        };
+        // The wet part itself keeps its soak; only the band's share is held back.
+        assert!((alpha_at(2).unwrap() - 0.36).abs() < 1e-6);
+        assert!((alpha_at(3).unwrap() - 0.61).abs() < 1e-6);
+        assert_eq!(alpha_at(5), None);
+        assert!((alpha_at(0).unwrap() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn no_soak_patch_is_made_without_ink_or_band() {
+        let params = soak_params(true);
+        assert!(row_soak_patches(&[], None, &[0..3], &params, false).is_empty());
+    }
+
+    #[test]
+    fn too_many_patches_fold_into_one_stretch_per_opacity() {
+        let patches = vec![
+            SoakPatch {
+                visual: 0..2,
+                alpha: 0.72,
+            },
+            SoakPatch {
+                visual: 3..5,
+                alpha: 0.36,
+            },
+            SoakPatch {
+                visual: 6..8,
+                alpha: 0.72,
+            },
+        ];
+        let folded = coalesce_soak_patches(patches);
+        assert_eq!(folded.len(), 2);
+        assert_eq!(folded[0].visual, 0..8);
+        assert_eq!(folded[1].visual, 3..5);
+    }
+
+    #[test]
+    fn the_patch_budget_counts_the_frame_ranges() {
+        let range = SourceRange::new(0, 1);
+        let frame = |wet: usize, band: bool| InkFrame {
+            wet: vec![(range, 4); wet],
+            band: band.then_some((range, 1.0)),
+            params: soak_params(true),
+        };
+        assert!(!soak_exceeds_budget(&frame(MAX_SOAK_PATCHES, false)));
+        assert!(!soak_exceeds_budget(&frame(MAX_SOAK_PATCHES - 1, true)));
+        assert!(soak_exceeds_budget(&frame(MAX_SOAK_PATCHES, true)));
+        assert!(soak_exceeds_budget(&frame(MAX_SOAK_PATCHES + 1, false)));
+    }
+
+    #[test]
+    fn the_soak_layers_add_up_to_the_patch_opacity() {
+        for alpha in [0.18_f32, 0.36, 0.54, 0.72, 0.9] {
+            let layers = soak_layer_alphas(alpha);
+            let transparent = layers.iter().fold(1.0_f32, |rest, layer| rest * (1.0 - layer));
+            assert!((1.0 - transparent - alpha).abs() < 1e-5, "{alpha}");
+            // Outer layers are fainter than the opacity they build up to.
+            assert!(layers.iter().all(|layer| (0.0..=1.0).contains(layer)));
+            assert!(layers[0] < alpha);
+        }
+    }
+
+    #[test]
+    fn a_soak_patch_is_three_stacked_layers() {
+        let divs = soak_patch_divs(0.54, 20.0, 80.0, 26.0, 12.0, 0xe0dfdc);
+        assert_eq!(divs.len(), 3);
     }
 
     #[test]
