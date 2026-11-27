@@ -823,7 +823,7 @@ impl EditorView {
                 });
             let confirm = view.clone();
             let drop = view.clone();
-            let row = div()
+            div()
                 .flex()
                 .flex_col()
                 .gap_0p5()
@@ -854,8 +854,7 @@ impl EditorView {
                                     drop.update(app, |view, cx| view.voice_discard(seq, cx));
                                 }),
                         ),
-                );
-            row
+                )
         });
         Some(
             div()
