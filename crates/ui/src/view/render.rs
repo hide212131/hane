@@ -502,6 +502,9 @@ impl EditorView {
         // Wet ink for this frame; empty while reading and while the master
         // switch is off. Taken before `editor` borrows the sessions.
         let ink_frame = self.drying_ink_frame(cx);
+        // The paper / wall behind the whole body. Not part of the tree while
+        // the setting is off or the image is still being generated.
+        let paper_texture = self.paper_texture_layer(window, cx);
         let editor = self.sessions.active().editor();
         let editor_scrollbar = self.editor_scrollbar(self.scrollable_content_height(), cx);
         let main_column = main_column.child(
@@ -525,6 +528,8 @@ impl EditorView {
                 )
                 .on_scroll_wheel(cx.listener(Self::on_scroll))
                 .on_pinch(cx.listener(Self::on_pinch))
+                // First child, so everything else paints over it.
+                .children(paper_texture)
                 .child(InputCapture { input: cx.entity() })
                 .child(
                     div()

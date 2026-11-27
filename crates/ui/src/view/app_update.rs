@@ -3098,6 +3098,8 @@ mod tests {
         view.update(cx, |view, _| view.attach_app_update(Some(attached)));
         open_general_settings(&view, cx);
         let calls_before = controller.calls();
+        cx.simulate_resize(gpui::size(gpui::px(960.0), gpui::px(1600.0)));
+        cx.run_until_parked();
 
         let button = cx
             .debug_bounds("settings-app-update-diagnostics")

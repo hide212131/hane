@@ -121,12 +121,59 @@ impl DryingInkStrength {
         }
     }
 
+    /// How far the soak color sits below the editor background in OKLab
+    /// lightness (Issue #788): `(light theme, dark theme)`.
+    pub fn soak_depth(self) -> (f32, f32) {
+        match self {
+            Self::Weak => (0.033, 0.030),
+            Self::Standard => (0.050, 0.045),
+            Self::Strong => (0.075, 0.065),
+        }
+    }
+
     /// OKLab lightness difference of the band background.
     pub fn band_delta_l(self) -> f32 {
         match self {
             Self::Weak => 0.02,
             Self::Standard => 0.03,
             Self::Strong => 0.045,
+        }
+    }
+}
+
+/// How strongly the background texture shows (`paper_texture_strength` key,
+/// Issue #788). A missing or invalid value means `Standard`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PaperTextureStrength {
+    Weak,
+    #[default]
+    Standard,
+    Strong,
+}
+
+impl PaperTextureStrength {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Weak => "weak",
+            Self::Standard => "standard",
+            Self::Strong => "strong",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "weak" => Self::Weak,
+            "strong" => Self::Strong,
+            _ => Self::Standard,
+        }
+    }
+
+    /// Multiplier applied to the texture's lightness amplitude.
+    pub fn amplitude_factor(self) -> f32 {
+        match self {
+            Self::Weak => 0.6,
+            Self::Standard => 1.0,
+            Self::Strong => 1.4,
         }
     }
 }
@@ -172,10 +219,20 @@ pub struct Settings {
     /// Whether a band is drawn behind a just-confirmed sentence
     /// (`drying_ink_band` key). A missing or invalid value means `true`.
     pub drying_ink_band: bool,
+    /// Whether wet ink soaks the paper behind it (`drying_ink_soak` key,
+    /// Issue #788). Display only. A missing or invalid value means `true`.
+    pub drying_ink_soak: bool,
     /// How long the ink takes to dry (`drying_ink_speed` key).
     pub drying_ink_speed: DryingInkSpeed,
     /// How strongly the ink and band stand out (`drying_ink_strength` key).
     pub drying_ink_strength: DryingInkStrength,
+    /// Whether the editor body is drawn on a paper / wall texture
+    /// (`paper_texture` key, Issue #788). Display only. A missing or invalid
+    /// value means `false`.
+    pub paper_texture: bool,
+    /// How strongly the texture shows (`paper_texture_strength` key). A
+    /// missing or invalid value means `Standard`.
+    pub paper_texture_strength: PaperTextureStrength,
     /// Whether Hane lets the whisparrot voice-input app read context from the
     /// open document and insert or replace text (`whisparrot_link` key). Off
     /// until the user turns it on; a missing key, any value other than `true`,
@@ -210,8 +267,11 @@ impl Default for Settings {
             syntax_highlight: true,
             drying_ink: true,
             drying_ink_band: true,
+            drying_ink_soak: true,
             drying_ink_speed: DryingInkSpeed::default(),
             drying_ink_strength: DryingInkStrength::default(),
+            paper_texture: false,
+            paper_texture_strength: PaperTextureStrength::default(),
             whisparrot_link: false,
             voice_composition: false,
             voice_engine_path: None,
@@ -601,7 +661,7 @@ impl SettingsRepository for FileStateStore {
         }
         fs::create_dir_all(&self.root)?;
         let mut contents = format!(
-            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\ndrying_ink_band={}\ndrying_ink_speed={}\ndrying_ink_strength={}\nwhisparrot_link={}\nvoice_composition={}\n",
+            "autosave={}\ntheme={}\nsidebar_sort={}\nauto_update_check={}\nplain_text_mode={}\nsyntax_highlight={}\ndrying_ink={}\ndrying_ink_band={}\ndrying_ink_soak={}\ndrying_ink_speed={}\ndrying_ink_strength={}\npaper_texture={}\npaper_texture_strength={}\nwhisparrot_link={}\nvoice_composition={}\n",
             settings.autosave,
             settings.theme.as_str(),
             settings.sidebar_sort.as_str(),
@@ -610,8 +670,11 @@ impl SettingsRepository for FileStateStore {
             settings.syntax_highlight,
             settings.drying_ink,
             settings.drying_ink_band,
+            settings.drying_ink_soak,
             settings.drying_ink_speed.as_str(),
             settings.drying_ink_strength.as_str(),
+            settings.paper_texture,
+            settings.paper_texture_strength.as_str(),
             settings.whisparrot_link && !settings.voice_composition,
             settings.voice_composition
         );
@@ -675,10 +738,16 @@ fn settings_from_read(read: io::Result<String>) -> Settings {
                     settings.drying_ink = value != "false";
                 } else if let Some(value) = line.strip_prefix("drying_ink_band=") {
                     settings.drying_ink_band = value != "false";
+                } else if let Some(value) = line.strip_prefix("drying_ink_soak=") {
+                    settings.drying_ink_soak = value != "false";
                 } else if let Some(value) = line.strip_prefix("drying_ink_speed=") {
                     settings.drying_ink_speed = DryingInkSpeed::parse(value);
                 } else if let Some(value) = line.strip_prefix("drying_ink_strength=") {
                     settings.drying_ink_strength = DryingInkStrength::parse(value);
+                } else if let Some(value) = line.strip_prefix("paper_texture_strength=") {
+                    settings.paper_texture_strength = PaperTextureStrength::parse(value);
+                } else if let Some(value) = line.strip_prefix("paper_texture=") {
+                    settings.paper_texture = value == "true";
                 } else if let Some(value) = line.strip_prefix("whisparrot_link=") {
                     settings.whisparrot_link = value == "true";
                 } else if let Some(value) = line.strip_prefix("voice_composition=") {
@@ -1051,8 +1120,11 @@ mod tests {
             syntax_highlight: false,
             drying_ink: false,
             drying_ink_band: false,
+            drying_ink_soak: false,
             drying_ink_speed: DryingInkSpeed::Slow,
             drying_ink_strength: DryingInkStrength::Strong,
+            paper_texture: true,
+            paper_texture_strength: PaperTextureStrength::Weak,
             whisparrot_link: true,
             voice_composition: false,
             voice_engine_path: None,
@@ -1268,8 +1340,11 @@ mod tests {
                     syntax_highlight: true,
                     drying_ink: true,
                     drying_ink_band: true,
+                    drying_ink_soak: true,
                     drying_ink_speed: DryingInkSpeed::Standard,
                     drying_ink_strength: DryingInkStrength::Standard,
+                    paper_texture: false,
+                    paper_texture_strength: PaperTextureStrength::Standard,
                     whisparrot_link: false,
                     voice_composition: false,
                     voice_engine_path: None,
@@ -1423,6 +1498,39 @@ mod tests {
     }
 
     #[test]
+    fn drying_ink_soak_round_trips_and_defaults_to_true() {
+        let root = temporary_directory("state-drying-ink-soak-round-trip");
+        let store = FileStateStore::at(&root);
+        for enabled in [false, true] {
+            let settings = Settings {
+                drying_ink_soak: enabled,
+                ..Settings::default()
+            };
+            SettingsRepository::store(&store, &settings).unwrap();
+            let text = fs::read_to_string(root.join("settings.conf")).unwrap();
+            assert!(text.contains(&format!("drying_ink_soak={enabled}\n")));
+            let loaded = SettingsRepository::load(&FileStateStore::at(&root));
+            assert_eq!(loaded.drying_ink_soak, enabled);
+            assert_eq!(loaded, settings);
+        }
+        fs::remove_dir_all(root).unwrap();
+        assert!(Settings::default().drying_ink_soak);
+        assert!(load_after_writing("autosave=false\n").drying_ink_soak);
+        for value in ["maybe", "", "FALSE", "0"] {
+            let loaded = load_after_writing(&format!("drying_ink_soak={value}\n"));
+            assert!(loaded.drying_ink_soak, "value {value:?}");
+        }
+        assert!(!load_after_writing("drying_ink_soak=false\n").drying_ink_soak);
+    }
+
+    #[test]
+    fn soak_depth_follows_the_drying_ink_strength() {
+        assert_eq!(DryingInkStrength::Weak.soak_depth(), (0.033, 0.030));
+        assert_eq!(DryingInkStrength::Standard.soak_depth(), (0.050, 0.045));
+        assert_eq!(DryingInkStrength::Strong.soak_depth(), (0.075, 0.065));
+    }
+
+    #[test]
     fn drying_ink_speed_and_strength_round_trip() {
         let root = temporary_directory("state-drying-ink-tuning-round-trip");
         let store = FileStateStore::at(&root);
@@ -1470,6 +1578,29 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn paper_texture_defaults_off_and_round_trips() {
+        let defaults = Settings::default();
+        assert!(!defaults.paper_texture);
+        assert_eq!(defaults.paper_texture_strength, PaperTextureStrength::Standard);
+        let missing = load_after_writing("autosave=false\n");
+        assert!(!missing.paper_texture);
+        assert_eq!(missing.paper_texture_strength, PaperTextureStrength::Standard);
+        for value in ["", "yes", "1", "False"] {
+            let loaded = load_after_writing(&format!(
+                "paper_texture={value}\npaper_texture_strength={value}\n"
+            ));
+            assert!(!loaded.paper_texture, "{value:?}");
+            assert_eq!(loaded.paper_texture_strength, PaperTextureStrength::Standard);
+        }
+        let loaded = load_after_writing("paper_texture=true\npaper_texture_strength=strong\n");
+        assert!(loaded.paper_texture);
+        assert_eq!(loaded.paper_texture_strength, PaperTextureStrength::Strong);
+        assert_eq!(PaperTextureStrength::Weak.amplitude_factor(), 0.6);
+        assert_eq!(PaperTextureStrength::Standard.amplitude_factor(), 1.0);
+        assert_eq!(PaperTextureStrength::Strong.amplitude_factor(), 1.4);
     }
 
     #[test]

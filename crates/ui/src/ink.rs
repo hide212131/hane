@@ -10,8 +10,11 @@
     reason = "the band, boundary and tuning APIs are wired in phase P3"
 )]
 
+use crate::color::shift_lightness;
+#[cfg(test)]
+use crate::color::{from_oklab, to_oklab};
 use hane_document::{Revision, RevisionDelta, RopeBuffer, SourceRange, TextBuffer};
-use hane_session::SessionId;
+use hane_session::{DryingInkStrength, SessionId};
 use std::time::{Duration, Instant};
 
 /// Number of discrete wetness levels: 4 is the wettest, 0 is dry.
@@ -38,6 +41,12 @@ pub(crate) struct InkParams {
     pub(crate) delta_l: f32,
     pub(crate) band_delta_l: f32,
     pub(crate) band_enabled: bool,
+    /// Whether wet ink soaks the paper behind it (Issue #788, phase P2). When
+    /// on, the band is drawn by the soak layer instead of as a segment
+    /// background.
+    pub(crate) soak_enabled: bool,
+    /// The strength setting; the soak depth and the band's alpha cap follow it.
+    pub(crate) strength: DryingInkStrength,
 }
 
 impl Default for InkParams {
@@ -47,6 +56,8 @@ impl Default for InkParams {
             delta_l: 0.04,
             band_delta_l: 0.03,
             band_enabled: true,
+            soak_enabled: true,
+            strength: DryingInkStrength::Standard,
         }
     }
 }
@@ -464,90 +475,24 @@ pub(crate) fn rebase_range(range: SourceRange, delta: &RevisionDelta) -> [Option
 }
 
 // --- Color (OKLab, lightness only) -------------------------------------
+// The conversion functions live in `crate::color`.
 
-fn srgb_to_linear(channel: u32) -> f64 {
-    let value = f64::from(channel & 0xff) / 255.0;
-    if value <= 0.04045 {
-        value / 12.92
-    } else {
-        ((value + 0.055) / 1.055).powf(2.4)
-    }
-}
-
-fn linear_to_srgb(value: f64) -> u32 {
-    let value = value.clamp(0.0, 1.0);
-    let encoded = if value <= 0.003_130_8 {
-        value * 12.92
-    } else {
-        1.055 * value.powf(1.0 / 2.4) - 0.055
-    };
-    // Rounded value is within 0..=255.
-    (encoded.clamp(0.0, 1.0) * 255.0).round() as u32
-}
-
-fn to_oklab(rgb: u32) -> [f64; 3] {
-    let r = srgb_to_linear(rgb >> 16);
-    let g = srgb_to_linear(rgb >> 8);
-    let b = srgb_to_linear(rgb);
-    let l = (0.412_221_470_8 * r + 0.536_332_536_3 * g + 0.051_445_992_9 * b).cbrt();
-    let m = (0.211_903_498_2 * r + 0.680_699_545_1 * g + 0.107_396_956_6 * b).cbrt();
-    let s = (0.088_302_461_9 * r + 0.281_718_837_6 * g + 0.629_978_700_5 * b).cbrt();
-    [
-        0.210_454_255_3 * l + 0.793_617_785_0 * m - 0.004_072_046_8 * s,
-        1.977_998_495_1 * l - 2.428_592_205_0 * m + 0.450_593_709_9 * s,
-        0.025_904_037_1 * l + 0.782_771_766_2 * m - 0.808_675_766_0 * s,
-    ]
-}
-
-fn oklab_to_linear(lightness: f64, a: f64, b: f64) -> [f64; 3] {
-    let l = (lightness + 0.396_337_777_4 * a + 0.215_803_757_3 * b).powi(3);
-    let m = (lightness - 0.105_561_345_8 * a - 0.063_854_172_8 * b).powi(3);
-    let s = (lightness - 0.089_484_177_5 * a - 1.291_485_548_0 * b).powi(3);
-    [
-        4.076_741_662_1 * l - 3.307_711_591_3 * m + 0.230_969_929_2 * s,
-        -1.268_438_004_6 * l + 2.609_757_401_1 * m - 0.341_319_396_5 * s,
-        -0.004_196_086_3 * l - 0.703_418_614_7 * m + 1.707_614_701_0 * s,
-    ]
-}
-
-fn in_gamut(linear: [f64; 3]) -> bool {
-    linear.iter().all(|c| (-1e-4..=1.0 + 1e-4).contains(c))
-}
-
-/// Encodes an OKLab color. When the requested lightness leaves the sRGB gamut
-/// at the original chroma, chroma is reduced just enough to fit; the lightness
-/// is kept.
-fn from_oklab(lightness: f64, a: f64, b: f64) -> u32 {
-    let mut linear = oklab_to_linear(lightness, a, b);
-    if !in_gamut(linear) {
-        let (mut low, mut high) = (0.0_f64, 1.0_f64);
-        for _ in 0..24 {
-            let mid = (low + high) / 2.0;
-            if in_gamut(oklab_to_linear(lightness, a * mid, b * mid)) {
-                low = mid;
-            } else {
-                high = mid;
-            }
-        }
-        linear = oklab_to_linear(lightness, a * low, b * low);
-    }
-    (linear_to_srgb(linear[0]) << 16) | (linear_to_srgb(linear[1]) << 8) | linear_to_srgb(linear[2])
-}
-
-fn shift_lightness(rgb: u32, delta: f64) -> u32 {
-    let [lightness, a, b] = to_oklab(rgb);
-    from_oklab((lightness + delta).clamp(0.0, 1.0), a, b)
-}
+/// Multiplier applied to the text `delta_l` in dark themes. The dark text color
+/// already sits near OKLab lightness 0.92, so the same `delta_l` that is clearly
+/// visible on dark ink in light themes moves it by only ~13/255 in sRGB and the
+/// drying effect is hard to see (#782). Doubling it makes the effect visible.
+const DARK_DELTA_L_FACTOR: f64 = 2.0;
 
 /// Text color for a wet range (3.3): the base color with its OKLab lightness
-/// moved toward more contrast by `delta_l * level / 4`. Light themes darken,
-/// dark themes lighten. Level 0 returns `base` untouched.
+/// moved toward more contrast by `delta_l * level / 4`. Light themes darken;
+/// dark themes lighten by `DARK_DELTA_L_FACTOR` times that amount (lightness is
+/// clamped to 1.0). Level 0 returns `base` untouched.
 pub(crate) fn ink_color(base: u32, level: u8, delta_l: f32, dark: bool) -> u32 {
     if level == 0 {
         return base;
     }
     let level = level.min(WET_LEVELS);
-    let direction = if dark { 1.0 } else { -1.0 };
+    let direction = if dark { DARK_DELTA_L_FACTOR } else { -1.0 };
     let amount = direction * f64::from(delta_l) * f64::from(level) / f64::from(WET_LEVELS);
     shift_lightness(base, amount)
 }
@@ -556,6 +501,66 @@ pub(crate) fn ink_color(base: u32, level: u8, delta_l: f32, dark: bool) -> u32 {
 pub(crate) fn band_color(background: u32, delta_l: f32, dark: bool) -> u32 {
     let direction = if dark { 1.0 } else { -1.0 };
     shift_lightness(background, direction * f64::from(delta_l))
+}
+
+// --- Soak (Issue #788, phase P2) ----------------------------------------
+
+/// Opacity the soak gains per wetness level: 0.72 / 0.54 / 0.36 / 0.18 for
+/// levels 4..=1.
+const SOAK_ALPHA_PER_LEVEL: f32 = 0.18;
+/// What the band adds to the soak opacity at full band opacity.
+const SOAK_BAND_ALPHA: f32 = 0.25;
+/// The soak with the band on top never gets more opaque than this.
+const SOAK_ALPHA_MAX: f32 = 0.9;
+/// Upper bound of the soak opacity with the band on top, per strength
+/// (`[weak, standard, strong]`) and theme (`[light, dark]`).
+///
+/// Computed from the darkest texture pixel (`L_bg - 0.020` in light themes) and
+/// the soak color `L_bg - depth`: the composite lightness is
+/// `L_texture - alpha * (L_texture - L_soak)`, which has to stay at or above
+/// `SOAK_LIGHT_FLOOR_L`. Only the strong light case reaches that floor before
+/// `SOAK_ALPHA_MAX`: `0.042 / 0.055 = 0.76`, held back to 0.72 (the level-4
+/// soak itself) for rounding. Dark soaks only make the background darker, so
+/// the ceiling `SOAK_DARK_CEILING_L` is never in play.
+const SOAK_ALPHA_CAPS: [[f32; 2]; 3] = [[0.9, 0.9], [0.9, 0.9], [0.72, 0.9]];
+/// Lowest OKLab lightness the composite background may have in a light theme.
+pub(crate) const SOAK_LIGHT_FLOOR_L: f64 = 0.92;
+/// Highest OKLab lightness the composite background may have in a dark theme.
+pub(crate) const SOAK_DARK_CEILING_L: f64 = 0.255;
+
+/// Opacity of the soak for a wetness level: `0.18 * level`, and none when dry.
+pub(crate) fn soak_level_alpha(level: u8) -> f32 {
+    SOAK_ALPHA_PER_LEVEL * f32::from(level.min(WET_LEVELS))
+}
+
+/// The cap of the soak opacity with the band on top.
+pub(crate) fn soak_alpha_cap(strength: DryingInkStrength, dark: bool) -> f32 {
+    let row = match strength {
+        DryingInkStrength::Weak => 0,
+        DryingInkStrength::Standard => 1,
+        DryingInkStrength::Strong => 2,
+    };
+    SOAK_ALPHA_CAPS[row][usize::from(dark)]
+}
+
+/// Opacity of the soak behind a stretch with wetness `level` and band opacity
+/// `band` (0 when the band does not cover it). The band only adds to the soak,
+/// never takes from it, and the sum stays within the cap.
+pub(crate) fn soak_alpha(level: u8, band: f32, strength: DryingInkStrength, dark: bool) -> f32 {
+    let base = soak_level_alpha(level);
+    let band = band.clamp(0.0, 1.0);
+    if band <= 0.0 {
+        return base;
+    }
+    let capped = (base + SOAK_BAND_ALPHA * band)
+        .min(SOAK_ALPHA_MAX)
+        .min(soak_alpha_cap(strength, dark));
+    capped.max(base)
+}
+
+/// The soak color: the editor background moved `depth` darker, in both themes.
+pub(crate) fn soak_color(background: u32, depth: f32) -> u32 {
+    shift_lightness(background, -f64::from(depth))
 }
 
 #[cfg(test)]
@@ -1232,16 +1237,56 @@ mod tests {
                     let result = ink_color(base_color, level, delta_l, dark);
                     let (dl, da, db) = lab_distance_parts(base_color, result);
                     let expected = f64::from(delta_l) * f64::from(level) / 4.0;
-                    let expected = if dark { expected } else { -expected };
+                    let expected = if dark {
+                        expected * DARK_DELTA_L_FACTOR
+                    } else {
+                        -expected
+                    };
+                    let base_l = to_oklab(base_color)[0];
+                    // Lightness is clamped at 1.0, so the expected shift is
+                    // the clamped target minus the original lightness.
+                    let expected = (base_l + expected).min(1.0) - base_l;
                     assert!(
                         (dl - expected).abs() <= 0.005,
                         "{base_color:06x} level {level} delta {delta_l}: dL {dl} vs {expected}"
                     );
+                    // Near white the sRGB gamut collapses to neutral, so chroma
+                    // is reduced; only the lightness shift is checked there.
+                    if base_l + expected > 0.96 {
+                        continue;
+                    }
                     assert!(da <= 0.005, "{base_color:06x} da {da}");
                     assert!(db <= 0.005, "{base_color:06x} db {db}");
                 }
             }
         }
+    }
+
+    #[test]
+    fn ink_color_dark_doubles_the_lightness_shift() {
+        let base_color = 0xe8e5df_u32;
+        let result = ink_color(base_color, 4, 0.04, true);
+        // +0.08 requested; lightness is clamped at 1.0.
+        let expected = (to_oklab(base_color)[0] + 0.08).min(1.0) - to_oklab(base_color)[0];
+        let (dl, _, _) = lab_distance_parts(base_color, result);
+        assert!((dl - expected).abs() <= 0.005, "dL {dl} vs {expected}");
+        // Clearly stronger than the undoubled shift.
+        let undoubled = shift_lightness(base_color, 0.04);
+        assert!(to_oklab(result)[0] > to_oklab(undoubled)[0]);
+    }
+
+    #[test]
+    fn ink_color_light_keeps_the_original_shift() {
+        let base_color = 0x262626_u32;
+        let result = ink_color(base_color, 4, 0.04, false);
+        let (dl, da, db) = lab_distance_parts(base_color, result);
+        assert!((dl + 0.04).abs() <= 0.005, "dL {dl}");
+        assert!(da <= 0.005 && db <= 0.005);
+    }
+
+    #[test]
+    fn ink_color_level_zero_is_exact_in_dark() {
+        assert_eq!(ink_color(0xe8e5df, 0, 0.04, true), 0xe8e5df);
     }
 
     #[test]
@@ -1322,5 +1367,178 @@ mod tests {
             assert!(dl.abs() <= 0.01, "dL {dl}");
             assert!(da <= 0.01 && db <= 0.01, "da {da} db {db}");
         }
+    }
+
+    // --- soak ---
+
+    const STRENGTHS: [DryingInkStrength; 3] = [
+        DryingInkStrength::Weak,
+        DryingInkStrength::Standard,
+        DryingInkStrength::Strong,
+    ];
+
+    #[test]
+    fn soak_alpha_follows_the_level_and_is_absent_when_dry() {
+        for (level, expected) in [(4_u8, 0.72_f32), (3, 0.54), (2, 0.36), (1, 0.18)] {
+            let alpha = soak_level_alpha(level);
+            assert!((alpha - expected).abs() < 1e-6, "level {level}: {alpha}");
+            for strength in STRENGTHS {
+                for dark in [false, true] {
+                    assert!((soak_alpha(level, 0.0, strength, dark) - expected).abs() < 1e-6);
+                }
+            }
+        }
+        assert_eq!(soak_level_alpha(0), 0.0);
+        assert_eq!(soak_alpha(0, 0.0, DryingInkStrength::Standard, false), 0.0);
+    }
+
+    #[test]
+    fn the_band_adds_a_quarter_of_its_opacity_up_to_the_cap() {
+        let standard = DryingInkStrength::Standard;
+        // 0.36 + 0.25 * 1.0
+        assert!((soak_alpha(2, 1.0, standard, false) - 0.61).abs() < 1e-6);
+        assert!((soak_alpha(2, 0.5, standard, true) - 0.485).abs() < 1e-6);
+        // 0.72 + 0.25 is held at 0.9.
+        assert!((soak_alpha(4, 1.0, standard, false) - 0.9).abs() < 1e-6);
+        // A dry stretch inside the band still gets the band's own share.
+        assert!((soak_alpha(0, 1.0, standard, false) - 0.25).abs() < 1e-6);
+        // Strong light themes stop at their table value, never below the soak.
+        let strong = DryingInkStrength::Strong;
+        assert!((soak_alpha(3, 1.0, strong, false) - 0.72).abs() < 1e-6);
+        assert!((soak_alpha(4, 1.0, strong, false) - 0.72).abs() < 1e-6);
+        assert!((soak_alpha(4, 1.0, strong, true) - 0.9).abs() < 1e-6);
+    }
+
+    #[test]
+    fn the_soak_color_is_darker_than_the_background_in_both_themes() {
+        for (theme, dark) in [(DEFAULT_THEME, false), (DARK_THEME, true)] {
+            for strength in STRENGTHS {
+                let (light_depth, dark_depth) = strength.soak_depth();
+                let depth = if dark { dark_depth } else { light_depth };
+                let color = soak_color(theme.editor_background, depth);
+                let (dl, da, db) = lab_distance_parts(theme.editor_background, color);
+                assert!((dl + f64::from(depth)).abs() <= 0.005, "dL {dl}");
+                assert!(da <= 0.005 && db <= 0.005, "da {da} db {db}");
+            }
+        }
+    }
+
+    fn channel_luminance(channels: [f64; 3]) -> f64 {
+        let linear = |value: f64| {
+            let value = value / 255.0;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(channels[0]) + 0.7152 * linear(channels[1]) + 0.0722 * linear(channels[2])
+    }
+
+    fn rgb_channels(color: u32) -> [f64; 3] {
+        [16, 8, 0].map(|shift| f64::from((color >> shift) & 0xff))
+    }
+
+    /// The tile pixel the soak is hardest on: the darkest one in a light theme,
+    /// the brightest one in a dark theme.
+    fn worst_texture_pixel(theme: &crate::theme::Theme, dark: bool) -> u32 {
+        let budget = if dark {
+            crate::paper_texture::DARK_BUDGET.max
+        } else {
+            crate::paper_texture::LIGHT_BUDGET.min
+        };
+        shift_lightness(theme.editor_background, f64::from(budget))
+    }
+
+    /// Alpha blending in sRGB channels, as the GPU does it.
+    fn blend(texture: u32, soak: u32, alpha: f32) -> [f64; 3] {
+        let alpha = f64::from(alpha);
+        let (texture, soak) = (rgb_channels(texture), rgb_channels(soak));
+        [0, 1, 2].map(|i| texture[i] * (1.0 - alpha) + soak[i] * alpha)
+    }
+
+    #[test]
+    fn soak_and_band_keep_the_background_and_every_text_color_readable() {
+        const BAND_OPACITIES: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+        for (theme, dark) in [(DEFAULT_THEME, false), (DARK_THEME, true)] {
+            let tokens = [
+                theme.foreground,
+                theme.quote_foreground,
+                theme.link_foreground,
+                theme.syntax_heading,
+                theme.syntax_heading_minor,
+                theme.syntax_code,
+                theme.syntax_structure,
+            ];
+            let texture = worst_texture_pixel(&theme, dark);
+            for strength in STRENGTHS {
+                let (light_depth, dark_depth) = strength.soak_depth();
+                let depth = if dark { dark_depth } else { light_depth };
+                let soak = soak_color(theme.editor_background, depth);
+                for level in 0..=WET_LEVELS {
+                    for band in BAND_OPACITIES {
+                        let alpha = soak_alpha(level, band, strength, dark);
+                        assert!(alpha <= SOAK_ALPHA_MAX + 1e-6);
+                        let composite = blend(texture, soak, alpha);
+                        let y = channel_luminance(composite);
+                        let label = format!("dark={dark} {strength:?} level {level} band {band}");
+                        if dark {
+                            assert!(y <= SOAK_DARK_CEILING_L.powi(3), "{label}: Y {y}");
+                        } else {
+                            assert!(y >= SOAK_LIGHT_FLOOR_L.powi(3), "{label}: Y {y}");
+                        }
+                        for token in tokens {
+                            let t = channel_luminance(rgb_channels(token));
+                            let contrast = (t.max(y) + 0.05) / (t.min(y) + 0.05);
+                            assert!(contrast >= 4.5, "{label}: {token:06x} contrast {contrast}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_alpha_cap_table_is_fixed() {
+        assert_eq!(SOAK_ALPHA_CAPS, [[0.9, 0.9], [0.9, 0.9], [0.72, 0.9]]);
+        assert_eq!(soak_alpha_cap(DryingInkStrength::Strong, false), 0.72);
+        assert_eq!(soak_alpha_cap(DryingInkStrength::Strong, true), 0.9);
+        assert_eq!(soak_alpha_cap(DryingInkStrength::Weak, false), 0.9);
+    }
+
+    #[test]
+    fn the_soak_adds_no_wakeups() {
+        let t = base();
+        let walk = |soak_enabled: bool| {
+            let p = InkParams {
+                soak_enabled,
+                ..InkParams::default()
+            };
+            let mut ledger = InkLedger::new(t);
+            ledger.record_commit(SourceRange::new(0, 3), "あ。", t, &p);
+            let mut now = t;
+            let mut seen = Vec::new();
+            while let Some(wakeup) = ledger.next_wakeup(now, &p) {
+                seen.push(wakeup.duration_since(t));
+                now = wakeup;
+                ledger.frame(now, &p);
+            }
+            seen
+        };
+        let with_soak = walk(true);
+        assert_eq!(with_soak, walk(false));
+        assert_eq!(
+            with_soak,
+            vec![
+                millis(600),
+                millis(700),
+                millis(800),
+                millis(900),
+                secs(15),
+                secs(30),
+                secs(45),
+                secs(60)
+            ]
+        );
     }
 }

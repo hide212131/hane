@@ -137,6 +137,7 @@ mod measurement;
 mod mermaid_diagrams;
 use mermaid_diagrams::diagram_plan_matches;
 mod network_settings;
+mod paper_texture;
 pub use network_settings::NetworkSettingsApplier;
 mod plain_text_mode;
 mod voice_composition;
@@ -1347,6 +1348,9 @@ pub struct EditorView {
     /// Unconfirmed voice segments' view state (voice composition P1). Display
     /// only: the segments live in the editor, never in the document.
     voice: voice_composition::VoiceViewState,
+    /// The generated paper / wall texture image and the generation that will
+    /// replace it (Issue #788). Display only.
+    paper_texture: paper_texture::PaperTextureState,
     /// Hands the pictures back to the window when the view is released; dropping
     /// it would cancel the hook.
     _mermaid_release_subscription: Subscription,
@@ -13099,6 +13103,23 @@ mod tests {
             assert_eq!(view.editor().document().full_text(), "- A\n- ");
             assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(6)));
             assert!(view.editor().can_undo());
+        });
+    }
+
+    /// Issue #784: Tab on an empty item whose nested form would reparse as a
+    /// setext heading is consumed without changing the document or selection.
+    #[gpui::test]
+    fn tab_on_empty_item_that_cannot_nest_leaves_document_unchanged(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new("- abc\n- ", "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(8)))
+                .unwrap();
+            assert!(view.apply_list_edit_intent(ListEditIntent::Indent, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\n- ");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(8)));
         });
     }
 

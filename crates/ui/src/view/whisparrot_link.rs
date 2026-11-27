@@ -2054,6 +2054,8 @@ mod tests {
         let (view, cx) = open(cx, stores.clone(), Some(controller.clone()));
         cx.update(|window, app| view.update(app, |view, cx| view.open_settings(window, cx)));
         cx.run_until_parked();
+        cx.simulate_resize(gpui::size(px(960.0), px(1600.0)));
+        cx.run_until_parked();
         let card = cx
             .debug_bounds("settings-whisparrot-link-card")
             .expect("the link card is laid out");

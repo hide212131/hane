@@ -88,6 +88,21 @@ impl EditorView {
         self.settings.drying_ink_band
     }
 
+    pub(crate) fn drying_ink_soak_enabled(&self) -> bool {
+        self.settings.drying_ink_soak
+    }
+
+    /// Turns the soak behind wet ink on or off. Only the display depends on
+    /// it; the band stays in the ledger and is drawn the other way.
+    pub(crate) fn set_drying_ink_soak(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.settings.drying_ink_soak == on {
+            return;
+        }
+        self.settings.drying_ink_soak = on;
+        self.store_settings();
+        cx.notify();
+    }
+
     pub(crate) fn drying_ink_speed(&self) -> DryingInkSpeed {
         self.settings.drying_ink_speed
     }
@@ -140,6 +155,8 @@ impl EditorView {
             delta_l: self.settings.drying_ink_strength.delta_l(),
             band_delta_l: self.settings.drying_ink_strength.band_delta_l(),
             band_enabled: self.settings.drying_ink_band,
+            soak_enabled: self.settings.drying_ink_soak,
+            strength: self.settings.drying_ink_strength,
         }
     }
 
@@ -857,6 +874,103 @@ mod tests {
         advance(cx, Duration::from_secs(90));
         let dry_state = rendered(&view, cx);
         (wet_state, dry_state)
+    }
+
+    #[gpui::test]
+    fn the_soak_switch_defaults_to_on_and_is_stored(cx: &mut gpui::TestAppContext) {
+        let stores = StateStores::memory();
+        let (view, cx) = open_view(cx, "", stores.clone());
+        view.read_with(cx, |view, _| assert!(view.drying_ink_soak_enabled()));
+        let params = |view: &TestView, cx: &mut TestCx| {
+            view.update(cx, |view, cx| view.drying_ink_frame(cx).params)
+        };
+        assert!(params(&view, cx).soak_enabled);
+        view.update(cx, |view, cx| view.set_drying_ink_soak(false, cx));
+        assert!(!params(&view, cx).soak_enabled);
+        assert!(!stores.settings().load().drying_ink_soak);
+        view.update(cx, |view, cx| view.set_drying_ink_soak(true, cx));
+        assert!(stores.settings().load().drying_ink_soak);
+    }
+
+    #[gpui::test]
+    fn the_soak_strength_follows_the_ink_strength(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        view.update(cx, |view, cx| {
+            view.set_drying_ink_strength(DryingInkStrength::Strong, cx);
+        });
+        let strength = view.update(cx, |view, cx| view.drying_ink_frame(cx).params.strength);
+        assert_eq!(strength, DryingInkStrength::Strong);
+        assert_eq!(strength.soak_depth(), (0.075, 0.065));
+    }
+
+    /// The band and wet ranges are the same with the soak on and off: the soak
+    /// only changes how they are drawn.
+    #[gpui::test]
+    fn the_soak_leaves_the_band_and_the_wet_ranges_alone(cx: &mut gpui::TestAppContext) {
+        let read = |cx: &mut gpui::TestAppContext, soak: bool| {
+            let (view, cx) = open_view(cx, "", StateStores::memory());
+            view.update(cx, |view, cx| view.set_drying_ink_soak(soak, cx));
+            replace(&view, cx, "あ。");
+            let first = (band(&view, cx), wet(&view, cx));
+            advance(cx, Duration::from_millis(700));
+            (first, band(&view, cx))
+        };
+        assert_eq!(read(cx, true), read(cx, false));
+    }
+
+    #[gpui::test]
+    fn the_soak_adds_no_notifications_beyond_the_band_and_level_steps(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        replace(&view, cx, "あ。");
+        let notifications = count_notifications(&view, cx);
+        advance(cx, Duration::from_secs(1));
+        assert!(notifications.get() <= 5, "{} notifications", notifications.get());
+        advance(cx, Duration::from_secs(5));
+        assert!(notifications.get() <= 5, "{} notifications", notifications.get());
+    }
+
+    #[gpui::test]
+    fn no_soak_band_while_reading_or_composing(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = open_view(cx, "", StateStores::memory());
+        replace(&view, cx, "あ。");
+        assert!(band(&view, cx).is_some());
+        mark(&view, cx, "か");
+        assert_eq!(band(&view, cx), None);
+        unmark(&view, cx);
+        cx.update(|window, app| {
+            view.update(app, |view, cx| {
+                assert!(view.set_editor_mode(EditorMode::Reading, window, cx));
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(band(&view, cx), None);
+        assert!(wet(&view, cx).is_empty());
+    }
+
+    fn typed_with_soak(cx: &mut gpui::TestAppContext, soak: bool) -> (Rendered, Rendered) {
+        let (view, cx) = open_view(cx, "# Title\n\nbody\n", StateStores::memory());
+        view.update(cx, |view, cx| view.set_drying_ink_soak(soak, cx));
+        view.update(cx, |view, _| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(14)))
+                .unwrap();
+        });
+        replace(&view, cx, "追加。");
+        let wet_state = rendered(&view, cx);
+        advance(cx, Duration::from_secs(90));
+        let dry_state = rendered(&view, cx);
+        (wet_state, dry_state)
+    }
+
+    #[gpui::test]
+    fn the_soak_changes_neither_layout_nor_document_state(cx: &mut gpui::TestAppContext) {
+        let (with_wet, with_dry) = typed_with_soak(cx, true);
+        let (without_wet, without_dry) = typed_with_soak(cx, false);
+        assert_eq!(with_wet, without_wet);
+        assert_eq!(with_wet, with_dry);
+        assert_eq!(without_wet, without_dry);
     }
 
     #[gpui::test]
