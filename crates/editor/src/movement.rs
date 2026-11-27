@@ -30,7 +30,7 @@ impl WordClass {
 }
 
 impl Editor {
-    fn previous_grapheme(&self, offset: SourceOffset) -> Result<SourceOffset, BufferError> {
+    pub(crate) fn previous_grapheme(&self, offset: SourceOffset) -> Result<SourceOffset, BufferError> {
         self.document.validate_offset(offset)?;
         if offset.0 == 0 {
             return Ok(offset);
@@ -312,6 +312,9 @@ impl Editor {
         stop: ForwardStop,
         now: std::time::Instant,
     ) -> Result<Option<EditSummary>, BufferError> {
+        if forward {
+            self.voice_guard_caret()?;
+        }
         let selection_before = self.selection;
         if self.selection.range().is_empty() {
             let target = self.word_target(self.selection.active, forward, stop)?;
@@ -355,6 +358,7 @@ impl Editor {
         &mut self,
         now: std::time::Instant,
     ) -> Result<Option<EditSummary>, BufferError> {
+        self.voice_guard_caret()?;
         let selection_before = self.selection;
         if self.selection.range().is_empty() {
             let next = self.next_grapheme(self.selection.active)?;

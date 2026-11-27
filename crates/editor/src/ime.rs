@@ -81,6 +81,8 @@ impl Editor {
             } else {
                 self.selection.range()
             };
+            // An IME that starts on voice text confirms those segments first.
+            let original_range = self.voice_guard(original_range)?.map_range(original_range);
             let transaction_id = TransactionId(self.next_transaction);
             self.next_transaction += 1;
             self.ime = Some(ImeState::begin(self, transaction_id, original_range)?);
@@ -112,10 +114,13 @@ impl Editor {
         self.preferred_grapheme_column = None;
         let range = if let Some(ime) = &self.ime {
             ime.current_range
-        } else if let Some(range) = replacement_utf16 {
-            self.utf16_range_to_source(range)?
         } else {
-            self.selection.range()
+            let range = if let Some(range) = replacement_utf16 {
+                self.utf16_range_to_source(range)?
+            } else {
+                self.selection.range()
+            };
+            self.voice_guard(range)?.map_range(range)
         };
         let ime = self.ime.take();
         let selection_before = self.selection;
@@ -148,6 +153,7 @@ impl Editor {
         }
         self.record_model_update(received, InputMeasurementKind::ImeCommit);
         self.run_deferred_rewrites();
+        self.voice_flush_held();
         Ok(summary)
     }
 
@@ -251,11 +257,13 @@ impl Editor {
             crate::history::EditKind::Ime,
         );
         self.run_deferred_rewrites();
+        self.voice_flush_held();
     }
 
     pub fn cancel_composition(&mut self) -> Result<ImeCancelOutcome, BufferError> {
         let outcome = self.cancel_composition_inner();
         self.run_deferred_rewrites();
+        self.voice_flush_held();
         outcome
     }
 

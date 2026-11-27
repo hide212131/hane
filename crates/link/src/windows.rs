@@ -34,7 +34,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+    ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows_sys::Win32::System::SystemInformation::GetTickCount64;
@@ -334,6 +334,14 @@ impl Drop for PipeConnection {
 }
 
 impl PipeConnection {
+    /// The process id of the client end of this pipe instance, as the system
+    /// records it (it cannot be set by the client).
+    pub fn client_pid(&self) -> Option<u32> {
+        let mut pid = 0u32;
+        // SAFETY: the handle is this connection's pipe instance.
+        (unsafe { GetNamedPipeClientProcessId(self.handle, &mut pid) } != 0).then_some(pid)
+    }
+
     /// Finishes an overlapped operation that returned pending: waits up to
     /// `timeout`, and cancels it on a timeout. `Ok(None)` means it timed out
     /// and nothing was transferred.
@@ -493,10 +501,20 @@ impl PipeListener {
     /// Creates the first instance of the pipe, so a name already in use by
     /// another process fails here. `name` is the short name of the descriptor.
     pub fn create(name: &str) -> io::Result<Self> {
+        Self::create_with(name, true)
+    }
+
+    /// Like [`PipeListener::create`] but for a pipe whose only peer is a child
+    /// of this process: the DACL names the current user alone.
+    pub fn create_private(name: &str) -> io::Result<Self> {
+        Self::create_with(name, false)
+    }
+
+    fn create_with(name: &str, logon_session: bool) -> io::Result<Self> {
         // The current user may create more instances; the logon session may
         // only read and write.
         let mut sddl = format!("D:P(A;;GA;;;{})", current_user_sid()?);
-        if let Some(logon) = logon_sid() {
+        if logon_session && let Some(logon) = logon_sid() {
             sddl.push_str(&format!("(A;;{PIPE_CLIENT_RIGHTS};;;{logon})"));
         }
         let mut listener = Self {

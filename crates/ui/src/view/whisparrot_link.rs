@@ -160,6 +160,10 @@ impl EditorView {
             return false;
         }
         self.settings.whisparrot_link = enabled;
+        // The two inputs are chosen explicitly and never run together.
+        if enabled && self.settings.voice_composition {
+            self.set_voice_composition(false, cx);
+        }
         // A failed write keeps the change for this run, like the other settings.
         self.store_settings();
         cx.notify();

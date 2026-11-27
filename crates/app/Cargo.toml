@@ -29,6 +29,7 @@ hane-presentation = { workspace = true, optional = true }
 hane-session.workspace = true
 hane-ui.workspace = true
 hane-update.workspace = true
+hane-voice.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 # HTTPS transport for the explicit "check for updates" action. Both crates are

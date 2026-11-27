@@ -621,7 +621,12 @@ impl EditorView {
         );
         let editor_column_width =
             (f32::from(window.viewport_size().width) - sidebar_width).max(0.0);
-        let rendered = root.child(main_column.child(self.footer_element(editor_column_width, cx)));
+        let voice_strip = self.voice_strip_element(cx);
+        let rendered = root.child(
+            main_column
+                .children(voice_strip)
+                .child(self.footer_element(editor_column_width, cx)),
+        );
         let rendered = if let Some(menu) = self.file_tab_context_menu.as_ref() {
             rendered.child(
                 anchored()

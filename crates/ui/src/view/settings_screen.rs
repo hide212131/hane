@@ -581,6 +581,59 @@ impl EditorView {
                             ),
                     ),
             )
+            .child(self.voice_composition_settings(cx))
+    }
+
+    /// The voice composition switch (P1). Last on the page so it moves none of
+    /// the sections above it. Turning it on switches the whisparrot link off.
+    #[inline(never)]
+    fn voice_composition_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let view = cx.entity();
+        let voice = Checkbox::new("settings-voice-composition")
+            .checked(self.voice_composition_enabled())
+            .label("音声コンポジション（試作）を有効にする")
+            .on_click(move |checked, _window, app| {
+                view.update(app, |view, cx| view.set_voice_composition(*checked, cx));
+            });
+        div()
+            .pt(px(16.0))
+            .border_t_1()
+            .border_color(rgb(self.theme.sidebar_active_background))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(14.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child("音声コンポジション"),
+            )
+            .child(
+                div()
+                    .id("settings-voice-composition-card")
+                    .w_full()
+                    .px(px(16.0))
+                    .py(px(14.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(self.theme.sidebar_active_background))
+                    .bg(rgb(self.theme.code_background))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(voice)
+                    .child(
+                        div()
+                            .pl(px(28.0))
+                            .text_color(rgb(self.theme.quote_foreground))
+                            .child(
+                                "認識した音声を、確定前の仮表示として本文の行内に出します。\
+                                 整文が届くと仮表示がその場で整文に置き換わり、区間ごとに Enter で確定、Esc で破棄できます。\
+                                 録音は F7 で開始・停止、Alt+F7 で取消します（インストール済みの whisparrot を使います）。\
+                                 既定ではオフで、whisparrot とのローカル連携とは同時に使えません。",
+                            ),
+                    ),
+            )
     }
 
     /// The "表示" and "保存" sections of the general settings: the theme and

@@ -3152,6 +3152,7 @@ dependencies = [
  "hane-session",
  "hane-ui",
  "hane-update",
+ "hane-voice",
  "raw-window-handle",
  "ring",
  "rustls",
@@ -3280,6 +3281,7 @@ dependencies = [
  "hane-network",
  "hane-presentation",
  "hane-session",
+ "hane-voice",
  "image",
  "keyring",
  "merman",
@@ -3316,6 +3318,19 @@ name = "hane-updater"
 version = "0.55.0"
 dependencies = [
  "hane-update",
+]
+
+[[package]]
+name = "hane-voice"
+version = "0.55.0"
+dependencies = [
+ "async-channel",
+ "hane-document",
+ "hane-editor",
+ "hane-link",
+ "libc",
+ "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
