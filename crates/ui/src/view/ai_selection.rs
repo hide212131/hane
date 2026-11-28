@@ -4102,4 +4102,368 @@ mod tests {
         drop(service);
         std::fs::remove_dir_all(app_data_root).unwrap();
     }
+
+    /// A real `AiService` whose active connection is a fully configured Custom
+    /// provider. Preparing it needs neither a runtime process nor the network:
+    /// the preparation only takes ownership and loads the settings file.
+    fn spawn_custom_service(label: &str) -> (hane_ai::AiService, std::path::PathBuf) {
+        use hane_ai::{
+            AiService, AiServiceConfig, CredentialRef, CredentialStore as _, FakeCredentialStore,
+            ShellEnvironmentPolicyFormat, SystemBrowserOpener,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let app_data_root = std::env::temp_dir().join(format!(
+            "hane-ui-ai-selection-{label}-{}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(app_data_root.join("ai")).unwrap();
+        std::fs::write(
+            app_data_root.join("ai/ai-settings.json"),
+            r#"{
+  "schema_version": 1,
+  "revision": 1,
+  "settings_generation": 1,
+  "active_connection": "custom",
+  "custom": {
+    "id": "custom-test",
+    "name": "Local mock",
+    "base_url": "http://127.0.0.1:9/v1",
+    "model_id": "local-model",
+    "credential_ref": "cred-ui-test"
+  }
+}"#,
+        )
+        .unwrap();
+        let credential_store = Arc::new(FakeCredentialStore::new());
+        credential_store
+            .set(&CredentialRef::from_persisted("cred-ui-test"), "secret")
+            .unwrap();
+        let service = AiService::spawn(AiServiceConfig {
+            app_data_root: app_data_root.clone(),
+            binary_path: app_data_root.join("missing-codex-app-server"),
+            binary_resolution_error: None,
+            credential_store,
+            browser_opener: Arc::new(SystemBrowserOpener),
+            shell_env_format: ShellEnvironmentPolicyFormat::Filters,
+        })
+        .unwrap();
+        (service, app_data_root)
+    }
+
+    fn wait_for_service(
+        handle: &AiServiceHandle,
+        what: &str,
+        done: impl Fn(&AiSnapshot) -> bool,
+    ) -> AiSnapshot {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = handle.snapshot();
+            if done(&snapshot) {
+                return snapshot;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}: {snapshot:?}"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn wait_for_connection_ready(handle: &AiServiceHandle) {
+        wait_for_service(handle, "the connection to become ready", |snapshot| {
+            snapshot.busy.is_none() && text_transform_connection_ready(snapshot)
+        });
+    }
+
+    /// A window over `text` with `0..end` selected, popup still closed.
+    fn view_with_selection(
+        cx: &mut gpui::TestAppContext,
+        text: &str,
+        end: usize,
+    ) -> (Entity<EditorView>, &mut gpui::VisualTestContext) {
+        cx.update(crate::actions::register_key_bindings);
+        let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
+        cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
+        cx.run_until_parked();
+        view.update(cx, |view, _| {
+            view.editor_mut()
+                .set_selection(Selection {
+                    anchor: SourceOffset(0),
+                    active: SourceOffset(end),
+                })
+                .unwrap();
+        });
+        (view, cx)
+    }
+
+    /// The real opening path. Deliberately does not park: once the view is
+    /// attached to a service its snapshot subscription polls forever, so
+    /// `run_until_parked` would never return.
+    fn open_selection(cx: &mut gpui::VisualTestContext, view: &Entity<EditorView>) {
+        cx.update(|window, app| {
+            view.update(app, |view, cx| view.open_ai_selection(window, cx));
+        });
+    }
+
+    /// Runs the scheduler step by step (bounded) until `done` holds.
+    fn pump_until(cx: &mut gpui::VisualTestContext, what: &str, done: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            if !cx.executor().tick() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    /// Steps the scheduler until the view has stopped being notified for a run
+    /// of consecutive steps.
+    fn pump_until_quiet(
+        cx: &mut gpui::VisualTestContext,
+        notifications: &std::rc::Rc<std::cell::Cell<usize>>,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut last = notifications.get();
+        let mut quiet_steps = 0;
+        while quiet_steps < 8 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the view kept being notified"
+            );
+            if !cx.executor().tick() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let now = notifications.get();
+            if now == last {
+                quiet_steps += 1;
+            } else {
+                quiet_steps = 0;
+                last = now;
+            }
+        }
+    }
+
+    /// One scenario of the opening test: a service (prepared first or not), a
+    /// view over `text` with `0..end` selected, then the real opening path
+    /// followed by renders, notifications and a re-open while open. Returns
+    /// the view's recorded preparation, whether the popup is open, the service
+    /// snapshot right after opening, and the id the service hands to the next
+    /// admission: operation ids are sequential from 1, so it counts how many
+    /// operations had been admitted.
+    fn open_and_count_admissions(
+        cx: &mut gpui::TestAppContext,
+        label: &str,
+        prepare_first: bool,
+        text: &str,
+        end: usize,
+    ) -> (Option<OperationId>, bool, AiSnapshot, OperationId) {
+        use hane_ai::AiCommand;
+
+        let (service, root) = spawn_custom_service(label);
+        let handle = service.handle();
+        if prepare_first {
+            let id = handle.try_submit(AiCommand::PrepareConnection).unwrap();
+            assert_eq!(id, OperationId(1));
+            wait_for_connection_ready(&handle);
+        }
+        let (view, vcx) = view_with_selection(cx, text, end);
+        view.update(vcx, |view, _| view.ai_selection.attach(Some(handle.clone())));
+        open_selection(vcx, &view);
+        let after_open = handle.snapshot();
+        // Renders, notifications and a re-operation while the popup is open
+        // must never send another preparation.
+        vcx.run_until_parked();
+        view.update(vcx, |_, cx| cx.notify());
+        open_selection(vcx, &view);
+        vcx.run_until_parked();
+        wait_for_service(&handle, "the service to become idle", |snapshot| {
+            snapshot.busy.is_none()
+        });
+        view.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+        let (prepare_operation, open) = view.read_with(vcx, |view, _| {
+            (view.ai_selection.prepare_operation, view.ai_selection.open)
+        });
+        let next = handle.try_submit(AiCommand::OpenSettings).unwrap();
+        wait_for_service(&handle, "the probe operation", |snapshot| {
+            snapshot.busy.is_none()
+        });
+        drop(handle);
+        drop(service);
+        let _ = std::fs::remove_dir_all(root);
+        (prepare_operation, open, after_open, next)
+    }
+
+    // Issue #787 P2: opening the popup is the one trigger of the connection
+    // preparation. The service numbers its admissions from 1, so the id of
+    // the next admission shows how many operations the opening submitted.
+    #[gpui::test]
+    fn opening_unprepared_selection_submits_prepare_once(cx: &mut gpui::TestAppContext) {
+        // Unprepared service, valid selection: exactly one preparation.
+        let (prepare_operation, open, after_open, next) =
+            open_and_count_admissions(cx, "open-unprepared", false, "abcdef\n", 3);
+        assert!(open);
+        assert_eq!(prepare_operation, Some(OperationId(1)));
+        if let Some((operation, _)) = after_open.busy {
+            assert_eq!(
+                after_open.preparation_operation,
+                Some(operation),
+                "the running operation right after opening must be the preparation"
+            );
+            assert_eq!(operation, OperationId(1));
+        }
+        assert_eq!(
+            next,
+            OperationId(2),
+            "opening, rendering, notifying and re-opening must admit one preparation"
+        );
+
+        // Already prepared: opening admits nothing.
+        let (prepare_operation, open, after_open, next) =
+            open_and_count_admissions(cx, "open-prepared", true, "abcdef\n", 3);
+        assert!(open);
+        assert_eq!(prepare_operation, None);
+        assert!(after_open.busy.is_none());
+        assert_eq!(next, OperationId(2), "only the setup preparation was admitted");
+
+        // Invalid (whitespace-only) selection: the popup never opens and the
+        // unprepared service receives nothing.
+        let (prepare_operation, open, after_open, next) =
+            open_and_count_admissions(cx, "open-blank", false, "   \n", 3);
+        assert!(!open);
+        assert_eq!(prepare_operation, None);
+        assert!(after_open.busy.is_none());
+        assert_eq!(next, OperationId(1), "no operation may be admitted");
+    }
+
+    /// Drives one service through the popup's lifetime: it is opened over an
+    /// unprepared service, completes its preparation, and the popup — never
+    /// re-opened — then sends. Completion must reach the view through the
+    /// snapshot subscription bound by `attach_ai_service`, and the
+    /// notification alone must not issue a transform.
+    fn assert_completion_enables_send_without_reopening(
+        cx: &mut gpui::VisualTestContext,
+        view: &Entity<EditorView>,
+        notifications: &std::rc::Rc<std::cell::Cell<usize>>,
+        handle: &AiServiceHandle,
+    ) {
+        use hane_ai::AiCommand;
+
+        open_selection(cx, view);
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open);
+            assert_eq!(view.ai_selection.prepare_operation, Some(OperationId(1)));
+        });
+        let after_open = notifications.get();
+        // The preparation finishes on the service thread; the view is only
+        // told through its subscription.
+        wait_for_connection_ready(handle);
+        pump_until_quiet(cx, notifications);
+        assert!(
+            notifications.get() > after_open,
+            "the view must be notified through its subscription"
+        );
+
+        // A service-side change made without any view action still reaches the
+        // view: the subscription is bound to this handle.
+        let before_probe = notifications.get();
+        let probe = handle.try_submit(AiCommand::OpenSettings).unwrap();
+        assert_eq!(
+            probe,
+            OperationId(2),
+            "completion must not have admitted a transform"
+        );
+        wait_for_service(handle, "the probe operation", |snapshot| {
+            snapshot.busy.is_none()
+        });
+        pump_until(cx, "the subscription notification", || {
+            notifications.get() > before_probe
+        });
+
+        // The completion notification alone issued no transform.
+        view.read_with(cx, |view, _| {
+            assert!(view.ai_selection.open, "the popup stays open");
+            assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
+            assert!(view.ai_selection.pending.is_none());
+            assert_eq!(view.ai_selection.request_generation, 0);
+        });
+        assert!(handle.snapshot().busy.is_none());
+
+        // Sending now, without re-opening, issues exactly one transform.
+        view.update(cx, |view, cx| {
+            view.ai_selection_run_saved_prompt("直す".to_owned(), cx);
+        });
+        view.read_with(cx, |view, _| {
+            assert!(matches!(
+                view.ai_selection.phase,
+                AiSelectionPhase::Submitting
+            ));
+            assert_eq!(
+                view.ai_selection
+                    .pending
+                    .as_ref()
+                    .map(|pending| pending.operation_id),
+                Some(OperationId(3))
+            );
+            assert_eq!(view.ai_selection.request_generation, 1);
+        });
+        // Cancel it and let the service settle: the next admission id shows
+        // that the send admitted one transform and nothing else.
+        view.update(cx, |view, _| view.ai_selection.reset());
+        wait_for_service(handle, "the transform to settle", |snapshot| {
+            snapshot.busy.is_none()
+        });
+        let next = handle.try_submit(AiCommand::OpenSettings).unwrap();
+        assert_eq!(next, OperationId(4));
+        wait_for_service(handle, "the final probe", |snapshot| snapshot.busy.is_none());
+    }
+
+    // Issue #787 P2: the popup stays open while the preparation runs; the
+    // completion reaches the view through the snapshot subscription, so the
+    // send works without re-opening. Replacing the service handle rebinds the
+    // subscription to the new handle.
+    #[gpui::test]
+    fn preparation_completion_enables_send_without_reopening(cx: &mut gpui::TestAppContext) {
+        let (service_a, root_a) = spawn_custom_service("completion-a");
+        let handle_a = service_a.handle();
+        let (view, vcx) = view_with_selection(cx, "abcdef\n", 3);
+        let notifications = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        vcx.update(|_, app| {
+            let notifications = notifications.clone();
+            app.observe(&view, move |_, _| notifications.set(notifications.get() + 1))
+                .detach();
+        });
+
+        view.update(vcx, |view, cx| {
+            view.attach_ai_service(Some(handle_a.clone()), cx)
+        });
+        assert_completion_enables_send_without_reopening(vcx, &view, &notifications, &handle_a);
+
+        // Reconnect: a different service handle replaces the first one.
+        let (service_b, root_b) = spawn_custom_service("completion-b");
+        let handle_b = service_b.handle();
+        view.update(vcx, |view, cx| {
+            view.attach_ai_service(Some(handle_b.clone()), cx)
+        });
+        assert_completion_enables_send_without_reopening(vcx, &view, &notifications, &handle_b);
+
+        drop(handle_a);
+        drop(service_a);
+        drop(handle_b);
+        drop(service_b);
+        let _ = std::fs::remove_dir_all(root_a);
+        let _ = std::fs::remove_dir_all(root_b);
+    }
 }
