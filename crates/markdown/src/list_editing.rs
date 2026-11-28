@@ -1193,6 +1193,11 @@ fn fold_top_level_exit(source: &str, item: &ListEditItem, fold_end: usize) -> Ma
         }
         previous_is_cr = piece.ends_with('\r');
     }
+    // The same fusion can happen between the replacement's end and the
+    // preserved byte at `fold_end`.
+    if replacement.ends_with('\r') && bytes.get(fold_end) == Some(&b'\n') {
+        replacement.push('\n');
+    }
 
     MarkdownEditPlan::Replace {
         range: SourceRange::new(line_start, fold_end),
@@ -2857,6 +2862,25 @@ mod tests {
                 Some(NodeKind::ListItem { .. })
             )
         })
+    }
+
+    #[test]
+    fn exit_does_not_fuse_trailing_bare_cr_with_preserved_lf() {
+        let edited = assert_fold_exit("- A\n- \r- \r\n\nplain", 6, (4, 11), "\n\r\n", 5);
+        assert_eq!(edited, "- A\n\n\r\n\nplain");
+        assert!(typed_text_is_standalone_paragraph(&edited, 5));
+
+        let mut typed = edited.clone();
+        typed.insert_str(5, "ghi");
+        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+        let paragraphs: Vec<&str> = parsed
+            .tree
+            .iter()
+            .filter(|(_, node)| matches!(node.kind, NodeKind::Paragraph))
+            .map(|(_, node)| &typed[node.source_range.as_usize()])
+            .collect();
+        assert!(paragraphs.iter().any(|p| p.contains("ghi") && !p.contains("plain")));
+        assert!(paragraphs.iter().any(|p| p.contains("plain") && !p.contains("ghi")));
     }
 
     #[test]
