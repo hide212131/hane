@@ -548,7 +548,7 @@ pub fn plan_list_edit(
     if let Some(result) = positional {
         return Ok(result);
     }
-    let Some((_index, item)) = projection.item_at(caret) else {
+    let Some((index, item)) = projection.item_at(caret) else {
         return Ok(ListEditPlanResult::NotApplicable);
     };
     let opening_line_start = line_start(source.as_bytes(), item.prefix_range.start.0);
@@ -672,7 +672,7 @@ pub fn plan_list_edit(
                 }
                 if item.depth <= 1 {
                     return Ok(ListEditPlanResult::Handled(exit_top_level_item(
-                        &source, item,
+                        &source, projection, index, item,
                     )));
                 }
                 let Some(parent) = item.parent_item.and_then(|at| projection.items.get(at)) else {
@@ -1030,7 +1030,20 @@ fn exit_is_safe_to_collapse(source: &str, item: &ListEditItem) -> bool {
 /// spurious extra blank line or duplicating an existing boundary. Everything
 /// beyond this item's own line, including any following item's raw bytes,
 /// is left untouched.
-fn exit_top_level_item(source: &str, item: &ListEditItem) -> MarkdownEditPlan {
+///
+/// When marker-only empty siblings of the same parser-confirmed list follow on
+/// the very next physical lines, they are folded into the same single
+/// replacement (see [`folded_empty_sibling_end`]) instead of being left as a
+/// pile of empty items that would otherwise need their own boundary lines.
+fn exit_top_level_item(
+    source: &str,
+    projection: &ListEditProjection,
+    index: usize,
+    item: &ListEditItem,
+) -> MarkdownEditPlan {
+    if let Some(fold_end) = folded_empty_sibling_end(source, projection, index, item) {
+        return fold_top_level_exit(source, item, fold_end);
+    }
     let line_start = item.prefix_range.start.0;
     let line_text_end = item.prefix_range.end.0;
     let after_line = line_end_inclusive(source.as_bytes(), line_start);
@@ -1067,6 +1080,124 @@ fn exit_top_level_item(source: &str, item: &ListEditItem) -> MarkdownEditPlan {
         range: item.prefix_range,
         replacement,
         selection_after: SourceSelection::caret(new_caret),
+    }
+}
+
+/// The end (start of the next physical line, or the source end) of the run of
+/// empty sibling items that directly follow `item`, or `None` when nothing is
+/// folded.
+///
+/// A candidate must start exactly at the previous item line's end, belong to
+/// the same parser-confirmed list at the same depth and parent with the next
+/// ordinal, and be a marker-only item (no body, no task box, outside quotes,
+/// subtree not past its opening line). The run stops at the first line that
+/// fails any of these. Folding is skipped as a whole when the first non-blank
+/// line left after the run is indented, because a different block could then
+/// re-attach to the remaining paragraph.
+fn folded_empty_sibling_end(
+    source: &str,
+    projection: &ListEditProjection,
+    index: usize,
+    item: &ListEditItem,
+) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut end = line_end_inclusive(bytes, item.prefix_range.start.0);
+    let mut ordinal = item.ordinal;
+    let mut folded = false;
+    for candidate in projection.items.iter().skip(index + 1) {
+        if candidate.prefix_range.start.0 < end {
+            continue;
+        }
+        if candidate.prefix_range.start.0 != end
+            || !candidate.is_parser_item
+            || candidate.list_range != item.list_range
+            || candidate.depth != item.depth
+            || candidate.parent_item != item.parent_item
+            || candidate.ordinal != ordinal + 1
+            || candidate.task.is_some()
+            || !source
+                .get(candidate.body_range.as_usize())
+                .is_some_and(str::is_empty)
+            || !exit_is_safe_to_collapse(source, candidate)
+        {
+            break;
+        }
+        let candidate_line_end = line_end(bytes, end);
+        if !source
+            .get(candidate.prefix_range.end.0..candidate_line_end)
+            .is_some_and(is_ascii_blank)
+        {
+            break;
+        }
+        end = line_end_inclusive(bytes, end);
+        ordinal = candidate.ordinal;
+        folded = true;
+    }
+    if !folded {
+        return None;
+    }
+    // The first non-blank line left behind must not be indented.
+    let mut at = end;
+    while at < source.len() {
+        let text_end = line_end(bytes, at);
+        let line = &source[at..text_end];
+        if !is_ascii_blank(line) {
+            if line.starts_with([' ', '\t']) {
+                return None;
+            }
+            break;
+        }
+        at = line_end_inclusive(bytes, at);
+    }
+    Some(end)
+}
+
+/// Replaces the exited item's line through the end of the folded run (`fold_end`)
+/// with one edit. The left boundary and the caret line follow the single-item
+/// exit; reaching the document end drops the caret line and right boundary but
+/// keeps the left boundary so the typed text cannot join the previous block.
+fn fold_top_level_exit(source: &str, item: &ListEditItem, fold_end: usize) -> MarkdownEditPlan {
+    let bytes = source.as_bytes();
+    let line_start = item.prefix_range.start.0;
+    let line_text_end = item.prefix_range.end.0;
+    let after_line = line_end_inclusive(bytes, line_start);
+    let own_terminator = &source[line_text_end..after_line];
+
+    let left_separator = if line_start > 0 && !previous_line_is_blank(source, line_start) {
+        line_terminator_before(source, line_start)
+    } else {
+        ""
+    };
+    let mut pieces = vec![left_separator];
+    if fold_end < source.len() {
+        pieces.push(own_terminator);
+        if !following_line_is_blank(source, fold_end) {
+            pieces.push(own_terminator);
+        }
+    }
+
+    // A bare CR followed by an LF would fuse into one CRLF and lose a line;
+    // emit CRLF for that terminator so the line count stays as planned.
+    let mut previous_is_cr = line_start > 0 && bytes[line_start - 1] == b'\r';
+    let mut replacement = String::new();
+    let mut caret = line_start;
+    for (position, piece) in pieces.iter().copied().enumerate() {
+        let piece = if previous_is_cr && piece == "\n" {
+            "\r\n"
+        } else {
+            piece
+        };
+        replacement.push_str(piece);
+        if position == 0 {
+            caret = line_start + replacement.len();
+        }
+        previous_is_cr = piece.ends_with('\r');
+    }
+
+    MarkdownEditPlan::Replace {
+        range: SourceRange::new(line_start, fold_end),
+        replacement,
+        selection_after: SourceSelection::caret(SourceOffset(caret)),
     }
 }
 
@@ -2668,6 +2799,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Applies the exit for both Enter and Backspace and checks the single
+    /// `Replace` (range, bytes, caret). Returns the edited text.
+    fn assert_fold_exit(
+        text: &str,
+        caret: usize,
+        range: (usize, usize),
+        expected_replacement: &str,
+        caret_after: usize,
+    ) -> String {
+        let mut edited = String::new();
+        for intent in [ListEditIntent::Enter, ListEditIntent::Backspace] {
+            let MarkdownEditPlan::Replace {
+                range: planned,
+                replacement,
+                selection_after,
+            } = plan(text, caret, intent)
+            else {
+                panic!("expected a Replace plan for {text:?} {intent:?}")
+            };
+            assert_eq!(
+                (planned.start.0, planned.end.0),
+                range,
+                "range for {text:?} {intent:?}"
+            );
+            assert_eq!(
+                replacement, expected_replacement,
+                "replacement for {text:?} {intent:?}"
+            );
+            assert_eq!(
+                selection_after,
+                SourceSelection::caret(SourceOffset(caret_after)),
+                "caret for {text:?} {intent:?}"
+            );
+            edited = text.to_owned();
+            edited.replace_range(range.0..range.1, &replacement);
+        }
+        edited
+    }
+
+    /// Whether `ghi` typed at `at` becomes a paragraph outside any list item.
+    fn typed_text_is_standalone_paragraph(edited: &str, at: usize) -> bool {
+        let mut typed = edited.to_owned();
+        typed.insert_str(at, "ghi");
+        let parsed = parse_document(Revision(1), SourceRange::new(0, typed.len()), &typed);
+        let Some((id, _)) = parsed.tree.iter().find(|(_, node)| {
+            matches!(node.kind, NodeKind::Paragraph)
+                && typed[node.source_range.as_usize()].contains("ghi")
+        }) else {
+            return false;
+        };
+        !parsed.tree.ancestors(id).skip(1).any(|ancestor| {
+            matches!(
+                parsed.tree.node(ancestor).map(|node| node.kind),
+                Some(NodeKind::ListItem { .. })
+            )
+        })
+    }
+
+    #[test]
+    fn exit_folds_empty_sibling_at_eof() {
+        let edited = assert_fold_exit("- abc\n- \n- ", 8, (6, 11), "\n", 7);
+        assert_eq!(edited, "- abc\n\n");
+        assert!(typed_text_is_standalone_paragraph(&edited, 7));
+        let items = reparsed_items(&edited);
+        assert_eq!(items.len(), 1);
+    }
+
+    #[test]
+    fn exit_preserves_boundaries_after_folding_before_content() {
+        let edited = assert_fold_exit("- abc\n- \n- \n- C", 8, (6, 12), "\n\n\n", 7);
+        assert_eq!(edited, "- abc\n\n\n\n- C");
+        assert!(typed_text_is_standalone_paragraph(&edited, 7));
+    }
+
+    #[test]
+    fn exit_folds_the_entire_adjacent_empty_run() {
+        let edited = assert_fold_exit("- A\n- \n- \n- \n", 6, (4, 13), "\n", 5);
+        assert_eq!(edited, "- A\n\n");
+        assert!(typed_text_is_standalone_paragraph(&edited, 5));
+        let edited = assert_fold_exit("- A\n- \n- \n", 6, (4, 10), "\n", 5);
+        assert_eq!(edited, "- A\n\n");
+    }
+
+    #[test]
+    fn exit_preserves_mixed_line_endings() {
+        let edited = assert_fold_exit("- A\r\n- \n- \r\n- C", 7, (5, 12), "\r\n\n\n", 7);
+        assert_eq!(edited, "- A\r\n\r\n\n\n- C");
+        let edited = assert_fold_exit(
+            "- A\r\n- \r\n- \r\n- C",
+            7,
+            (5, 13),
+            "\r\n\r\n\r\n",
+            7,
+        );
+        assert_eq!(edited, "- A\r\n\r\n\r\n\r\n- C");
+    }
+
+    #[test]
+    fn exit_keeps_cr_and_lf_from_merging() {
+        let edited = assert_fold_exit("- A\r- \n- \r\n- C", 6, (4, 11), "\r\r\n\n", 5);
+        assert_eq!(edited, "- A\r\r\r\n\n- C");
+    }
+
+    #[test]
+    fn exit_folding_stops_at_task_items() {
+        for tail in ["- [ ] ", "- [x] ", "- [X] ", "- [] "] {
+            let text = format!("- A\n- \n- \n{tail}");
+            let edited = assert_fold_exit(&text, 6, (4, 10), "\n\n\n", 5);
+            assert_eq!(edited, format!("- A\n\n\n\n{tail}"));
+        }
+    }
+
+    #[test]
+    fn exit_folding_preserves_a_sibling_subtree() {
+        let edited = assert_fold_exit("- A\n- \n- \n- \n  - child", 6, (4, 10), "\n\n\n", 5);
+        assert_eq!(edited, "- A\n\n\n\n- \n  - child");
+    }
+
+    #[test]
+    fn exit_reuses_blank_lines_without_scanning_past_them() {
+        let edited = assert_fold_exit("- A\n- \n- \n \t\n- ", 6, (4, 10), "\n\n", 5);
+        assert_eq!(edited, "- A\n\n\n \t\n- ");
+    }
+
+    #[test]
+    fn exit_skips_folding_if_indented_suffix_could_reattach() {
+        let edited = assert_fold_exit("- A\n- \n- \n\n  x", 6, (4, 6), "\n\n", 5);
+        assert_eq!(edited, "- A\n\n\n\n- \n\n  x");
+    }
+
+    #[test]
+    fn exit_keeps_previous_empty_siblings() {
+        let edited = assert_fold_exit("- A\n- \n- \n- ", 9, (7, 12), "\n", 8);
+        assert_eq!(edited, "- A\n- \n\n");
+    }
+
+    #[test]
+    fn exit_preserves_remaining_ordered_marker_bytes() {
+        let edited = assert_fold_exit("3. A\n4. \n5. \n6. C", 8, (5, 13), "\n\n\n", 6);
+        assert_eq!(edited, "3. A\n\n\n\n6. C");
+        assert!(typed_text_is_standalone_paragraph(&edited, 6));
+    }
+
+    #[test]
+    fn exit_folding_ignores_other_lists_and_unicode_space_bodies() {
+        // A different bullet starts a different list.
+        assert_fold_exit("- A\n- \n* \n", 6, (4, 6), "\n\n", 5);
+        // U+3000 is body text, not an empty item.
+        assert_fold_exit("- A\n- \n- \u{3000}\n- C", 6, (4, 6), "\n\n", 5);
     }
 
     #[test]
