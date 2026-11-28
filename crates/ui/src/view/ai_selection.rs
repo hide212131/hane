@@ -4334,6 +4334,10 @@ mod tests {
     ) {
         use hane_ai::AiCommand;
 
+        // `request_generation` is monotonic and survives `reset()`, so compare
+        // against the value at the start of this scenario.
+        let baseline_generation = view.read_with(cx, |view, _| view.ai_selection.request_generation);
+
         open_selection(cx, view);
         view.read_with(cx, |view, _| {
             assert!(view.ai_selection.open);
@@ -4368,7 +4372,7 @@ mod tests {
             assert!(view.ai_selection.open, "the popup stays open");
             assert!(matches!(view.ai_selection.phase, AiSelectionPhase::Composing));
             assert!(view.ai_selection.pending.is_none());
-            assert_eq!(view.ai_selection.request_generation, 0);
+            assert_eq!(view.ai_selection.request_generation, baseline_generation);
         });
         assert!(handle.snapshot().busy.is_none());
 
@@ -4388,7 +4392,10 @@ mod tests {
                     .map(|pending| pending.operation_id),
                 Some(OperationId(3))
             );
-            assert_eq!(view.ai_selection.request_generation, 1);
+            assert_eq!(
+                view.ai_selection.request_generation,
+                baseline_generation + 1
+            );
         });
         // Cancel it and let the service settle: the next admission id shows
         // that the send admitted one transform and nothing else.
