@@ -4185,11 +4185,11 @@ mod tests {
     }
 
     /// A window over `text` with `0..end` selected, popup still closed.
-    fn view_with_selection(
-        cx: &mut gpui::TestAppContext,
+    fn view_with_selection<'a>(
+        cx: &'a mut gpui::TestAppContext,
         text: &str,
         end: usize,
-    ) -> (Entity<EditorView>, &mut gpui::VisualTestContext) {
+    ) -> (Entity<EditorView>, &'a mut gpui::VisualTestContext) {
         cx.update(crate::actions::register_key_bindings);
         let (view, cx) = cx.add_window_view(|_, cx| EditorView::new(text, "Untitled", cx));
         cx.simulate_resize(gpui::size(px(960.0), px(760.0)));
