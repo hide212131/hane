@@ -4228,33 +4228,6 @@ mod tests {
         }
     }
 
-    /// Steps the scheduler until the view has stopped being notified for a run
-    /// of consecutive steps.
-    fn pump_until_quiet(
-        cx: &mut gpui::VisualTestContext,
-        notifications: &std::rc::Rc<std::cell::Cell<usize>>,
-    ) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
-        let mut last = notifications.get();
-        let mut quiet_steps = 0;
-        while quiet_steps < 8 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the view kept being notified"
-            );
-            if !cx.executor().tick() {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let now = notifications.get();
-            if now == last {
-                quiet_steps += 1;
-            } else {
-                quiet_steps = 0;
-                last = now;
-            }
-        }
-    }
-
     /// One scenario of the opening test: a service (prepared first or not), a
     /// view over `text` with `0..end` selected, then the real opening path
     /// followed by renders, notifications and a re-open while open. Returns
@@ -4370,11 +4343,9 @@ mod tests {
         // The preparation finishes on the service thread; the view is only
         // told through its subscription.
         wait_for_connection_ready(handle);
-        pump_until_quiet(cx, notifications);
-        assert!(
-            notifications.get() > after_open,
-            "the view must be notified through its subscription"
-        );
+        pump_until(cx, "the view to be notified through its subscription", || {
+            notifications.get() > after_open
+        });
 
         // A service-side change made without any view action still reaches the
         // view: the subscription is bound to this handle.
