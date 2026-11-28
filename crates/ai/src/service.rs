@@ -174,6 +174,12 @@ pub struct AiSnapshot {
     /// Progress of the automatic ChatGPT connection preparation. It is owned
     /// by the service, so closing the settings screen does not end it.
     pub preparation: PreparationStatus,
+    /// OperationId of the connection preparation that owns the busy gate, kept
+    /// from admission through every stage (Recovering / Preparing / Saving /
+    /// Probe) until the gate is released. `busy`'s OperationId equal to this
+    /// marker means a connection preparation is in progress. A standalone
+    /// Probe, text transform or other operation never sets it.
+    pub preparation_operation: Option<OperationId>,
 }
 
 impl Default for AiSnapshot {
@@ -201,6 +207,7 @@ impl Default for AiSnapshot {
             runtime_distribution_error: None,
             runtime_install: RuntimeInstallState::NotInstalled,
             preparation: PreparationStatus::Idle,
+            preparation_operation: None,
         }
     }
 }
@@ -511,10 +518,42 @@ impl AiServiceHandle {
         Ok((id, reply_rx))
     }
 
+    /// Entry point for the selection AI popup to request the connection
+    /// preparation (account, model, fixed probe). Same operation as
+    /// `AiCommand::PrepareConnection`, but when another operation holds the
+    /// busy gate it only returns `Busy`: it never leaves a deferred
+    /// preparation behind (`deferred_open_settings`), which is reserved for the
+    /// settings screen's own trigger. While a preparation is running (including
+    /// right after admission), the request joins it without another admission.
+    /// Compare `AiSnapshot::busy` with `AiSnapshot::preparation_operation` to
+    /// show the progress.
+    pub fn try_prepare_connection_from_selection(&self) -> Result<OperationId, AdmissionError> {
+        // Same admission as `PrepareConnection`: the recovery of an isolated
+        // runtime and the ownership checks are part of the command itself.
+        self.enqueue_with(
+            WorkerCommand::Action(AiCommand::PrepareConnection),
+            ServiceBusyReason::Recovering,
+            false,
+        )
+    }
+
     fn enqueue(
         &self,
         command: WorkerCommand,
         reason: ServiceBusyReason,
+    ) -> Result<OperationId, AdmissionError> {
+        self.enqueue_with(command, reason, true)
+    }
+
+    /// `defer_when_busy` is true only for the settings screen's trigger: a
+    /// losing open-settings request is then remembered for after the gate is
+    /// released. A request that arrives while a connection preparation owns
+    /// the gate always joins it instead, whatever its origin.
+    fn enqueue_with(
+        &self,
+        command: WorkerCommand,
+        reason: ServiceBusyReason,
+        defer_when_busy: bool,
     ) -> Result<OperationId, AdmissionError> {
         if !*self.shared.available.lock().unwrap() {
             return Err(AdmissionError::Unavailable);
@@ -528,15 +567,25 @@ impl AiServiceHandle {
         {
             return Err(AdmissionError::Unavailable);
         }
-        let preparation_running = matches!(
-            self.shared.snapshot.lock().unwrap().preparation,
-            PreparationStatus::Running(_)
+        let is_preparation = matches!(
+            &command,
+            WorkerCommand::Action(AiCommand::PrepareConnection | AiCommand::RetryPreparation)
         );
         let mut busy = self.shared.busy.lock().unwrap();
         if busy.is_some() {
-            if is_open_settings {
+            if is_open_settings && defer_when_busy {
+                let (preparation_running, marked) = {
+                    let snapshot = self.shared.snapshot.lock().unwrap();
+                    (
+                        matches!(snapshot.preparation, PreparationStatus::Running(_)),
+                        snapshot.preparation_operation.is_some(),
+                    )
+                };
+                // A running preparation (marked from admission, so including
+                // its Recovering stage) is joined, never deferred behind.
                 let preparation_busy = matches!(*busy, Some((_, ServiceBusyReason::Preparing)))
-                    || preparation_running;
+                    || preparation_running
+                    || marked;
                 if !preparation_busy {
                     self.shared
                         .deferred_open_settings
@@ -551,18 +600,27 @@ impl AiServiceHandle {
                 .fetch_add(1, Ordering::Relaxed),
         );
         *busy = Some((id, reason));
-        mutate(&self.shared, |snapshot| snapshot.busy = Some((id, reason)));
+        mutate(&self.shared, |snapshot| {
+            snapshot.busy = Some((id, reason));
+            snapshot.preparation_operation = is_preparation.then_some(id);
+        });
         drop(busy);
         match self.command_tx.try_send(QueuedCommand { id, command }) {
             Ok(()) => Ok(id),
             Err(TrySendError::Full(_)) => {
                 *self.shared.busy.lock().unwrap() = None;
-                mutate(&self.shared, |snapshot| snapshot.busy = None);
+                mutate(&self.shared, |snapshot| {
+                    snapshot.busy = None;
+                    snapshot.preparation_operation = None;
+                });
                 Err(AdmissionError::QueueFull)
             }
             Err(TrySendError::Disconnected(_)) => {
                 *self.shared.busy.lock().unwrap() = None;
-                mutate(&self.shared, |snapshot| snapshot.busy = None);
+                mutate(&self.shared, |snapshot| {
+                    snapshot.busy = None;
+                    snapshot.preparation_operation = None;
+                });
                 Err(AdmissionError::Unavailable)
             }
         }
@@ -1612,7 +1670,10 @@ fn claim_busy(shared: &Arc<SharedServiceState>, reason: ServiceBusyReason) -> Op
     }
     let id = OperationId(shared.next_operation_id.fetch_add(1, Ordering::Relaxed));
     *busy = Some((id, reason));
-    mutate(shared, |snapshot| snapshot.busy = Some((id, reason)));
+    mutate(shared, |snapshot| {
+        snapshot.busy = Some((id, reason));
+        snapshot.preparation_operation = (reason == ServiceBusyReason::Preparing).then_some(id);
+    });
     drop(busy);
     Some(id)
 }
@@ -1623,7 +1684,10 @@ fn claim_busy(shared: &Arc<SharedServiceState>, reason: ServiceBusyReason) -> Op
 fn release_busy(shared: &Arc<SharedServiceState>) {
     let mut busy = shared.busy.lock().unwrap();
     *busy = None;
-    mutate(shared, |snapshot| snapshot.busy = None);
+    mutate(shared, |snapshot| {
+        snapshot.busy = None;
+        snapshot.preparation_operation = None;
+    });
     drop(busy);
 }
 
@@ -4159,6 +4223,7 @@ fn finish(
     *busy = None;
     mutate(shared, |snapshot| {
         snapshot.busy = None;
+        snapshot.preparation_operation = None;
         snapshot.login = login;
         snapshot.last_result = Some((id, result));
     });

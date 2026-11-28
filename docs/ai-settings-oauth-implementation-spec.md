@@ -61,6 +61,7 @@
 `AiService`のworkerが接続準備の進行を所有する。純粋な遷移判断は`crates/ai/src/connection_preparation.rs`に置き、通信・保存・probeは既存の経路を使う。別のruntimeや汎用workflow基盤は追加しない。
 
 - 起点: AI設定を開く（`AiCommand::PrepareConnection`）、ログイン完了、モデル選択の確定・設定の適用（保存成功）・適用再試行の成功、明示的な再試行（`AiCommand::RetryPreparation`）。描画やsnapshot受信では開始しない。設定画面を一度も開いていないプロセスでは、ログインや保存だけでは開始しない。
+- 機能側の起点（Issue #787）: 選択AIポップアップを有効な選択範囲で開く操作（`EditorView::open_ai_selection`）。未準備で接続準備も他の処理も実行中でないときに限り、`AiServiceHandle::try_prepare_connection_from_selection()`で一度だけ送る。他の処理に競り負けても遅延登録は残さず、実行中の準備へは合流する。描画・snapshot受信・購読開始・`start_request`・起動時には送らない。
 - 段階: account/read → model/list → モデル決定（必要なら既存の保存経路で永続化）→ 固定入力のprobe。段階は同一のbusy操作内で進み、既存コマンドを再投入しない。重複した起点は実行中・保留中の準備へ合流し、保留は最新の一件だけ。他のAI操作がbusyなら終了後に前提を再確認して開始する。
 - ログイン完了時は、`finish_login_reconciliation`が取得したaccount/readとmodel/listの結果を引き継ぎ、同じ取得を直後に再送しない。
 - 設定・世代・network revisionが段階の途中で変わった場合、その段階の結果は採用しない。モデル保存でruntimeが再構成された場合は、新しい条件でaccountとモデル一覧を確認してからprobeへ進む。

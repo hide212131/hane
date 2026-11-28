@@ -1036,3 +1036,179 @@ fn closing_and_reopening_does_not_duplicate_preparation() {
     drop(service);
     let _ = std::fs::remove_dir_all(data_root);
 }
+
+fn signed_in_probe_service() -> (AiService, PathBuf) {
+    let data_root = unique_data_root();
+    configure_fake_scenario(&data_root, "probe_success");
+    std::fs::write(
+        data_root.join("ai/codex-chatgpt/.hane-fake-app-server-signed-in"),
+        b"signed-in",
+    )
+    .unwrap();
+    let service = spawn_service(data_root.clone(), Arc::new(RecordingBrowser::default()));
+    (service, data_root)
+}
+
+fn wait_for_account_reads(data_root: &std::path::Path, at_least: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while rpc_count(data_root, "account/read") < at_least {
+        assert!(
+            Instant::now() < deadline,
+            "the account read was never reached"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn preparation_marker_follows_the_connection_preparation_only() {
+    let (service, data_root) = signed_in_probe_service();
+    let handle = service.handle();
+    assert_eq!(handle.snapshot().preparation_operation, None);
+
+    // The marker is set at admission and keeps the same id while the gate is
+    // held through the stages.
+    let hold = data_root.join("ai/codex-chatgpt/.hane-fake-app-server-hold-account-read");
+    std::fs::write(&hold, b"hold").unwrap();
+    let id = handle.try_submit(AiCommand::PrepareConnection).unwrap();
+    let admitted = handle.snapshot();
+    assert_eq!(admitted.busy.map(|(busy_id, _)| busy_id), Some(id));
+    assert_eq!(admitted.preparation_operation, Some(id));
+    wait_for_account_reads(&data_root, 1);
+    let held = handle.snapshot();
+    assert_eq!(held.busy.map(|(busy_id, _)| busy_id), Some(id));
+    assert_eq!(held.preparation_operation, Some(id));
+    std::fs::remove_file(&hold).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let snapshot = handle.snapshot();
+        match snapshot.busy {
+            Some((busy_id, _)) => {
+                assert_eq!(busy_id, id, "one operation id for the whole preparation");
+                assert_eq!(snapshot.preparation_operation, Some(id));
+            }
+            None => break,
+        }
+        assert!(Instant::now() < deadline, "preparation did not finish");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let done = wait_for_preparation(&service, |snapshot| {
+        snapshot.preparation == PreparationStatus::Ready
+    });
+    assert_eq!(done.preparation_operation, None, "cleared with the gate");
+
+    // A standalone Probe is not a connection preparation.
+    let probe_id = handle.try_submit(AiCommand::Probe).unwrap();
+    let probing = handle.snapshot();
+    assert_eq!(probing.busy.map(|(busy_id, _)| busy_id), Some(probe_id));
+    assert_eq!(probing.preparation_operation, None);
+    wait_for_result(&service, probe_id);
+    assert_eq!(handle.snapshot().preparation_operation, None);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
+
+#[test]
+fn overlapping_settings_and_selection_share_one_preparation() {
+    for selection_first in [true, false] {
+        let (service, data_root) = signed_in_probe_service();
+        let handle = service.handle();
+        let hold = data_root.join("ai/codex-chatgpt/.hane-fake-app-server-hold-account-read");
+        std::fs::write(&hold, b"hold").unwrap();
+
+        // Right after admission (still recovering) and while a stage runs,
+        // both origins join the running preparation.
+        let id = handle.try_submit(AiCommand::PrepareConnection).unwrap();
+        let overlap = |handle: &hane_ai::AiServiceHandle| {
+            if selection_first {
+                assert_eq!(
+                    handle.try_prepare_connection_from_selection(),
+                    Err(AdmissionError::Busy)
+                );
+                assert_eq!(
+                    handle.try_submit(AiCommand::PrepareConnection),
+                    Err(AdmissionError::Busy)
+                );
+            } else {
+                assert_eq!(
+                    handle.try_submit(AiCommand::PrepareConnection),
+                    Err(AdmissionError::Busy)
+                );
+                assert_eq!(
+                    handle.try_prepare_connection_from_selection(),
+                    Err(AdmissionError::Busy)
+                );
+            }
+        };
+        overlap(&handle);
+        wait_for_account_reads(&data_root, 1);
+        overlap(&handle);
+        std::fs::remove_file(&hold).unwrap();
+
+        let ready = wait_for_preparation(&service, |snapshot| {
+            snapshot.preparation == PreparationStatus::Ready
+        });
+        assert_eq!(ready.last_result.map(|(last, _)| last), Some(id));
+        let reads = rpc_count(&data_root, "account/read");
+        // Nothing was left behind to run again.
+        std::thread::sleep(Duration::from_millis(400));
+        let after = handle.snapshot();
+        assert!(after.busy.is_none());
+        assert_eq!(after.last_result.map(|(last, _)| last), Some(id));
+        assert_eq!(rpc_count(&data_root, "account/read"), reads);
+        assert_eq!(rpc_count(&data_root, "turn/start"), 1, "one fixed probe");
+
+        drop(service);
+        let _ = std::fs::remove_dir_all(data_root);
+    }
+}
+
+#[test]
+fn selection_request_losing_to_another_operation_leaves_no_deferred_preparation() {
+    let (service, data_root) = signed_in_probe_service();
+    let handle = service.handle();
+    open_settings(&service);
+    let hold = data_root.join("ai/codex-chatgpt/.hane-fake-app-server-hold-account-read");
+
+    // The popup loses to a running account refresh: nothing is remembered.
+    std::fs::write(&hold, b"hold").unwrap();
+    let refresh = handle
+        .try_submit(AiCommand::RefreshAccount {
+            refresh_token: false,
+        })
+        .unwrap();
+    assert_eq!(
+        handle.try_prepare_connection_from_selection(),
+        Err(AdmissionError::Busy)
+    );
+    std::fs::remove_file(&hold).unwrap();
+    wait_for_result(&service, refresh);
+    std::thread::sleep(Duration::from_millis(400));
+    let idle = handle.snapshot();
+    assert!(idle.busy.is_none());
+    assert_eq!(idle.preparation, PreparationStatus::Idle);
+    assert_eq!(rpc_count(&data_root, "turn/start"), 0);
+
+    // The settings screen's own trigger is still deferred as before.
+    std::fs::write(&hold, b"hold").unwrap();
+    let refresh = handle
+        .try_submit(AiCommand::RefreshAccount {
+            refresh_token: false,
+        })
+        .unwrap();
+    assert_eq!(
+        handle.try_submit(AiCommand::PrepareConnection),
+        Err(AdmissionError::Busy)
+    );
+    std::fs::remove_file(&hold).unwrap();
+    wait_for_result(&service, refresh);
+    wait_for_preparation(&service, |snapshot| {
+        snapshot.preparation == PreparationStatus::Ready
+    });
+    assert_eq!(rpc_count(&data_root, "turn/start"), 1);
+
+    drop(service);
+    let _ = std::fs::remove_dir_all(data_root);
+}
