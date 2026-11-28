@@ -13155,6 +13155,45 @@ mod tests {
         });
     }
 
+    /// Issue #795: leaving a run of empty top-level items folds the following
+    /// empty siblings in one edit, so the exit is one revision and one Undo,
+    /// and the later typing is its own history entry.
+    #[gpui::test]
+    fn empty_sibling_exit_is_one_undoable_edit(cx: &mut gpui::TestAppContext) {
+        let original = "- abc\n- \n- ";
+        let view = gpui::AppContext::new(cx, |cx| EditorView::new(original, "Untitled", cx));
+        view.update(cx, |view, cx| {
+            view.editor_mut()
+                .set_selection(Selection::caret(SourceOffset(8)))
+                .unwrap();
+            let before = view.editor().document().revision().0;
+
+            assert!(view.apply_list_edit_intent(ListEditIntent::Enter, cx));
+            assert_eq!(view.editor().document().full_text(), "- abc\n\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+            assert_eq!(view.editor().document().revision().0, before + 1);
+
+            view.editor_mut().insert_text("ghi").unwrap();
+            view.after_input(cx);
+            assert_eq!(view.editor().document().full_text(), "- abc\n\nghi");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(10)));
+
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\n\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+            view.editor_mut().dispatch(EditorCommand::Undo).unwrap();
+            assert_eq!(view.editor().document().full_text(), original);
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(8)));
+
+            view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\n\n");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(7)));
+            view.editor_mut().dispatch(EditorCommand::Redo).unwrap();
+            assert_eq!(view.editor().document().full_text(), "- abc\n\nghi");
+            assert_eq!(view.editor().selection(), Selection::caret(SourceOffset(10)));
+        });
+    }
+
     /// Issue #728: Enter left of a marker inserts a blank line above without a
     /// duplicate marker, and a single undo / redo restores each step.
     #[gpui::test]
