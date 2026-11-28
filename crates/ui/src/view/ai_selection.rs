@@ -25,9 +25,9 @@ use gpui::{AppContext, Entity};
 use gpui_component::input::{Input, InputEvent, InputState};
 use hane_ai::{
     AccountState, ActiveConnection, AdmissionError, AiServiceHandle, AiSnapshot, DocumentContext,
-    DocumentContextScope, OperationId, OwnershipState, PromptSource, TextTransformErrorCode,
-    TextTransformOutcome, UserPrompt, UserPrompts, UserPromptsLoadError, initial_default_draft,
-    parse_prompt_template,
+    DocumentContextScope, OperationId, OwnershipState, PreparationFailure, PreparationStatus,
+    ProbeErrorCode, ProbeStatus, PromptSource, TextTransformErrorCode, TextTransformOutcome,
+    UserPrompt, UserPrompts, UserPromptsLoadError, initial_default_draft, parse_prompt_template,
 };
 use hane_session::FileStateStore;
 use std::sync::mpsc::RecvTimeoutError;
@@ -188,6 +188,10 @@ pub(super) struct AiSelectionState {
     pending: Option<PendingRequest>,
     request_generation: u64,
     message: Option<String>,
+    /// The connection preparation this popup opening started or joined. Only a
+    /// probe diagnostic of this operation is shown as the reason of a failure;
+    /// an older diagnostic is never taken as the cause.
+    prepare_operation: Option<OperationId>,
     escape_was_composing: bool,
     enter_was_composing: bool,
 }
@@ -215,6 +219,7 @@ impl AiSelectionState {
         self.list_focus_index = None;
         self.phase = AiSelectionPhase::Composing;
         self.message = None;
+        self.prepare_operation = None;
         self.saved_prompts = Vec::new();
         self.escape_was_composing = false;
         self.enter_was_composing = false;
@@ -437,6 +442,7 @@ fn text_transform_connection_ready(snapshot: &AiSnapshot) -> bool {
     if snapshot.ownership != OwnershipState::Owned
         || snapshot.busy.is_some()
         || snapshot.recovery_required
+        || snapshot.runtime_isolated
     {
         return false;
     }
@@ -460,26 +466,152 @@ fn text_transform_connection_ready(snapshot: &AiSnapshot) -> bool {
     }
 }
 
-fn text_transform_status_line(snapshot: Option<&AiSnapshot>) -> String {
+const AI_SELECTION_CONNECTION_UNCONFIRMED_MESSAGE: &str =
+    "接続を確認できませんでした。設定 → AI接続で状態を確認してください。";
+
+/// What the compose screen's status line shows. `prepare_operation` is the
+/// connection preparation this popup opening started or joined; only its own
+/// probe diagnostic is used as a failure reason. Messages carry no provider
+/// text and no credential, and guide to the settings without navigating there.
+fn text_transform_status_line(
+    snapshot: Option<&AiSnapshot>,
+    prepare_operation: Option<OperationId>,
+) -> String {
     let Some(snapshot) = snapshot else {
         return "AI接続を設定してください".to_owned();
     };
-    if !text_transform_connection_ready(snapshot) {
-        return "AI接続を設定してください".to_owned();
+    if let Some((operation, _)) = snapshot.busy {
+        return if snapshot.preparation_operation == Some(operation) {
+            "接続を確認しています…".to_owned()
+        } else {
+            "別のAI処理が進行中です".to_owned()
+        };
     }
-    match snapshot.settings.active_connection {
-        ActiveConnection::ChatGpt => format!(
-            "ChatGPT / {} に送信します",
-            snapshot.settings.chatgpt.model_id.clone().unwrap_or_default()
-        ),
-        ActiveConnection::Custom => {
-            let custom = snapshot.settings.custom.as_ref();
-            format!(
-                "{} / {} に送信します",
-                custom.map_or("", |custom| custom.name.as_str()),
-                custom.map_or("", |custom| custom.model_id.as_str())
-            )
+    if text_transform_connection_ready(snapshot) {
+        let line = match snapshot.settings.active_connection {
+            ActiveConnection::ChatGpt => format!(
+                "ChatGPT / {} に送信します",
+                snapshot.settings.chatgpt.model_id.clone().unwrap_or_default()
+            ),
+            ActiveConnection::Custom => {
+                let custom = snapshot.settings.custom.as_ref();
+                format!(
+                    "{} / {} に送信します",
+                    custom.map_or("", |custom| custom.name.as_str()),
+                    custom.map_or("", |custom| custom.model_id.as_str())
+                )
+            }
+        };
+        // A probe that did not finish does not forbid an explicit send.
+        return match probe_failure_reason(snapshot, prepare_operation) {
+            Some(reason) => format!("{line}（事前の接続確認: {reason}）"),
+            None => line,
+        };
+    }
+    match snapshot.ownership {
+        OwnershipState::OwnedElsewhere => {
+            return "別のHaneプロセスがAI runtimeを使用しています。".to_owned();
         }
+        OwnershipState::Unavailable => {
+            return "AI runtimeを利用できません。設定 → AI接続で状態を確認してください。"
+                .to_owned();
+        }
+        OwnershipState::Unknown | OwnershipState::Owned => {}
+    }
+    if snapshot.runtime_isolated {
+        return "子プロセスの停止を確認できず、AI操作を停止しています。設定 → AI接続で状態を確認してください。"
+            .to_owned();
+    }
+    if snapshot.recovery_required {
+        return "AI設定の復旧が必要です。設定 → AI接続で状態を確認してください。".to_owned();
+    }
+    let unconfirmed = AI_SELECTION_CONNECTION_UNCONFIRMED_MESSAGE.to_owned();
+    match snapshot.settings.active_connection {
+        ActiveConnection::ChatGpt => {
+            chatgpt_not_ready_status_line(snapshot, prepare_operation).unwrap_or(unconfirmed)
+        }
+        ActiveConnection::Custom => {
+            if snapshot.ownership == OwnershipState::Owned {
+                "Customの接続設定が不足しています。設定 → AI接続で接続先とAPIキーの登録を確認してください。"
+                    .to_owned()
+            } else {
+                unconfirmed
+            }
+        }
+    }
+}
+
+fn chatgpt_not_ready_status_line(
+    snapshot: &AiSnapshot,
+    prepare_operation: Option<OperationId>,
+) -> Option<String> {
+    let stopped = match snapshot.preparation {
+        PreparationStatus::Stopped(failure) => Some(failure),
+        _ => None,
+    };
+    // A failed account read says nothing about the login: it is never turned
+    // into a sign-out.
+    if snapshot.account_refresh_failed || stopped == Some(PreparationFailure::AccountReadFailed) {
+        return Some(
+            "ログイン状態を取得できませんでした。設定 → AI接続で再試行してください。".to_owned(),
+        );
+    }
+    if snapshot.account == AccountState::SignedOut || stopped == Some(PreparationFailure::NeedsLogin)
+    {
+        return Some(
+            "ChatGPTにログインしていません。設定 → AI接続でログインしてください。".to_owned(),
+        );
+    }
+    let message = match stopped? {
+        PreparationFailure::ModelListFailed => {
+            "モデル一覧を取得できませんでした。設定 → AI接続で再試行してください。".to_owned()
+        }
+        PreparationFailure::NoModelCandidates => {
+            "利用できるモデルがありません。設定 → AI接続で状態を確認してください。".to_owned()
+        }
+        PreparationFailure::SavedModelMissing => {
+            "保存済みのモデルが一覧にありません。設定 → AI接続でモデルを選択してください。"
+                .to_owned()
+        }
+        PreparationFailure::ModelSaveFailed => {
+            "モデルを保存できませんでした。設定 → AI接続で再試行してください。".to_owned()
+        }
+        PreparationFailure::ProbeFailed => match probe_failure_reason(snapshot, prepare_operation)
+        {
+            Some(reason) => {
+                format!("接続を確認できませんでした（{reason}）。設定 → AI接続で状態を確認してください。")
+            }
+            None => "接続の確認に失敗しました。設定 → AI接続で再試行してください。".to_owned(),
+        },
+        PreparationFailure::NotReady
+        | PreparationFailure::AccountReadFailed
+        | PreparationFailure::NeedsLogin => return None,
+    };
+    Some(message)
+}
+
+/// The class of the probe failure of this popup's own preparation. A
+/// diagnostic of any other operation is not this opening's cause.
+fn probe_failure_reason(
+    snapshot: &AiSnapshot,
+    prepare_operation: Option<OperationId>,
+) -> Option<&'static str> {
+    let diagnostic = snapshot.probe_diagnostic.as_ref()?;
+    if prepare_operation != Some(diagnostic.operation_id) {
+        return None;
+    }
+    match &snapshot.probe_status {
+        ProbeStatus::Failed(ProbeErrorCode::Unauthorized | ProbeErrorCode::Forbidden) => {
+            Some("認証が拒否されました")
+        }
+        ProbeStatus::Failed(ProbeErrorCode::Network) => Some("通信に失敗しました"),
+        ProbeStatus::Failed(ProbeErrorCode::RateLimited) => Some("利用制限に達しました"),
+        ProbeStatus::Failed(ProbeErrorCode::TimedOut) | ProbeStatus::TimedOut => {
+            Some("応答待ちがタイムアウトしました")
+        }
+        ProbeStatus::Failed(_) => Some("確認に失敗しました"),
+        ProbeStatus::Isolated => Some("子プロセスの停止を確認できませんでした"),
+        _ => None,
     }
 }
 
@@ -1049,7 +1181,45 @@ impl EditorView {
         // `input_focused` the same way for the same reason.
         self.ai_selection.input_focused = true;
         self.reload_ai_selection_saved_prompts(cx);
+        self.ai_selection_prepare_on_open();
         cx.notify();
+    }
+
+    /// Explicit opening of the popup is the one trigger of the automatic
+    /// connection preparation on this side; rendering, snapshot updates and
+    /// `start_request` never send it. Nothing is sent while the connection is
+    /// ready or while any operation (a preparation included) is running; a
+    /// running preparation is only observed through the snapshot subscription.
+    fn ai_selection_prepare_on_open(&mut self) {
+        self.ai_selection.prepare_operation = None;
+        let Some(service) = self.ai_selection.service.clone() else {
+            return;
+        };
+        let snapshot = service.snapshot();
+        if text_transform_connection_ready(&snapshot) {
+            return;
+        }
+        if let Some((operation, _)) = snapshot.busy {
+            if snapshot.preparation_operation == Some(operation) {
+                self.ai_selection.prepare_operation = Some(operation);
+            }
+            return;
+        }
+        match service.try_prepare_connection_from_selection() {
+            Ok(operation) => self.ai_selection.prepare_operation = Some(operation),
+            Err(AdmissionError::Busy) => {
+                // Lost the race: wait for the result through the subscription.
+                let snapshot = service.snapshot();
+                if let Some((operation, _)) = snapshot.busy
+                    && snapshot.preparation_operation == Some(operation)
+                {
+                    self.ai_selection.prepare_operation = Some(operation);
+                }
+            }
+            Err(error) => {
+                self.ai_selection.message = Some(text_transform_admission_message(error));
+            }
+        }
     }
 
     /// Re-validates the captured target, then admits `instruction` (either
@@ -1467,7 +1637,8 @@ impl EditorView {
             .as_ref()
             .map(AiServiceHandle::snapshot);
         let ready = snapshot.as_ref().is_some_and(text_transform_connection_ready);
-        let status_line = text_transform_status_line(snapshot.as_ref());
+        let status_line =
+            text_transform_status_line(snapshot.as_ref(), self.ai_selection.prepare_operation);
         let input = self.ai_selection.input.clone();
         // Send/Close have no native focus target of their own while they
         // hold the compose screen's logical keyboard focus (real GPUI focus
@@ -1947,6 +2118,107 @@ mod tests {
         );
         assert!(matches!(state.phase, AiSelectionPhase::Composing));
         assert!(state.message.is_some());
+    }
+
+    fn owned_chatgpt_snapshot() -> AiSnapshot {
+        AiSnapshot {
+            ownership: OwnershipState::Owned,
+            ..AiSnapshot::default()
+        }
+    }
+
+    fn probe_diagnostic(operation: u64) -> hane_ai::ProbeDiagnostic {
+        hane_ai::ProbeDiagnostic {
+            operation_id: OperationId(operation),
+            stage: "probe",
+            code: "probe_test",
+            cause: "test".to_owned(),
+        }
+    }
+
+    #[test]
+    fn preparing_selection_shows_progress_and_other_work_as_other_work() {
+        let mut snapshot = owned_chatgpt_snapshot();
+        for reason in [
+            hane_ai::ServiceBusyReason::Recovering,
+            hane_ai::ServiceBusyReason::Preparing,
+            hane_ai::ServiceBusyReason::Saving,
+            hane_ai::ServiceBusyReason::Probe,
+        ] {
+            snapshot.busy = Some((OperationId(7), reason));
+            snapshot.preparation_operation = Some(OperationId(7));
+            assert_eq!(
+                text_transform_status_line(Some(&snapshot), Some(OperationId(7))),
+                "接続を確認しています…"
+            );
+            assert!(!text_transform_connection_ready(&snapshot));
+        }
+        // A standalone probe or text transform is other work.
+        for reason in [
+            hane_ai::ServiceBusyReason::Probe,
+            hane_ai::ServiceBusyReason::TextTransform,
+        ] {
+            snapshot.busy = Some((OperationId(8), reason));
+            assert_eq!(
+                text_transform_status_line(Some(&snapshot), Some(OperationId(7))),
+                "別のAI処理が進行中です"
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_failure_shows_reason_and_settings_guidance() {
+        let mut snapshot = owned_chatgpt_snapshot();
+        snapshot.preparation = PreparationStatus::Stopped(PreparationFailure::NeedsLogin);
+        let line = text_transform_status_line(Some(&snapshot), None);
+        assert!(line.contains("ログインしていません") && line.contains("設定 → AI接続"));
+
+        // A failed account read is not a sign-out.
+        let mut snapshot = owned_chatgpt_snapshot();
+        snapshot.account_refresh_failed = true;
+        snapshot.preparation = PreparationStatus::Stopped(PreparationFailure::AccountReadFailed);
+        let line = text_transform_status_line(Some(&snapshot), None);
+        assert!(line.contains("取得できませんでした") && line.contains("設定 → AI接続"));
+        assert!(!line.contains("ログインしていません"));
+
+        // This preparation's own probe failure is classified.
+        let mut snapshot = owned_chatgpt_snapshot();
+        snapshot.preparation = PreparationStatus::Stopped(PreparationFailure::ProbeFailed);
+        snapshot.probe_diagnostic = Some(probe_diagnostic(3));
+        snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::Unauthorized);
+        let line = text_transform_status_line(Some(&snapshot), Some(OperationId(3)));
+        assert!(line.contains("認証が拒否") && line.contains("設定 → AI接続"));
+        snapshot.probe_status = ProbeStatus::Failed(ProbeErrorCode::Network);
+        let line = text_transform_status_line(Some(&snapshot), Some(OperationId(3)));
+        assert!(line.contains("通信に失敗") && line.contains("設定 → AI接続"));
+
+        // A diagnostic of another operation is not this preparation's cause.
+        let line = text_transform_status_line(Some(&snapshot), Some(OperationId(4)));
+        assert!(!line.contains("通信に失敗") && !line.contains("認証"));
+        assert!(line.contains("設定 → AI接続"));
+
+        // Custom with missing settings.
+        let mut snapshot = owned_chatgpt_snapshot();
+        snapshot.settings.active_connection = ActiveConnection::Custom;
+        let line = text_transform_status_line(Some(&snapshot), None);
+        assert!(line.contains("接続先とAPIキー") && line.contains("設定 → AI接続"));
+
+        // Unknown cause.
+        let line = text_transform_status_line(Some(&AiSnapshot::default()), None);
+        assert_eq!(line, AI_SELECTION_CONNECTION_UNCONFIRMED_MESSAGE);
+    }
+
+    #[test]
+    fn isolated_runtime_is_not_ready_to_send() {
+        let mut snapshot = owned_chatgpt_snapshot();
+        snapshot.settings.chatgpt.model_id = Some("model".to_owned());
+        snapshot.account = AccountState::SignedIn {
+            email: None,
+            plan_type: "plus".to_owned(),
+        };
+        assert!(text_transform_connection_ready(&snapshot));
+        snapshot.runtime_isolated = true;
+        assert!(!text_transform_connection_ready(&snapshot));
     }
 
     #[gpui::test]

@@ -273,7 +273,10 @@ pub(super) struct AiSettingsPage {
     recorded_probe_operation: Option<OperationId>,
     save_then_leave: Option<(OperationId, LeaveTarget)>,
     route_ready: Option<LeaveTarget>,
-    subscription_started: bool,
+    /// The snapshot subscription of the currently attached service handle.
+    /// Re-attaching replaces it, which drops (cancels) the previous task, so
+    /// the subscription never stays bound to a stale handle.
+    subscription: Option<gpui::Task<()>>,
     #[cfg(test)]
     forced_dirty_for_test: bool,
 }
@@ -297,7 +300,7 @@ impl Default for AiSettingsPage {
             recorded_probe_operation: None,
             save_then_leave: None,
             route_ready: None,
-            subscription_started: false,
+            subscription: None,
             #[cfg(test)]
             forced_dirty_for_test: false,
         }
@@ -320,12 +323,8 @@ impl AiSettingsPage {
         let updates = Arc::new(Mutex::new(service.subscribe()));
         let snapshot_service = service.clone();
         self.service = Some(service);
-        if self.subscription_started {
-            return;
-        }
-        self.subscription_started = true;
         let view = cx.entity().downgrade();
-        cx.spawn(async move |_, cx| {
+        self.subscription = Some(cx.spawn(async move |_, cx| {
             loop {
                 let updates = updates.clone();
                 let result = cx
@@ -360,8 +359,7 @@ impl AiSettingsPage {
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
-        })
-        .detach();
+        }));
     }
 
     pub(super) fn begin_settings_session(&mut self) {
@@ -408,8 +406,9 @@ impl AiSettingsPage {
         let Some(service) = &self.service else {
             return;
         };
-        // Opening the screen is a permitted trigger of the automatic
-        // connection preparation; rendering and snapshot updates never send it.
+        // Explicitly opening AI settings or the selection AI popup can start
+        // automatic connection preparation. Rendering and snapshot updates
+        // never submit it.
         match service.try_submit(AiCommand::PrepareConnection) {
             Ok(_) => {}
             Err(AdmissionError::Busy) => {
